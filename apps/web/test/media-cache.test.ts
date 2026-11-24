@@ -4,6 +4,9 @@ import {
   catalogView,
   expectedVersion,
   formState,
+  inputAfterSave,
+  keySaveArgs,
+  keyWriteArgs,
   mediaScreenStore,
   formValue,
   isStaleKeyError,
@@ -251,5 +254,42 @@ describe("media admin screen rules (#238)", () => {
     expect(s.shown!.key.last4).toBe("aaaa"); // unchanged so far: the old read was not taken
     s.answer(afterDelete, status("p:4", "none"));
     expect(s.shown!.key.source).toBe("none");
+  });
+
+  // ---- round 6 ----------------------------------------------------------------------------------------------
+
+  it("r6: a write's inputs are fixed at the click — what is on screen later does not change them", () => {
+    let input = "sk-or-v1-e2e-key-bbbb";
+    let generation = "p:3";
+    const save = keySaveArgs(input, generation);
+    const del = keyWriteArgs(generation);
+    // Held back offline: meanwhile the input becomes CCCC and the status read shows another key (p:4).
+    input = "sk-or-v1-e2e-key-cccc";
+    generation = "p:4";
+    expect(save).toEqual({ key: "sk-or-v1-e2e-key-bbbb", expectedGeneration: "p:3" });
+    expect(del).toEqual({ expectedGeneration: "p:3" });
+    // Once it succeeds, the newer input is kept; the saved one is cleared.
+    expect(inputAfterSave(input, save.key)).toBe(input);
+    expect(inputAfterSave("  sk-or-v1-e2e-key-bbbb ", save.key)).toBe("");
+    expect(generation).toBe("p:4");
+  });
+
+  it("r6: a save waiting for its confirming read stays with the QueryClient — a re-entered form is still locked", () => {
+    const qc = {};
+    mediaScreenStore(qc).setSave({ phase: "confirming", values: twenty, version: 5 });
+    // The menu is left and entered again (a new form): the same store, the same lock.
+    const again = mediaScreenStore(qc);
+    expect(formState({ edit: null, save: again.save, server: fifty, serverVersion: 4 })).toEqual({
+      values: twenty,
+      locked: true,
+    });
+    expect(formState({ edit: null, save: again.save, server: twenty, serverVersion: 5 }).locked).toBe(false);
+  });
+
+  it("r6: a key write refused for its generation rejects that generation (lists hidden, one read)", () => {
+    const s = screen(status("p:3"));
+    expect(s.catalogError({ code: "media_key_changed" }, keyWriteArgs("p:3").expectedGeneration)).toBe(false);
+    expect(s.list(catalog("p:3"))).toBeUndefined();
+    expect(s.refreshes).toBe(1);
   });
 });

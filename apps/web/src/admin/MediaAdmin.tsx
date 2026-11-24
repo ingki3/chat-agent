@@ -14,8 +14,14 @@ import {
   catalogView,
   expectedVersion,
   formState,
+  inputAfterSave,
   isStaleKeyError,
+  keySaveArgs,
+  keyWriteArgs,
   mediaScreenStore,
+  type KeySave,
+  type KeyWrite,
+  type MediaScreenStore,
   onCatalogError,
   type RejectedGenerations,
   type SettingsSave,
@@ -35,6 +41,9 @@ type Screen = {
   rejected: RejectedGenerations;
   /** A generation was just rejected (re-render: every kind hides its list at once). */
   onReject: (e: unknown, generation: string) => boolean;
+  /** Reads the status now; rejects when that read fails (the caller keeps what it holds). */
+  reload: () => Promise<void>;
+  store: MediaScreenStore;
 };
 
 const SOURCE: Record<MediaAdminView["key"]["source"], string> = {
@@ -57,18 +66,24 @@ function KeySection({ m, screen }: { m: MediaAdminView; screen: Screen }) {
   const [key, setKey] = useState("");
   // Whatever a write's outcome, the status shown comes from a new status read (never from the write's answer).
   // Every key write names the generation shown (the server refuses another: `media_key_changed`, nothing changes).
+  // Each write's inputs are fixed at the click (`mutate(args)`); the mutation uses only those.
   const generation = m.key.generation;
+  // A key write refused for its generation rejects that generation at once (as a refused catalog does).
+  const onKeyError = (e: unknown, a: KeyWrite) => void screen.onReject(e, a.expectedGeneration);
   const save = useMutation({
-    mutationFn: () => admin.setMediaKey(key.trim(), generation),
-    onSuccess: () => setKey(""),
+    mutationFn: (a: KeySave) => admin.setMediaKey(a.key, a.expectedGeneration),
+    onSuccess: (_r, a) => setKey((input) => inputAfterSave(input, a.key)),
+    onError: onKeyError,
     onSettled: screen.refresh,
   });
   const remove = useMutation({
-    mutationFn: () => admin.deleteMediaKey(generation),
+    mutationFn: (a: KeyWrite) => admin.deleteMediaKey(a.expectedGeneration),
+    onError: onKeyError,
     onSettled: screen.refresh,
   });
   const check = useMutation({
-    mutationFn: () => admin.checkMediaKey(generation),
+    mutationFn: (a: KeyWrite) => admin.checkMediaKey(a.expectedGeneration),
+    onError: onKeyError,
     onSettled: screen.refresh,
   });
   // A generation a catalog call refused: this key may no longer be the one in use — no key write until re-read.
@@ -76,7 +91,7 @@ function KeySection({ m, screen }: { m: MediaAdminView; screen: Screen }) {
   const k = m.key;
   const submit = (e: FormEvent) => {
     e.preventDefault();
-    save.mutate();
+    save.mutate(keySaveArgs(key, generation));
   };
   return (
     <section aria-label="OpenRouter 키">
@@ -128,7 +143,11 @@ function KeySection({ m, screen }: { m: MediaAdminView; screen: Screen }) {
             {save.isPending ? "확인 중…" : "확인하고 저장"}
           </button>
           {k.source !== "none" && (
-            <button type="button" disabled={stale || check.isPending} onClick={() => check.mutate()}>
+            <button
+              type="button"
+              disabled={stale || check.isPending}
+              onClick={() => check.mutate(keyWriteArgs(generation))}
+            >
               {check.isPending ? "확인 중…" : "남은 한도 다시 확인"}
             </button>
           )}
@@ -137,7 +156,7 @@ function KeySection({ m, screen }: { m: MediaAdminView; screen: Screen }) {
               type="button"
               disabled={stale || remove.isPending}
               onClick={() => {
-                if (confirm("등록한 OpenRouter 키를 지울까요?")) remove.mutate();
+                if (confirm("등록한 OpenRouter 키를 지울까요?")) remove.mutate(keyWriteArgs(generation));
               }}
             >
               키 지우기
@@ -192,7 +211,7 @@ function KindRow({
     retry: (n, e) => !isStaleKeyError(e) && n < 2,
   });
   const reload = useMutation({
-    mutationFn: () => admin.mediaCatalog(kind, true, generation),
+    mutationFn: (g: string) => admin.mediaCatalog(kind, true, g),
     // Stored under the generation the server actually read it with — shown only while that is the status's.
     onSuccess: (r) => qc.setQueryData(catalogKey(r.generation, kind), r),
     onError: onStale,
@@ -233,7 +252,7 @@ function KindRow({
         type="button"
         aria-label={`${label} 목록 새로 고침`}
         disabled={!hasKey || reload.isPending || screen.rejected.has(generation)}
-        onClick={() => reload.mutate()}
+        onClick={() => reload.mutate(generation)}
       >
         목록 새로 고침
       </button>
@@ -264,9 +283,18 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
   // The admin's unsaved edit and the version it started from; null = the form follows the latest status read.
   const [edit, setEdit] = useState<MediaSettings | null>(null);
   const [editBase, setEditBase] = useState<number | null>(null);
-  const [inFlight, setInFlight] = useState<SettingsSave | null>(null);
+  // The save in progress lives with the QueryClient (a re-entered form stays locked on the submitted values).
+  const { store } = screen;
+  const [, rerender] = useState(0);
+  const inFlight = store.save;
+  const setInFlight = (v: SettingsSave | null) => {
+    store.setSave(v);
+    rerender((n) => n + 1);
+  };
   const [conflict, setConflict] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [reloading, setReloading] = useState(false);
+  const [reloadFailed, setReloadFailed] = useState(false);
   const { values: draft, locked } = formState({
     edit,
     save: inFlight,
@@ -274,6 +302,7 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
     serverVersion: m.settingsVersion,
   });
   const save = useMutation({
+    // Only the values and version fixed at the click are sent.
     mutationFn: (o: { values: MediaSettings; version: number }) =>
       admin.saveMediaSettings(o.values, o.version),
     // The answer only says which version to wait for; the form shows the status read that has it.
@@ -404,6 +433,11 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
             저장하는 중…
           </p>
         )}
+        {reloadFailed && (
+          <p className="error small" role="alert">
+            최신 값을 불러오지 못했어요 — 입력한 값은 그대로예요. 다시 시도하세요.
+          </p>
+        )}
         {conflict ? (
           <span className="actions">
             <button type="button" onClick={() => submit(m.settingsVersion)} disabled={invalid}>
@@ -411,11 +445,21 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
             </button>
             <button
               type="button"
+              disabled={reloading}
               onClick={() => {
-                setConflict(false);
-                setEdit(null);
-                setEditBase(null);
-                save.reset();
+                // The edit goes only once the latest values are actually here; a failed read keeps it.
+                setReloading(true);
+                setReloadFailed(false);
+                screen
+                  .reload()
+                  .then(() => {
+                    setConflict(false);
+                    setEdit(null);
+                    setEditBase(null);
+                    save.reset();
+                  })
+                  .catch(() => setReloadFailed(true))
+                  .finally(() => setReloading(false));
               }}
             >
               최신 값 불러오기
@@ -457,9 +501,15 @@ export function MediaAdmin() {
       await qc.invalidateQueries({ queryKey: MEDIA_KEY, refetchType: "all" });
     })();
   }, [qc]);
+  const store = mediaScreenStore(qc);
   const screen: Screen = {
     refresh,
     rejected,
+    store,
+    reload: async () => {
+      await qc.cancelQueries({ queryKey: MEDIA_KEY });
+      await qc.refetchQueries({ queryKey: MEDIA_KEY, type: "all" }, { throwOnError: true });
+    },
     onReject: (e, generation) => {
       const show = onCatalogError(e, generation, rejected, refresh);
       if (!show) rerender((n) => n + 1);

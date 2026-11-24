@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { ADMIN, MOM, csrf, useAccount } from "./helpers.js";
+import { ADMIN, MOM, authFile, csrf, useAccount } from "./helpers.js";
 
 /**
  * 관리자 → 미디어 생성 (#238 stage 1). The e2e server (FAKE_RUNTIME) answers for OpenRouter with a scripted fake
@@ -7,9 +7,16 @@ import { ADMIN, MOM, csrf, useAccount } from "./helpers.js";
  * catalogs are small made-up lists — the real openrouter.ai is never called. The settings are server-wide, so the
  * write flow runs in one project only.
  */
+let closeOther: (() => Promise<void>) | undefined;
+test.afterEach(async () => {
+  await closeOther?.();
+  closeOther = undefined;
+});
+
 test("the admin registers an OpenRouter key, picks a model per kind and sets the limits", async ({
   page,
   baseURL,
+  browser,
 }, info) => {
   test.skip(info.project.name !== "desktop", "server-wide settings: one project writes them");
   await useAccount(page, ADMIN);
@@ -154,6 +161,44 @@ test("the admin registers an OpenRouter key, picks a model per kind and sets the
   await expect(form.getByTestId("media-model-image")).toHaveCount(0);
   await expect(form.getByTestId("media-catalog-source-image")).toHaveCount(0);
   await expect(form.getByTestId("media-catalog-error-image")).toHaveCount(0);
+
+  // Review r6: a write held back offline sends what was clicked, not what is on screen when it goes out.
+  const otherTab = await browser.newContext({ storageState: authFile(ADMIN), baseURL: baseURL! });
+  closeOther = () => otherTab.close();
+  const keyInput = keyForm.getByLabel("OpenRouter API 키");
+  const serverLast4 = async () =>
+    ((await (await otherTab.request.get("/api/admin/media")).json()) as { key: { last4: string | null } }).key
+      .last4;
+  await keyInput.fill("sk-or-v1-e2e-synthetic-offline-00000000000bbbb");
+  await page.context().setOffline(true);
+  await keyForm.getByRole("button", { name: "확인하고 저장" }).click();
+  await keyInput.fill("sk-or-v1-e2e-synthetic-offline-00000000000cccc");
+  await page.context().setOffline(false);
+  await expect(keyForm.getByTestId("media-key")).toContainText("bbbb");
+  expect(await serverLast4()).toBe("bbbb");
+  // The newer input is kept (only the saved key is cleared).
+  await expect(keyInput).toHaveValue("sk-or-v1-e2e-synthetic-offline-00000000000cccc");
+  await keyInput.fill("");
+
+  // Delete of bbbb confirmed offline; meanwhile the other tab puts eeee in. Online again, the delete is refused
+  // (it names bbbb's generation) and eeee stays.
+  await page.context().setOffline(true);
+  page.once("dialog", (d) => void d.accept());
+  await keyForm.getByRole("button", { name: "키 지우기" }).click();
+  const g = (
+    (await (await otherTab.request.get("/api/admin/media")).json()) as { key: { generation: string } }
+  ).key.generation;
+  const swap = await otherTab.request.put("/api/admin/media/key", {
+    headers: csrf(baseURL!),
+    data: { key: "sk-or-v1-e2e-synthetic-offline-00000000000eeee", expectedGeneration: g },
+  });
+  expect(swap.status()).toBe(200);
+  await page.context().setOffline(false);
+  await expect(keyForm.getByTestId("media-key")).toContainText("eeee");
+  expect(await serverLast4()).toBe("eeee");
+  page.once("dialog", (d) => void d.accept());
+  await keyForm.getByRole("button", { name: "키 지우기" }).click();
+  await expect(keyForm.getByTestId("media-key")).toContainText("키 없음");
 });
 
 test("a member gets neither the tab's data nor the key routes", async ({ page }) => {

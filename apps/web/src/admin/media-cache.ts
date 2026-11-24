@@ -80,13 +80,41 @@ export const formValue = (edit: MediaSettings | null, server: MediaSettings): Me
  * The screen's memory that must outlive the component (review r5): status read tickets and rejected generations
  * live with the QueryClient — leaving the menu and coming back keeps them, as the query cache does.
  */
-export type MediaScreenStore = { reads: StatusReads; rejected: RejectedGenerations };
+export class MediaScreenStore {
+  readonly reads = new StatusReads();
+  readonly rejected = new RejectedGenerations();
+  private pending: SettingsSave | null = null;
+  /** A settings save sent or waiting for its confirming read (review r6: a re-entered form stays locked). */
+  get save(): SettingsSave | null {
+    return this.pending;
+  }
+  setSave(v: SettingsSave | null): void {
+    this.pending = v;
+  }
+}
 const stores = new WeakMap<object, MediaScreenStore>();
 export function mediaScreenStore(queryClient: object): MediaScreenStore {
   let s = stores.get(queryClient);
-  if (!s) stores.set(queryClient, (s = { reads: new StatusReads(), rejected: new RejectedGenerations() }));
+  if (!s) stores.set(queryClient, (s = new MediaScreenStore()));
   return s;
 }
+
+/**
+ * The inputs of every write, fixed when the admin clicks (review r6): a write React Query holds back (offline) and
+ * sends later must send what was on screen at the click — never the input or generation of the moment it is sent.
+ */
+export type KeyWrite = { expectedGeneration: string };
+export type KeySave = KeyWrite & { key: string };
+export type SettingsWrite = { settings: MediaSettings; expectedVersion: number };
+
+export const keySaveArgs = (input: string, generation: string): KeySave => ({
+  key: input.trim(),
+  expectedGeneration: generation,
+});
+export const keyWriteArgs = (generation: string): KeyWrite => ({ expectedGeneration: generation });
+
+/** After a key save: the input is cleared only if it still holds the key that was saved (a newer one is kept). */
+export const inputAfterSave = (input: string, saved: string): string => (input.trim() === saved ? "" : input);
 
 /**
  * A settings save in progress (review r5): `sending` until the server answers, then `confirming` until a status read
