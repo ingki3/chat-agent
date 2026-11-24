@@ -151,6 +151,9 @@ test("the admin registers an OpenRouter key, picks a model per kind and sets the
   await form.getByRole("button", { name: "최신 값 불러오기" }).click();
   await expect(form.getByRole("alert").filter({ hasText: "최신 값을 불러오지 못했어요" })).toBeVisible();
   await expect(limit).toHaveValue("44");
+  // Review r12: the status read waits for the connection — said as such, not as a failure to retry.
+  await expect(page.getByTestId("media-status-paused")).toBeVisible();
+  await expect(page.getByTestId("media-status-error")).toHaveCount(0);
   await page.context().setOffline(false);
   // Review r8: the read held back, the menu re-entered — a save cannot start while the read holds the slot.
   const releases: (() => void)[] = [];

@@ -4,6 +4,8 @@ import {
   catalogView,
   conflictNotice,
   draftBase,
+  pendingText,
+  readState,
   expectedRevision,
   formState,
   MediaScreenStore,
@@ -408,18 +410,34 @@ describe("media admin screen rules (#238)", () => {
   });
 
   it("r11: a conflict says 'loading' only while a read is under way; a failed read points at the retry", () => {
-    expect(conflictNotice(false, false)).toBe("다른 곳에서 설정이 바뀌었어요. 최신 값을 불러오는 중…");
-    expect(conflictNotice(false, true)).toBe(
+    expect(conflictNotice(false, "fetching")).toBe("다른 곳에서 설정이 바뀌었어요. 최신 값을 불러오는 중…");
+    expect(conflictNotice(false, "failed")).toBe(
       "다른 곳에서 설정이 바뀌었어요. 최신 값을 불러오지 못했어요 — 위의 '다시 시도'를 눌러 주세요.",
     );
     // The latest values are here: no notice of its own (the server's message), whatever the last read did.
-    expect(conflictNotice(true, false)).toBeNull();
-    expect(conflictNotice(true, true)).toBeNull();
+    expect(conflictNotice(true, "fetching")).toBeNull();
+    expect(conflictNotice(true, "failed")).toBeNull();
     // And the re-save stays closed until a fresh read arrives (refreshed), a failed read or not.
     const t = store();
     const before = t.st.reads.start();
     const id = t.st.beginSave(twenty, "R1")!;
     t.st.settleSave(id, { ok: false, code: "media_settings_changed" });
     expect(shown(t.st, fifty, before).refreshed).toBe(false);
+  });
+
+  it("r12: a read waiting for the connection is neither loading nor failed", () => {
+    expect(readState("fetching", false)).toBe("fetching");
+    // A retry under way after a failure is under way, not failed.
+    expect(readState("fetching", true)).toBe("fetching");
+    expect(readState("paused", true)).toBe("paused");
+    expect(readState("paused", false)).toBe("paused");
+    expect(readState("idle", true)).toBe("failed");
+    expect(readState("idle", false)).toBe("idle");
+    expect(conflictNotice(false, "paused")).toBe("다른 곳에서 설정이 바뀌었어요. 연결을 기다리는 중…");
+    expect(conflictNotice(false, readState("paused", true))).not.toContain("다시 시도");
+    expect(conflictNotice(true, "paused")).toBeNull();
+    // A paused write says it waits for the connection.
+    expect(pendingText(true, "확인 중…")).toBe("연결을 기다리는 중…");
+    expect(pendingText(false, "확인 중…")).toBe("확인 중…");
   });
 });

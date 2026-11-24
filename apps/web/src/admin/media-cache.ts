@@ -302,16 +302,30 @@ export function formState(o: {
 }
 
 /**
- * What a settings conflict says before the latest values are here (review r10–r11): "불러오는 중…" only while a
- * status read is actually under way; when it failed (and nothing reads), point at the banner's retry. Null once the
- * latest values are here (the server's own message then).
+ * Where the status read stands (review r12): under way, waiting for the connection (React Query's `paused`), failed
+ * with nothing under way, or idle. A paused read is not a failure — it goes as soon as the connection is back.
  */
-export function conflictNotice(refreshed: boolean, statusReadFailed: boolean): string | null {
-  if (refreshed) return null;
-  return statusReadFailed
-    ? "다른 곳에서 설정이 바뀌었어요. 최신 값을 불러오지 못했어요 — 위의 '다시 시도'를 눌러 주세요."
-    : "다른 곳에서 설정이 바뀌었어요. 최신 값을 불러오는 중…";
+export type ReadState = "fetching" | "paused" | "failed" | "idle";
+export function readState(fetchStatus: "fetching" | "paused" | "idle", isError: boolean): ReadState {
+  if (fetchStatus !== "idle") return fetchStatus;
+  return isError ? "failed" : "idle";
 }
+
+/**
+ * What a settings conflict says before the latest values are here (review r10–r12): loading while a read is under
+ * way, waiting while it waits for the connection, and the banner's retry once it failed. Null once the latest
+ * values are here (the server's own message then).
+ */
+export function conflictNotice(refreshed: boolean, read: ReadState): string | null {
+  if (refreshed) return null;
+  if (read === "paused") return "다른 곳에서 설정이 바뀌었어요. 연결을 기다리는 중…";
+  if (read === "failed")
+    return "다른 곳에서 설정이 바뀌었어요. 최신 값을 불러오지 못했어요 — 위의 '다시 시도'를 눌러 주세요.";
+  return "다른 곳에서 설정이 바뀌었어요. 최신 값을 불러오는 중…";
+}
+
+/** A write's button text while it is out: waiting for the connection (a paused mutation), or under way. */
+export const pendingText = (paused: boolean, busy: string): string => (paused ? "연결을 기다리는 중…" : busy);
 
 /**
  * The revision a save is made from: the one the admin's edit started from (an edit started before another save

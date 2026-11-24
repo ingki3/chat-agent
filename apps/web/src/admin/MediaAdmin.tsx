@@ -14,6 +14,9 @@ import {
   catalogView,
   conflictNotice,
   draftBase,
+  pendingText,
+  readState,
+  type ReadState,
   expectedRevision,
   formState,
   inputAfterSave,
@@ -144,7 +147,7 @@ function KeySection({ m, screen }: { m: MediaAdminView; screen: Screen }) {
         )}
         <span className="actions">
           <button className="primary" disabled={stale || save.isPending || !key.trim()}>
-            {save.isPending ? "확인 중…" : "확인하고 저장"}
+            {save.isPending ? pendingText(save.isPaused, "확인 중…") : "확인하고 저장"}
           </button>
           {k.source !== "none" && (
             <button
@@ -152,7 +155,7 @@ function KeySection({ m, screen }: { m: MediaAdminView; screen: Screen }) {
               disabled={stale || check.isPending}
               onClick={() => check.mutate(keyWriteArgs(generation))}
             >
-              {check.isPending ? "확인 중…" : "남은 한도 다시 확인"}
+              {check.isPending ? pendingText(check.isPaused, "확인 중…") : "남은 한도 다시 확인"}
             </button>
           )}
           {k.source === "admin" && (
@@ -287,14 +290,14 @@ function SettingsForm({
   m,
   screen,
   shownTicket,
-  statusReadFailed,
+  read,
 }: {
   m: MediaAdminView;
   screen: Screen;
   /** The ticket of the status read shown (`m`). */
   shownTicket: number;
-  /** The last status read failed and none is under way (the banner above offers the retry). */
-  statusReadFailed: boolean;
+  /** Where the status read stands (under way, waiting for the connection, failed, idle). */
+  read: ReadState;
 }) {
   // The admin's unsaved edit and the version it started from; null = the form follows the latest status read (or a
   // failed save's values, kept in the store).
@@ -444,7 +447,7 @@ function SettingsForm({
           <p className="error small" role="alert">
             {failedKind && `${MEDIA_KIND_LABEL[failedKind]}: `}
             {/* Until a read started after the refusal is shown, the latest values are not here yet. */}
-            {(failed === "media_settings_changed" && conflictNotice(refreshed, statusReadFailed)) ||
+            {(failed === "media_settings_changed" && conflictNotice(refreshed, read)) ||
               errorText(new ApiError(0, failed))}
           </p>
         )}
@@ -499,7 +502,7 @@ function SettingsForm({
         ) : (
           <span className="actions">
             <button className="primary" disabled={invalid || locked}>
-              {pending?.phase === "sending" ? "모델 확인 중…" : "확인하고 저장"}
+              {pending?.phase === "sending" ? pendingText(save.isPaused, "모델 확인 중…") : "확인하고 저장"}
             </button>
           </span>
         )}
@@ -562,9 +565,11 @@ export function MediaAdmin() {
   };
   const m = q.data?.status;
   const shownTicket = q.data?.ticket ?? 0;
+  // A read waiting for the connection is not a failure, and a retry under way is not one either.
+  const read = readState(q.fetchStatus, q.isError);
   // Only a first load that failed shows the empty error; with a status shown, a failed re-read keeps the screen.
   if (!m)
-    return q.isError ? (
+    return read === "failed" ? (
       <p className="error small" role="alert">
         {errorText(q.error)}{" "}
         <button type="button" onClick={() => void q.refetch()}>
@@ -572,7 +577,7 @@ export function MediaAdmin() {
         </button>
       </p>
     ) : (
-      <p className="muted small">불러오는 중…</p>
+      <p className="muted small">{read === "paused" ? "연결을 기다리는 중…" : "불러오는 중…"}</p>
     );
   return (
     <section className="admin" aria-label="미디어 생성">
@@ -581,7 +586,12 @@ export function MediaAdmin() {
         OpenRouter 모델로 이미지·음성·음악·영상을 만들어요(운영 문서 51절). 종류마다 켜고 모델을 골라요. 생성
         비용은 OpenRouter가 알려 준 실제 금액으로 사용량에 &quot;미디어 생성&quot;으로 기록돼요.
       </p>
-      {q.isError && (
+      {read === "paused" && (
+        <p className="muted small" role="status" data-testid="media-status-paused">
+          연결을 기다리는 중이에요 — 연결되면 최신 상태를 불러와요.
+        </p>
+      )}
+      {read === "failed" && (
         <p className="error small" role="alert" data-testid="media-status-error">
           최신 상태를 다시 불러오지 못했어요 — {errorText(q.error)}{" "}
           <button type="button" onClick={refresh}>
@@ -590,12 +600,7 @@ export function MediaAdmin() {
         </p>
       )}
       <KeySection m={m} screen={screen} />
-      <SettingsForm
-        m={m}
-        screen={screen}
-        shownTicket={shownTicket}
-        statusReadFailed={q.isError && !q.isFetching}
-      />
+      <SettingsForm m={m} screen={screen} shownTicket={shownTicket} read={read} />
     </section>
   );
 }
