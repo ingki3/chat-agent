@@ -1870,3 +1870,25 @@ a.btnlink:focus-visible,
   display: grid;
   gap: 16px;
 }
+
+/* 관리자 → 미디어 생성 (#238): one row per kind; the model list may be long, so it never widens the page. */
+.media-kind {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+}
+.media-kind select {
+  max-width: 100%;
+  min-width: 0;
+}
+.media-per-run {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+}
+/* A fieldset that only groups controls (to lock them together), with no frame of its own. */
+fieldset.plain {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+}

@@ -19,7 +19,12 @@ import { AUDIO_TRANSCRIBE_TOOL } from "@agentlee/mcp-tools/audio";
 import { SKILL_CATALOGUE, SKILL_SECRET_NAMES } from "@agentlee/mcp-tools/skills";
 import { buildApp } from "../src/app.js";
 import { capSpeakers, clock, mergeTranscript, splitLong, transcriptMarkdown } from "../src/audio/merge.js";
-import { OPENROUTER_TRANSCRIBE_URL, openRouterClient, requestTexts } from "../src/audio/openrouter.js";
+import {
+  OPENROUTER_TRANSCRIBE_URL,
+  openRouterClient,
+  requestTexts,
+  type FallbackClient,
+} from "../src/audio/openrouter.js";
 import {
   AUDIO_DIR,
   AUDIO_LOCK,
@@ -287,6 +292,8 @@ async function start(
       on?: boolean;
       sw?: AudioFallbackSwitch;
       allowed?: () => boolean;
+      /** The per-call key resolver of the real app (#238) in place of a fixed client. */
+      resolve?: () => FallbackClient | undefined;
     } = {},
   ) => {
     const sw = opts.sw ?? new AudioFallbackSwitch(memorySettings());
@@ -301,6 +308,7 @@ async function start(
       fallback: {
         switch: sw,
         client: opts.client ? openRouterClient({ apiKey: SYNTHETIC_KEY, fetchImpl: opts.client }) : undefined,
+        ...(opts.resolve ? { resolve: opts.resolve } : {}),
         ...(opts.allowed ? { allowed: opts.allowed } : {}),
       },
     });
@@ -1044,6 +1052,44 @@ describe("audio_transcribe: a call stops with its run (#173 review 1)", () => {
       .run(scope, { fileId: file.id });
     expect(r3).toEqual({ ok: false, code: "audio_failed" });
     expect(sawAbort).toBe(true);
+  });
+});
+
+// ---- the key, resolved per piece (#238 review 1) ---------------------------------------------------------------
+
+describe("audio_transcribe: the OpenRouter key is resolved again for every piece (#238)", () => {
+  const ADMIN_KEY = "sk-or-v1-SYNTHETIC0000test0000admin000238";
+  const ENV_KEY = "sk-or-v1-SYNTHETIC0000test0000envkey00238";
+  knownSecrets.add(ADMIN_KEY);
+  knownSecrets.add(ENV_KEY);
+
+  it("the admin's key deleted after the first piece: the rest go with .env's; with no key left, nothing more is sent", async () => {
+    const t = await start();
+    const c = t.app.conversations!.create(t.f.users.owner.id);
+    const file = await t.sentFile(t.f.cookies.owner, c.id);
+    const scope = await t.scopeOf(c.id);
+    for (const fallbackToEnv of [true, false]) {
+      t.db.$client.prepare("UPDATE runs SET ended_at = NULL WHERE id = ?").run(scope.runId);
+      let keys: string[] = [ADMIN_KEY, ENV_KEY];
+      if (!fallbackToEnv) keys = [ADMIN_KEY];
+      const or = mockOpenRouter((i) => {
+        if (i === 0) keys = keys.slice(1); // the admin's key is deleted while the first piece is in flight
+        return verbose(i);
+      });
+      const resolve = () =>
+        keys[0] ? openRouterClient({ apiKey: keys[0], fetchImpl: or.fetchImpl }) : undefined;
+      const r = await t
+        .svc(scripted({ words: "fail", chunkCount: 3 }).runner, { on: true, resolve })
+        .run(scope, { fileId: file.id });
+      const auth = or.requests.map((q) => new Headers(q.init.headers).get("authorization"));
+      if (fallbackToEnv) {
+        expect(r.ok).toBe(true);
+        expect(auth).toEqual([`Bearer ${ADMIN_KEY}`, `Bearer ${ENV_KEY}`, `Bearer ${ENV_KEY}`]);
+      } else {
+        expect(r).toEqual({ ok: false, code: "audio_fallback_failed" });
+        expect(auth).toEqual([`Bearer ${ADMIN_KEY}`]);
+      }
+    }
   });
 });
 

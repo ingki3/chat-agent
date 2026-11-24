@@ -5,7 +5,7 @@ import type { AudioTranscriber } from "./service.js";
 
 /**
  * 관리자 → 스킬 → 음성 전사 (#173): the OpenRouter fallback switch. Off by default; on, it is used only when the local
- * Whisper fails and `OPENROUTER_API_KEY` is set. The key itself is never sent to the screen (`keyConfigured` only).
+ * Whisper fails and an OpenRouter key is there (the admin's, #238, else `OPENROUTER_API_KEY`). The key itself is never sent to the screen (`keyConfigured` only).
  */
 export function registerAudioRoutes(
   app: FastifyInstance,

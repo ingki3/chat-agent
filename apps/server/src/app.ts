@@ -98,6 +98,12 @@ import { sandboxedAudioRunner, type AudioRunner } from "./audio/runner.js";
 import { AudioFallbackSwitch, AudioTranscriber } from "./audio/service.js";
 import { openRouterClient, type FallbackClient } from "./audio/openrouter.js";
 import { registerAudioRoutes } from "./audio/routes.js";
+import { OpenRouterKeys } from "./media/keys.js";
+import { MediaSettingsStore } from "./media/settings.js";
+import { MediaBudget } from "./media/budget.js";
+import { MediaAdminService } from "./media/service.js";
+import { registerMediaRoutes } from "./media/routes.js";
+import { fixtureOpenRouterFetch } from "./media/fixture.js";
 import { youtubeState, type YoutubeState } from "./youtube/packages.js";
 import { sandboxedYoutubeRunner, type YoutubeRunner } from "./youtube/runner.js";
 import { YoutubeAudioFetcher } from "./youtube/service.js";
@@ -201,6 +207,13 @@ declare module "fastify" {
     usageStore: UsageStore | undefined;
     /** Usage screens and the daily cost check (#32); undefined without a database. */
     usage: UsageService | undefined;
+    /**
+     * 미디어 생성 (#238): the OpenRouter key resolver, the admin's settings and the per-user daily budget (stage 2–3
+     * tools read these); undefined without a database.
+     */
+    media:
+      | { keys: OpenRouterKeys; settings: MediaSettingsStore; budget: MediaBudget; admin: MediaAdminService }
+      | undefined;
     /**
      * The data folder's file-write lock (#37): every writer of files under `files/`, `artifacts/` or `sources/`
      * writes inside `fileWrites.write()`, so a backup's snapshot of rows and files is from one moment.
@@ -339,6 +352,11 @@ export type BuildOptions = {
     state?: () => AudioState;
     fallback?: FallbackClient;
   };
+  /**
+   * 미디어 생성 (#238): OpenRouter's answers (tests mock it; the FAKE_RUNTIME e2e run uses a scripted one — no
+   * real call either way) and the budget's clock.
+   */
+  media?: { fetchImpl?: typeof fetch; now?: () => number };
   python?: {
     runner?: PythonRunner;
     state?: () => ScratchpadState;
@@ -591,6 +609,37 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       onRecorded: (at) => usageService.checkDailyCost(at),
     });
     app.decorate("usageStore", usage);
+    // 미디어 생성 (#238 stage 1): the admin's OpenRouter key (else .env's), models, limits and the daily budget.
+    const openRouterKeys = new OpenRouterKeys(settingsStore, config.skillSecrets.OPENROUTER_API_KEY);
+    const mediaSettings = new MediaSettingsStore(settingsStore);
+    // Never openrouter.ai from the FAKE_RUNTIME (e2e) server: a scripted OpenRouter there (also for the audio fallback).
+    const mediaFetchImpl =
+      opts.media?.fetchImpl ?? (config.fakeRuntime ? fixtureOpenRouterFetch() : undefined);
+    const mediaFetch = mediaFetchImpl ? { fetchImpl: mediaFetchImpl } : {};
+    const mediaAdmin = new MediaAdminService({
+      settings: settingsStore,
+      transaction: (fn) => opts.db!.transaction(() => fn()),
+      // One statement: the key and its check go together, or neither does.
+      remove: (keys) =>
+        void opts
+          .db!.$client.prepare(`DELETE FROM settings WHERE key IN (${keys.map(() => "?").join(", ")})`)
+          .run(...keys),
+      keys: openRouterKeys,
+      store: mediaSettings,
+      ...mediaFetch,
+    });
+    app.decorate("media", {
+      keys: openRouterKeys,
+      settings: mediaSettings,
+      budget: new MediaBudget(
+        opts.db!,
+        () => mediaSettings.get(),
+        usageService.timeZone,
+        opts.media?.now ?? opts.usage?.now ?? Date.now,
+      ),
+      admin: mediaAdmin,
+    });
+    registerMediaRoutes(app, { users, media: mediaAdmin });
     // Web search and fetch (#50): results are stored as sources of the run's conversation.
     const sources = new SourceStore(opts.db!);
     // Artifacts (#27): made by the artifact tools, scoped to the run's conversation.
@@ -706,8 +755,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     });
     app.addHook("preClose", async () => scratchpad.close());
     // audio_transcribe (#173): offered once `pnpm audio:install` ran (packages + models), with ffmpeg and
-    // SKILL_PYTHON; the OpenRouter fallback only when the admin switch is on and OPENROUTER_API_KEY is set.
-    const openRouterKey = config.skillSecrets.OPENROUTER_API_KEY;
+    // SKILL_PYTHON; the OpenRouter fallback only when the admin switch is on and an OpenRouter key is there —
+    // the admin's (관리자 → 미디어 생성, #238) first, else OPENROUTER_API_KEY — resolved per call.
     const audio = new AudioTranscriber({
       db: opts.db!,
       dataDir: config.dataDir,
@@ -720,8 +769,12 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
           : () => audioState(config.skillPython, config.dataDir, config.audioFfmpeg)),
       fallback: {
         switch: new AudioFallbackSwitch(settingsStore),
-        client:
-          opts.audio?.fallback ?? (openRouterKey ? openRouterClient({ apiKey: openRouterKey }) : undefined),
+        resolve: opts.audio?.fallback
+          ? () => opts.audio!.fallback
+          : () => {
+              const k = openRouterKeys.resolve();
+              return k ? openRouterClient({ apiKey: k.key, ...mediaFetch }) : undefined;
+            },
       },
       extract: (id) => fileExtracts.enqueue(id),
     });
@@ -1393,6 +1446,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("publicLinks", undefined);
     app.decorate("usageStore", undefined);
     app.decorate("usage", undefined);
+    app.decorate("media", undefined);
     app.decorate("backups", undefined);
     app.decorate("storedRescrub", undefined);
     app.decorate("files", undefined);
