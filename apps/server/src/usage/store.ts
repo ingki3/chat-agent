@@ -312,22 +312,34 @@ export class UsageStore {
    * has started yet — so no clock is compared. With a generation id it waits for its cost (`awaiting_cost`), without
    * one it is `unconfirmed` (its reserved amount stays). One transaction: both moves, or none. Returns the count.
    */
-  recoverReservedMedia(): number {
+  recoverReservedMedia(o: { noWait?: boolean } = {}): number {
     const at = this.now();
     const reserved = and(eq(usageRecords.purpose, "media"), eq(usageRecords.mediaSettlement, "reserved"));
-    return this.db.transaction((tx) => {
-      const a = tx
+    const sqlite = this.db.$client;
+    const move = sqlite.transaction(() => {
+      const a = this.db
         .update(usageRecords)
         .set({ mediaSettlement: "awaiting_cost", updatedAt: at })
         .where(and(reserved, isNotNull(usageRecords.mediaGenerationId)))
         .run().changes;
-      const b = tx
+      const b = this.db
         .update(usageRecords)
         .set({ mediaSettlement: "unconfirmed", updatedAt: at })
         .where(and(reserved, isNull(usageRecords.mediaGenerationId)))
         .run().changes;
       return a + b;
     });
+    // BEGIN IMMEDIATE: the write lock is taken first. `noWait` (a background retry, review r6): with the busy
+    // handler off for this one statement, a lock held elsewhere is SQLITE_BUSY at once — the event loop never
+    // waits for it — and the next timer tick tries again.
+    if (!o.noWait) return move.immediate();
+    const timeout = Number(sqlite.pragma("busy_timeout", { simple: true })) || 0;
+    sqlite.pragma("busy_timeout = 0");
+    try {
+      return move.immediate();
+    } finally {
+      sqlite.pragma(`busy_timeout = ${timeout}`);
+    }
   }
 
   /**

@@ -19,7 +19,9 @@ import zlib from "node:zlib";
 import { byteRange, FILE_CSP } from "../src/files/routes.js";
 import { imageCostBound, speechCostBound } from "../src/media/cost.js";
 import { imageSize, MAX_PARTS, MAX_RUNS, stripImage, textRuns } from "../src/media/strip.js";
-import { MAX_TRIES, MediaSettler, recoverMediaReservations } from "../src/media/settle.js";
+import { MAX_TRIES, MediaRecovery, MediaSettler, recoverMediaReservations } from "../src/media/settle.js";
+import Database from "better-sqlite3";
+import { openDb, runMigrations } from "../src/db/client.js";
 import { compose } from "../src/notifications/compose.js";
 import { usageRecords } from "../src/db/schema.js";
 import { addRow, emptyTotals, UsageService } from "../src/usage/service.js";
@@ -2136,7 +2138,7 @@ describe("media tools: review round 4 regressions (#246)", () => {
     ]);
   });
 
-  it("P2: a recovery write that fails is tried again; one that keeps failing fails the start (no row left reserved quietly)", () => {
+  it("P2: a recovery attempt that fails says so (null, logged); the next one can succeed; the moves are one transaction", () => {
     let calls = 0;
     const flaky = {
       recoverReservedMedia: () => {
@@ -2145,7 +2147,8 @@ describe("media tools: review round 4 regressions (#246)", () => {
         return 3;
       },
     };
-    expect(recoverMediaReservations(flaky, { waitMs: 1 })).toBe(3);
+    expect(recoverMediaReservations(flaky)).toBeNull();
+    expect(recoverMediaReservations(flaky)).toBe(3);
     expect(calls).toBe(2);
     const down = {
       recoverReservedMedia: () => {
@@ -2154,7 +2157,7 @@ describe("media tools: review round 4 regressions (#246)", () => {
     };
     const lines: unknown[] = [];
     const log = { info: () => {}, warn: () => {}, error: (...args: unknown[]) => void lines.push(args) };
-    expect(recoverMediaReservations(down, { waitMs: 1, log: log as never })).toBeNull();
+    expect(recoverMediaReservations(down, { log: log as never })).toBeNull();
     expect(JSON.stringify(lines)).toContain("media.recovery_failed");
     // One transaction: a failure in the second move leaves the first undone too.
     const db = createTestDb();
@@ -2291,7 +2294,7 @@ describe("media tools: review round 5 — recovery failure keeps the server up (
         media: {
           fetchImpl: fixtureOpenRouterFetch(),
           sleep: async () => {},
-          recovery: { waitMs: 1, background: false },
+          recovery: { background: false },
         },
       },
     );
@@ -2371,5 +2374,87 @@ describe("media tools: review round 5 — recovery failure keeps the server up (
           .get() as { s: string }
       ).s,
     ).toBe("reserved");
+  });
+});
+
+// ---------------------------------------------------------------- review round 6 (#246)
+
+describe("media tools: review round 6 — background recovery never blocks, only with the lock held (#246)", () => {
+  it("a background retry with another connection holding the write lock returns at once; busy_timeout is restored", async () => {
+    const dir = tmp();
+    const file = path.join(dir, "media.db");
+    const db = openDb(file);
+    runMigrations(db);
+    db.$client
+      .prepare("INSERT INTO users (id, email, name, role) VALUES ('u1', 'u1@x.test', 'u1', 'member')")
+      .run();
+    const store = new UsageStore(db, () => 1);
+    store.reserveMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "old",
+      callId: "1",
+      model: "m",
+      estimateUsd: 1,
+    });
+    // Another connection holds the write lock.
+    const other = new Database(file);
+    other.exec("BEGIN IMMEDIATE");
+    let held = false;
+    const recovery = new MediaRecovery({ usage: store, held: () => held, background: false });
+    // The lock was not held at start: nothing touched, media blocked.
+    expect(recovery.runAtStart()).toBe(false);
+    expect(recovery.recovering()).toBe(true);
+    held = true;
+    // An unrelated timer due in 20 ms is not held up by the retry.
+    const fired = new Promise<number>((r) => {
+      const at = Date.now();
+      setTimeout(() => r(Date.now() - at), 20);
+    });
+    const t0 = Date.now();
+    expect(recovery.retryNow()).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(200);
+    expect(await fired).toBeLessThan(500);
+    expect(Number(db.$client.pragma("busy_timeout", { simple: true }))).toBe(5000);
+    expect(recovery.recovering()).toBe(true);
+    // The other writer is done: the next tick succeeds and lifts the block.
+    other.exec("COMMIT");
+    other.close();
+    expect(recovery.retryNow()).toBe(true);
+    expect(recovery.recovering()).toBe(false);
+    expect(
+      (db.$client.prepare("SELECT media_settlement s FROM usage_records").get() as { s: string }).s,
+    ).toBe("unconfirmed");
+    db.$client.close();
+  });
+
+  it("a released data-lock handle touches no row and keeps media blocked", () => {
+    const db = createTestDb();
+    db.$client
+      .prepare("INSERT INTO users (id, email, name, role) VALUES ('u1', 'u1@x.test', 'u1', 'member')")
+      .run();
+    const store = new UsageStore(db, () => 1);
+    store.reserveMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "old",
+      callId: "1",
+      model: "m",
+      estimateUsd: 1,
+    });
+    let held = true;
+    const spy = vi.spyOn(store, "recoverReservedMedia");
+    held = false; // released before the start
+    const recovery = new MediaRecovery({ usage: store, held: () => held, background: false });
+    expect(recovery.runAtStart()).toBe(false);
+    expect(recovery.retryNow()).toBe(false);
+    expect(spy).not.toHaveBeenCalled();
+    expect(recovery.recovering()).toBe(true);
+    expect(
+      (db.$client.prepare("SELECT media_settlement s FROM usage_records").get() as { s: string }).s,
+    ).toBe("reserved");
+    held = true;
+    expect(recovery.retryNow()).toBe(true);
+    expect(spy).toHaveBeenCalledTimes(1);
   });
 });

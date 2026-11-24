@@ -372,8 +372,8 @@ export type BuildOptions = {
     sleep?: (ms: number) => Promise<void>;
     /** Tests: run the start-up recovery as the lock-holding start does (`dataLock`). */
     recoverAtStart?: boolean;
-    /** Tests: the recovery's wait between tries, and whether it retries in the background. */
-    recovery?: { waitMs?: number; background?: boolean };
+    /** Tests: whether the recovery retries in the background. */
+    recovery?: { background?: boolean };
   };
   python?: {
     runner?: PythonRunner;
@@ -665,6 +665,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const mediaRecovery = new MediaRecovery({
       usage,
       log: app.log,
+      ...(opts.dataLock ? { held: opts.dataLock.held } : {}),
       ...(opts.media?.recovery ?? {}),
     });
     if (opts.dataLock || opts.media?.recoverAtStart) mediaRecovery.runAtStart();

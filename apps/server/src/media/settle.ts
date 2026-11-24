@@ -98,43 +98,36 @@ export class MediaSettler {
   }
 }
 
-/** Tries of one start-up recovery attempt, and the wait between them. */
-export const RECOVER_TRIES = 3;
-export const RECOVER_WAIT_MS = 200;
 /** Background retries after a failed start-up recovery: 5 s, 10 s, 20 s … up to 5 min apart. */
 export const RECOVER_RETRY_FIRST_MS = 5_000;
 export const RECOVER_RETRY_MAX_MS = 5 * 60_000;
 
 /**
- * One recovery of a previous process's `reserved` rows (#238 review r4–r5): all of them, in one transaction (no
- * clock compared: only the lock-holding server runs this, before any media call of its own). Tried `tries` times,
- * `waitMs` apart (a short write lock passes). The count, or null when it did not succeed (logged).
+ * One recovery of a previous process's `reserved` rows (#238 review r4–r6): all of them, in one `BEGIN IMMEDIATE`
+ * transaction (no clock compared: only the lock-holding server runs this). At start it may wait on SQLite's busy
+ * handler (the app is being built, nothing waits on the thread); `noWait` (a background retry) never does — a lock
+ * held elsewhere fails it at once. The count, or null when it did not succeed (logged).
  */
 export function recoverMediaReservations(
   usage: Pick<UsageStore, "recoverReservedMedia">,
-  o: { log?: EventLogger | undefined; tries?: number; waitMs?: number } = {},
+  o: { log?: EventLogger | undefined; noWait?: boolean } = {},
 ): number | null {
-  const tries = o.tries ?? RECOVER_TRIES;
-  for (let i = 1; ; i++) {
-    try {
-      return usage.recoverReservedMedia();
-    } catch {
-      if (i >= tries) {
-        logEvent(o.log, "error", "media.recovery_failed", { mediaCode: "media_usage_failed" });
-        return null;
-      }
-      // A synchronous wait: the first attempt runs while the app is built, before it takes any request.
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, o.waitMs ?? RECOVER_WAIT_MS);
-    }
+  try {
+    return usage.recoverReservedMedia({ noWait: o.noWait === true });
+  } catch {
+    logEvent(o.log, "error", "media.recovery_failed", { mediaCode: "media_usage_failed" });
+    return null;
   }
 }
 
 /**
- * The start-up recovery and what happens when it fails (#238 review r5; the user's decision: chat stays available,
- * media bookkeeping waits). Only the lock-holding server start runs it (`app.ts`, `opts.dataLock`). It is tried
- * while the app is built; if it fails the server starts anyway, but **new paid media calls are refused**
- * (`media_recovering`) while it is retried in the background with a backoff — the block is in place before any
- * media call, so no new reservation mixes into the rows being recovered. On success the block is lifted.
+ * The start-up recovery and what happens when it fails (#238 review r5–r6; the user's decision: chat stays
+ * available, media bookkeeping waits). Only the lock-holding server start runs it (`app.ts`, `opts.dataLock`), and
+ * only while the lock is really held (`held`, checked before every attempt — a released lock touches no row and
+ * keeps media blocked). It is tried while the app is built; if it fails the server starts anyway, but **new paid
+ * media calls are refused** (`media_recovering`) while it is retried in the background — one non-waiting attempt
+ * per timer tick, with a backoff — and the block is in place before any media call, so no new reservation mixes
+ * into the rows being recovered. On success the block is lifted.
  */
 export class MediaRecovery {
   private pending = false;
@@ -146,7 +139,8 @@ export class MediaRecovery {
     private readonly o: {
       usage: Pick<UsageStore, "recoverReservedMedia">;
       log?: EventLogger | undefined;
-      waitMs?: number;
+      /** Whether this process still holds the data folder's lock (absent: yes). */
+      held?: () => boolean;
       /** Tests: the background retries are driven by hand (`retryNow`). */
       background?: boolean;
     },
@@ -157,30 +151,30 @@ export class MediaRecovery {
     return this.pending;
   }
 
+  private held(): boolean {
+    try {
+      return this.o.held?.() ?? true;
+    } catch {
+      return false;
+    }
+  }
+
   /** The start-up attempt (synchronous). False: it failed, the block is on and retries are scheduled. */
   runAtStart(): boolean {
-    if (this.attemptOnce()) return true;
+    if (this.held() && recoverMediaReservations(this.o.usage, { log: this.o.log }) !== null) return true;
     this.pending = true;
     this.schedule();
     return false;
   }
 
-  /** One more attempt now; lifts the block on success. */
+  /** One more attempt now — never waiting on a lock; lifts the block on success. */
   retryNow(): boolean {
     if (!this.pending) return true;
-    if (!this.attemptOnce()) return false;
+    if (!this.held()) return false;
+    if (recoverMediaReservations(this.o.usage, { log: this.o.log, noWait: true }) === null) return false;
     this.pending = false;
     logEvent(this.o.log, "info", "media.recovered", {});
     return true;
-  }
-
-  private attemptOnce(): boolean {
-    return (
-      recoverMediaReservations(this.o.usage, {
-        log: this.o.log,
-        waitMs: this.o.waitMs ?? RECOVER_WAIT_MS,
-      }) !== null
-    );
   }
 
   private schedule(): void {
