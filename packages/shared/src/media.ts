@@ -172,7 +172,6 @@ export const MEDIA_ERRORS: Record<string, string> = {
   media_no_key: "OpenRouter 키가 없어요. 먼저 키를 등록하세요(.env의 OPENROUTER_API_KEY도 쓸 수 있어요).",
   media_catalog_failed: "OpenRouter에서 모델 목록을 받지 못했어요. 잠시 뒤 다시 해 보세요.",
   media_key_changed: "그사이 OpenRouter 키가 바뀌었어요. 목록을 다시 불러오세요.",
-  media_settings_changed:
-    "다른 곳에서 설정이 바뀌었어요. 최신 값을 불러왔어요 — 다시 확인 후 저장하세요.",
+  media_settings_changed: "다른 곳에서 설정이 바뀌었어요. 최신 값을 불러왔어요 — 다시 확인 후 저장하세요.",
   media_model_unknown: "고른 모델이 OpenRouter 목록에 없어요. 목록을 새로 불러와 다시 고르세요.",
 };
