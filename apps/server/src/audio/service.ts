@@ -69,10 +69,14 @@ export type AudioServiceOptions = {
   files: () => FileStore | undefined;
   runner: AudioRunner;
   state: () => AudioState;
-  /** The fallback: the admin's switch, and the client when `OPENROUTER_API_KEY` is set. */
+  /**
+   * The fallback: the admin's switch, and the client when an OpenRouter key is there — `client` fixed (tests), or
+   * `resolve`d per call from the one key resolver (#238: the admin's key first, else `OPENROUTER_API_KEY`).
+   */
   fallback: {
     switch: AudioFallbackSwitch;
     client?: FallbackClient | undefined;
+    resolve?: (() => FallbackClient | undefined) | undefined;
     /** Whether this user may still use the skill (checked before every piece is sent). */
     allowed?: ((scope: ToolScope) => boolean) | undefined;
   };
@@ -146,7 +150,12 @@ export class AudioTranscriber {
 
   /** The fallback as the admin sees it: switched on, and whether a key is configured. */
   fallback(): { enabled: boolean; keyConfigured: boolean } {
-    return { enabled: this.opts.fallback.switch.enabled(), keyConfigured: !!this.opts.fallback.client };
+    return { enabled: this.opts.fallback.switch.enabled(), keyConfigured: !!this.fallbackClient() };
+  }
+
+  /** The fallback client of this moment (the key may have been saved or deleted since the last call). */
+  private fallbackClient(): FallbackClient | undefined {
+    return this.opts.fallback.resolve ? this.opts.fallback.resolve() : this.opts.fallback.client;
   }
 
   setFallback(on: boolean): void {
@@ -372,7 +381,7 @@ export class AudioTranscriber {
     ctx.check();
     if (local.ok) words = local.segments;
     else {
-      const client = this.opts.fallback.client;
+      const client = this.fallbackClient();
       const sw = this.opts.fallback.switch;
       if (!client || !sw.enabled()) throw new AudioError(local.code);
       // From here on the switch is watched too: turned off, the request in flight is aborted.

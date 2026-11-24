@@ -30,6 +30,9 @@ export type UsageAttempt = {
 
 export type UsageRow = typeof usageRecords.$inferSelect;
 
+/** The `runtime` of a media row (#238): the generation ran at OpenRouter, not in a runtime. */
+export const MEDIA_RUNTIME = "openrouter";
+
 /** A token count as stored: a non-negative integer, or NULL when the runtime did not report it. */
 const tokens = (v: number | undefined): number | null =>
   v !== undefined && Number.isInteger(v) && v >= 0 ? v : null;
@@ -124,6 +127,54 @@ export class UsageStore {
         })
         .run();
     });
+    this.onRecorded?.(at);
+  }
+
+  /**
+   * One media generation (#238): OpenRouter's own reported cost, as is — no price table, no tokens. The row is an
+   * API key row (the OpenRouter key), so its cost counts in every total, today's cost check and the forecast; a
+   * generation OpenRouter reported no cost for is "미제공" (`costMissing`). `callId` is unique per generation (one
+   * row each; a repeat with the same id replaces it — the latest reported cost wins).
+   */
+  recordMedia(m: {
+    userId: string;
+    conversationId: string | null;
+    runId: string;
+    callId: string;
+    model: string;
+    costUsd: number | null;
+  }): void {
+    const at = this.now();
+    const usd = cost(m.costUsd ?? undefined);
+    const micros = usd === null ? null : Math.round(usd * 1_000_000);
+    this.db
+      .insert(usageRecords)
+      .values({
+        userId: m.userId,
+        conversationId: m.conversationId,
+        runId: `${m.runId}#media:${m.callId}`,
+        attempt: 1,
+        runtime: MEDIA_RUNTIME,
+        model: m.model,
+        connectionId: null,
+        purpose: "media",
+        createdAt: at,
+        authType: "api_key",
+        priceVersion: null,
+        pricedCostMicros: micros,
+        inputTokens: null,
+        outputTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        costUsd: usd,
+        requestCount: 1,
+        updatedAt: at,
+      })
+      .onConflictDoUpdate({
+        target: [usageRecords.runId, usageRecords.attempt],
+        set: { costUsd: usd, pricedCostMicros: micros, updatedAt: at },
+      })
+      .run();
     this.onRecorded?.(at);
   }
 

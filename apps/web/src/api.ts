@@ -113,6 +113,11 @@ import {
   AdminEmailConfirmState,
   type AccessPreviewChange,
   type AccessRegisterRequest,
+  MEDIA_ERRORS,
+  MediaAdmin,
+  MediaCatalog,
+  type MediaKind,
+  type MediaSettings,
 } from "@agentlee/shared";
 
 const enc = encodeURIComponent;
@@ -353,6 +358,15 @@ export const admin = {
   audio: async () => AudioAdmin.parse(await call("GET", "/api/admin/audio")),
   setAudioFallback: async (fallback: boolean) =>
     AudioAdmin.parse(await call("PUT", "/api/admin/audio", { fallback })),
+  /** 미디어 생성 (#238): the OpenRouter key, per-kind models and the cost limits. */
+  media: async () => MediaAdmin.parse(await call("GET", "/api/admin/media")),
+  setMediaKey: async (key: string) => MediaAdmin.parse(await call("PUT", "/api/admin/media/key", { key })),
+  deleteMediaKey: async () => MediaAdmin.parse(await call("DELETE", "/api/admin/media/key")),
+  checkMediaKey: async () => MediaAdmin.parse(await call("POST", "/api/admin/media/key/check", {})),
+  mediaCatalog: async (kind: MediaKind, fresh = false) =>
+    MediaCatalog.parse(await call("GET", `/api/admin/media/catalog/${enc(kind)}${fresh ? "?fresh=1" : ""}`)),
+  saveMediaSettings: async (settings: MediaSettings) =>
+    MediaAdmin.parse(await call("PUT", "/api/admin/media/settings", settings)),
   runtimes: async () => AdminRuntimesResponse.parse(await call("GET", "/api/admin/runtimes")).items,
   system: async () => SystemStatus.parse(await call("GET", "/api/admin/system")),
   /** Backups (#37): list and "지금 백업". Restore is the CLI only. */
@@ -727,6 +741,8 @@ const MESSAGES: Record<string, string> = {
   no_runtime: "쓸 수 있는 런타임이 없어요 — 관리자에게 문의하세요.",
   // 공개 링크 (#204)
   ...PUBLIC_LINK_ERRORS,
+  // 미디어 생성 (#238)
+  ...MEDIA_ERRORS,
 };
 export const errorText = (e: unknown) =>
   e instanceof ApiError ? (MESSAGES[e.code] ?? `오류가 났어요 (${e.code})`) : "서버에 연결하지 못했어요.";

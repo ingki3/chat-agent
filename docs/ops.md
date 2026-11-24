@@ -2194,7 +2194,7 @@ pnpm audio:check       # 합성 음으로 실제 3단계(ffmpeg·Nemotron·Whisp
 
 ### 46.2 켜고 끄기
 - **서버 허용 목록**: 관리자 → 스킬 → `audio-transcription` "허용"(기본 켜짐 — 설치 전에는 `설치 안 됨`으로 보이고 제공되지 않음). **사용자별**: 같은 탭 아래(청소년 계정도 `"all"`이면 켜짐 — 금융 스킬이 아님).
-- **외부 대체(OpenRouter)**: 관리자 → 스킬 → **음성 전사 외부 대체 → OpenRouter 대체 허용**(기본 꺼짐) + `.env`의 `OPENROUTER_API_KEY`. 둘 다 있어야 하고, **로컬 Whisper가 실패했을 때만**(오류·비정상 종료·시간·메모리 한도) 쓴다. 쓰면 결과에 `stt: "openrouter"`·`externalTranscription: true`·`notice: "외부 전사 사용 (OpenRouter openai/whisper-large-v3)"`이 붙고 대본 파일 머리에도 적힌다. 화자 구분은 항상 이 Mac에서 한다.
+- **외부 대체(OpenRouter)**: 관리자 → 스킬 → **음성 전사 외부 대체 → OpenRouter 대체 허용**(기본 꺼짐) + OpenRouter 키(관리자 → 미디어 생성에서 등록한 키, 없으면 `.env`의 `OPENROUTER_API_KEY` — §51.1). 둘 다 있어야 하고, **로컬 Whisper가 실패했을 때만**(오류·비정상 종료·시간·메모리 한도) 쓴다. 쓰면 결과에 `stt: "openrouter"`·`externalTranscription: true`·`notice: "외부 전사 사용 (OpenRouter openai/whisper-large-v3)"`이 붙고 대본 파일 머리에도 적힌다. 화자 구분은 항상 이 Mac에서 한다.
 - 대체 요청: 고정 URL `https://openrouter.ai/api/v1/audio/transcriptions`, 리다이렉트 거부, 키는 `Authorization: Bearer` 헤더에만, 폼은 고정(`model`·`language`·`response_format=verbose_json`·`temperature=0`·고정 파일 이름)과 오디오 바이트. 오디오는 WAV를 64kbps mono MP3 10분 조각(< 24MB, 공급자 25MB 한도 안)으로 다시 만들어 조각마다 한 번 보내고 시간을 이어 붙인다. 한 조각이라도 실패하면 `audio_fallback_failed`(일부만 된 대본을 전체인 척 돌려주지 않음).
 
 ### 46.3 동작과 한도 (`AUDIO_LIMITS`, `packages/shared/src/audio.ts`)
@@ -2412,3 +2412,38 @@ Gemini Deep Research·OpenAI deep research 같은 외부 백엔드는 다음 단
 - **노트는 고치지 않는다**: 서브 연구자 노트의 구절이 저장된 원문과 정확히 맞지 않으면 그 노트는 버린다 — 서버가 비슷한 원문 구절로 바꿔 주지 않는다. 리뷰 #237 1–4차에서 낱말·공백·"…" 기준의 자동 수정은 어떤 규칙으로도 주장의 뜻을 바꿀 수 있었다(부정·질문이 사실로, 주체·부호·통화·식별자가 바뀜). 정확성이 재현율보다 앞선다. 버린 노트의 주장은 "확인하지 못한 주장"으로 재조사·보강 판단 프롬프트에만 들어가고, 서브 연구자 지침(`subagent.md` v5)은 **범위에 주어진 도구로**(웹: `web_find`·`web_fetch`, 첨부 파일: `file_search`·`file_read`) 원문을 다시 찾아 글자 그대로 복사하라고 하고, 범위에 없는 도구는 쓰지 말라고 한다.
 - **자동 재조사**: 확인된 노트가 0개이거나 출처가 1개뿐인 하위 질문은 리드가 지목하지 않아도 **한 번** 검색어를 바꿔 다시 조사한다(같은 도구 12번·6분, 동시 3개). 그 질문의 **마지막 실행이 끝난 방식**을 노트 수와 따로 기록해, 일시적인 런타임 오류(`runtime_error`)나 정상 종료면 재조사하고, 로그인·사용 한도·연결·권한·런타임 전환 문제나 런타임의 자체 거부(`runtime_policy` — 허용되지 않은 도구를 쓰려 함)로 끝났으면(노트를 남겼어도) 하지 않는다. 출처 수는 내용 단위다 — 같은 본문의 행들(리다이렉트 주소와 최종 주소, 같은 PDF의 두 주소)은 출처 하나다. 같은 페이지의 같은 구절(공백만 다름)도 노트 하나다. 이 정보가 없는 예전 체크포인트는 이어 할 때 저장된 출처 행의 최종 주소로 채우고 출처 수를 다시 센 뒤 재조사를 정한다. 확인된 것이 하나도 없으면 작업은 마지막 실행의 종료 사유(계정 문제가 먼저)로 실패하고, 마지막 실행들이 모두 정상 종료였으면 `no_findings`다(재시작 뒤 하위 질문이나 보강 판단이 하나라도 돌았으면 `server_restart`가 아니다). 재조사를 예약해도 이전 실패는 재조사가 실제로 돌 때까지 남는다(시간 때문에 건너뛰면 그 실패가 작업의 오류). 조사 예산이 이미 끝난 채 재시작해도 기다리던 질문은 시간 상한으로 센다. 재조사와 보강 질문은 **실행 슬롯을 받는 순간** 조사 예산이 3분 넘게 남았는지 본다(동시 상한 뒤에 기다리던 것, 재시작 뒤 이어지는 것도). 재조사 직전 범위를 승인한 자료 범위로 다시 고정한다. 첫 조사의 노트는 남고(12개 상한 안에서 재조사가 새로 찾은 출처마다 적어도 한 자리), 확인하지 못한 주장은 앞뒤 것을 합쳐 중복을 먼저 지운 뒤 5개까지(같은 주장인지는 주장 전체의 해시(`claimKeyOf` — 노트 줄의 500자 자르기 전)로 비교하고, 프롬프트에 보일 때만 자른다), **최종으로 남은 노트**가 뒷받침하는 것만 뺀다. 시간이 모자라 슬롯에서 건너뛴 질문은 `skipped: "time"`으로 남기고 보고서의 "한계"에 "근거를 찾지 못한 하위 질문"이 아니라 시간 상한으로 센다(`timedOut`). 확인된 노트가 없어도 확인하지 못한 주장이 있으면 리드의 보강 질문을 받아들인다(그 주장을 확인하도록). 보강 판단 뒤에도 남은 시간을 다시 본다: 새 보강 단계는 3분, 2단계를 넘는 추가 단계(최대 3)는 8분 넘게 남았을 때만 질문을 더한다.
 - **1차 자료 우선**: 서브 연구자 프롬프트(`subagent.md` v5)가 정부·공공기관·대학·연구기관 자료를 먼저 찾게 한다. `web_fetch`·`web_search`·`sources_list` 결과와 노트에 도메인으로 정한 `sourceType`(`government`·`academic`·`organization`·`other`, `sourceTypeOf`)이 붙는다 — 판단의 참고일 뿐 검증이 아니다. 보고서 출처 목록에 표시하는 것은 #233.
+
+## 51. 미디어 생성 — 관리자 OpenRouter 키·모델·비용 한도 (#238 1단계)
+OpenRouter 모델로 이미지·음성(TTS)·음악·영상을 만드는 기능의 **관리자 설정과 공통 기반**이다. 도구(`image_generate`·`speech_generate`는 2단계, `video_generate`·음악은 3단계)는 아직 없다 — 이 단계에서는 설정·키·사용량 기록 틀·예산·요청 정책만 생긴다. 코드: `apps/server/src/media/`(`openrouter.ts` 고정 URL 읽기, `keys.ts` 키 결정, `service.ts` 관리자 동작, `settings.ts`, `budget.ts`, `policy.ts`, `fixture.ts` e2e용 가짜 OpenRouter), 화면 `apps/web/src/admin/MediaAdmin.tsx`, 형식 `packages/shared/src/media.ts`. 근거는 `docs/decisions/media-generation.md`.
+
+### 51.1 키 (관리자 → 미디어 생성 → OpenRouter 키)
+- **등록:** 키를 넣고 "확인하고 저장". 저장 **전에** `GET https://openrouter.ai/api/v1/key`로 확인한다 — 401/403이면 `media_key_invalid`(저장 안 함), 연결 실패·5xx면 `media_key_check_failed`(저장 안 함). 맞으면 `settings.media.openrouter_key`에 AES-256-GCM으로 암호화해 저장하고(`settings.setSecret` — 알려진 비밀로 등록돼 모든 출력에서 가려지고 egress 검사에 걸린다), 화면에는 **끝 4자리와 남은 한도**(`limit_remaining`, 제한 없는 키면 "제한 없음")만 보인다. 확인 결과(한도·사용액·시각, 끝 4자리)는 평문 `media.openrouter_key_status`에 둔다 — 키의 다른 부분은 없다.
+- **우선순위:** 관리자가 저장한 키 → 없으면 `.env`의 `OPENROUTER_API_KEY` → 없으면 키 없음. 요청할 때마다 다시 정하므로 저장·삭제가 재시작 없이 다음 요청부터 적용된다. **음성 전사 외부 대체(§46.2)도 같은 키를 쓴다**(관리자 → 스킬 → 음성 전사 외부 대체의 "키 설정됨"도 이 기준).
+- **삭제:** "키 지우기" — 관리자 키와 그 확인 결과를 지운다(`.env` 키가 있으면 그것을 쓴다). **"남은 한도 다시 확인"**은 지금 쓰는 키(관리자 또는 `.env`)로 다시 `/key`를 부른다.
+- 요청 규칙(`audio/openrouter.ts`와 같음): URL은 코드의 상수뿐, 리다이렉트 거부, 키는 `Authorization: Bearer` 헤더에만, URL은 보내기 전 `carriesSecret` 검사, 15초 시간 한도, 응답 8MB까지, 요청·응답 내용은 로그에 남기지 않는다.
+
+### 51.2 종류별 켜기와 모델
+- 이미지·음성·음악·영상마다 켜기와 대상 모델. **기본은 모두 꺼짐·모델 없음**(호출마다 돈이 든다). 켜려면 모델이 있어야 한다.
+- 모델 목록(키가 있어야 불러온다, 10분 재사용, "목록 새로 고침"은 다시 받음):
+
+  | 종류 | 목록 | 화면에 보이는 것 |
+  |---|---|---|
+  | 이미지 | `GET /api/v1/images/models` | `supported_parameters`(aspect_ratio·resolution 등), 가격은 항목·엔드포인트에 있으면 |
+  | 음성 | `GET /api/v1/audio/speech/models` | voice·response_format·speed 등, 가격은 엔드포인트에 있으면 |
+  | 음악 | `GET /api/v1/models?output_modalities=audio` (전용 목록 없음 — 출력에 `audio`가 있는 모델만) | `pricing`(요청당 등) |
+  | 영상 | `GET /api/v1/videos/models` | 길이·해상도·비율, `pricing_skus`(초당), 최대 길이 |
+- **저장 전 재확인:** 새로 켰거나 모델을 바꾼 종류는 그 종류의 목록을 **그 자리에서 다시 받아** 모델이 있는지 본다(없으면 409 `media_model_unknown`, 저장 안 함). 끄기·한도만 바꾸기는 OpenRouter를 부르지 않는다.
+
+### 51.3 비용·횟수 한도
+- **1인당 하루 비용 한도**(USD, 기본 **$50**, 소수 둘째 자리까지, 최대 10,000): 서비스 시간대(Asia/Seoul)의 하루 동안 그 사람의 `media` 사용량 행 비용 합. 2·3단계 도구는 호출 전에 `app.media.budget.remaining(userId)`/`allows(userId, 예상 비용)`로 확인한다. OpenRouter가 비용을 알려 주지 않은 생성은 합에 들어가지 않고 `uncosted`로 센다.
+- **한 번 실행당 최대 횟수**: 이미지 4·음성 3·음악 1·영상 1(기본, 0–50).
+- **영상 기본 길이 8초**(저장만 — 사용자가 더 길게 요청하면 모델 최대 길이까지, 3단계 확인 카드에서 적용).
+- 사용량: `usage_records`에 purpose `media`, runtime `openrouter`, 모델 id, **OpenRouter가 알려 준 실제 비용**(가격표 없이 그대로 — `UsageStore.recordMedia`)을 API 키 행으로 쓴다. 사용량 화면의 목적 "미디어 생성", 연결 "OpenRouter 키"로 보이고, 오늘 비용 알림(§사용량)·월 예상에도 들어간다. 토큰은 없다("—").
+
+### 51.4 청소년 계정과 요청 정책
+- 청소년 계정에도 **보인다**(2026-11-24 사용자 결정). 청소년 계정의 요청은 모델이 moderation 값을 내놓으면 그중 가장 엄격한 값을 보낸다(`policy.ts` `moderationFor`). 도구 설명의 금지 규칙은 모든 계정에 같다(2단계).
+- 모든 요청 본문에 `provider: { data_collection: "deny" }`(`withMediaPolicy` — 호출자가 다른 값을 넣어도 덮어씀), 프롬프트·지시문 등 나가는 글은 보내기 전에 `carriesSecret` 검사(`mediaRequestCarriesSecret`).
+
+### 51.5 시험
+- `pnpm vitest run apps/server/test/media.test.ts` — 가짜 `fetchImpl`·합성 키만(실제 OpenRouter 호출 없음): 키 확인·저장(암호화, 끝 4자리), 거부·장애 시 미저장, 우선순위(관리자 → `.env`)와 음성 전사 대체의 같은 결정, 종류별 목록 해석, 저장 전 모델 재확인, 기본값, 예산(사용자별·하루·덮어쓰기·0 아래로 안 감), 사용량 화면, 요청 정책.
+- `E2E_PORT=3138 pnpm e2e e2e/media-admin.spec.ts`(먼저 `pnpm build`) — e2e 서버(FAKE_RUNTIME)는 `media/fixture.ts`의 가짜 OpenRouter를 쓴다(`sk-or-v1-e2e`로 시작하는 키만 통과).

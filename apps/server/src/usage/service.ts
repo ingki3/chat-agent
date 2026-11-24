@@ -20,7 +20,11 @@ export const THRESHOLD_KEY = "usage.daily_cost_threshold_usd";
 /** The service-zone day ("YYYY-MM-DD") the daily cost notification was last sent for. */
 export const ALERTED_KEY = "usage.daily_cost_alerted_day";
 
-const RUNTIME_LABEL: Record<string, string> = { "claude-code": "Claude Code", codex: "Codex" };
+const RUNTIME_LABEL: Record<string, string> = {
+  "claude-code": "Claude Code",
+  codex: "Codex",
+  openrouter: "OpenRouter",
+};
 export const PURPOSE_LABEL: Record<UsagePurpose, string> = {
   chat: "대화",
   schedule: "예약",
@@ -29,9 +33,11 @@ export const PURPOSE_LABEL: Record<UsagePurpose, string> = {
   connection_test: "연결 테스트",
   dreaming: "기억 정리",
   research: "깊이 조사",
+  media: "미디어 생성",
 };
 const NO_CONNECTION = "연결 없음";
 const GONE_CONNECTION = "삭제된 연결";
+const OPENROUTER_KEY = "OpenRouter 키";
 const RECENT = 50;
 
 type Row = UsageRow & { userName: string | null; connectionLabel: string | null };
@@ -64,7 +70,10 @@ export function addRow(t: UsageTotals, r: UsageRow): void {
   t.outputTokens += r.outputTokens ?? 0;
   t.cacheReadTokens += r.cacheReadTokens ?? 0;
   t.cacheWriteTokens += r.cacheWriteTokens ?? 0;
-  if (r.inputTokens === null || r.outputTokens === null) t.tokensMissing += 1;
+  // A media generation (#238) has no tokens at all: not "미제공", just none.
+  if (r.purpose === "media") {
+    // nothing to count
+  } else if (r.inputTokens === null || r.outputTokens === null) t.tokensMissing += 1;
   else t.totalTokens += r.inputTokens + r.outputTokens;
   if (r.authType === "api_key") {
     t.apiKeyRequests += r.requestCount;
@@ -101,8 +110,13 @@ export function groupBy(rows: Row[], key: (r: Row) => [string, string]): UsageGr
 const byUser = (r: Row): [string, string] => [r.userId, r.userName ?? "?"];
 const byRuntime = (r: Row): [string, string] => [r.runtime, RUNTIME_LABEL[r.runtime] ?? r.runtime];
 const byModel = (r: Row): [string, string] => [`${r.runtime}/${r.model}`, r.model];
+/** Media rows (#238) have no runtime connection: they are grouped as the OpenRouter key. */
 const byConnection = (r: Row): [string, string] =>
-  r.connectionId === null ? ["none", NO_CONNECTION] : [r.connectionId, r.connectionLabel ?? GONE_CONNECTION];
+  r.connectionId === null
+    ? r.purpose === "media"
+      ? ["openrouter", OPENROUTER_KEY]
+      : ["none", NO_CONNECTION]
+    : [r.connectionId, r.connectionLabel ?? GONE_CONNECTION];
 const byPurpose = (r: Row): [string, string] => [r.purpose, PURPOSE_LABEL[r.purpose]];
 
 export type UsageServiceOptions = {

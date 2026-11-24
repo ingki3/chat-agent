@@ -74,7 +74,7 @@ export function UserSkillToggles({ user }: { user: Pick<AdminUser, "id" | "name"
 
 /**
  * 음성 전사의 외부 대체 (#173): OpenRouter `openai/whisper-large-v3`, used only when the local Whisper fails. Off by
- * default; needs `OPENROUTER_API_KEY` in `.env`.
+ * default; needs an OpenRouter key: the admin's (관리자 → 미디어 생성, #238) or `OPENROUTER_API_KEY` in `.env`.
  */
 function AudioFallbackToggle() {
   const qc = useQueryClient();
@@ -105,7 +105,9 @@ function AudioFallbackToggle() {
           OpenRouter 대체 허용
           <span className="muted small">
             {" "}
-            {a.keyConfigured ? "· 키 설정됨" : "· OPENROUTER_API_KEY 없음 — 켜도 쓰이지 않아요"}
+            {a.keyConfigured
+              ? "· 키 설정됨"
+              : "· OpenRouter 키 없음 — 관리자 → 미디어 생성에서 등록하거나 .env의 OPENROUTER_API_KEY. 그전에는 켜도 쓰이지 않아요"}
           </span>
         </label>
       )}

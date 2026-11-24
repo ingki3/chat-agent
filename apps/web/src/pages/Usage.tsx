@@ -16,6 +16,7 @@ const PURPOSE: Record<UsageRecordView["purpose"], string> = {
   connection_test: "연결 테스트",
   dreaming: "기억 정리",
   research: "깊이 조사",
+  media: "미디어 생성",
 };
 
 function GroupTable({ groups, label }: { groups: UsageGroup[]; label: string }) {
@@ -150,7 +151,7 @@ export function UsageAdmin() {
                       {x.model} <span className="muted small">{x.connectionLabel}</span>
                     </td>
                     <td>{PURPOSE[x.purpose]}</td>
-                    <td className="num">{recordTokens(x)}</td>
+                    <td className="num">{x.purpose === "media" ? "—" : recordTokens(x)}</td>
                     <td
                       className="num"
                       title={x.priceVersion === null ? undefined : `가격표 v${x.priceVersion}`}

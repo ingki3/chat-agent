@@ -553,7 +553,7 @@ export const usageRecords = sqliteTable(
     model: text("model").notNull(),
     connectionId: text("connection_id"),
     purpose: text("purpose", {
-      enum: ["chat", "schedule", "title", "summary", "connection_test", "dreaming", "research"],
+      enum: ["chat", "schedule", "title", "summary", "connection_test", "dreaming", "research", "media"],
     }).notNull(),
     /** All input tokens, cached ones included (as the adapter contract reports them). */
     inputTokens: integer("input_tokens"),
