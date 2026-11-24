@@ -82,7 +82,15 @@ export type MediaGeneratorOptions = {
   settings: Pick<MediaSettingsStore, "get" | "revision">;
   budget: Pick<MediaBudget, "allows">;
   usage:
-    | Pick<UsageStore, "reserveMedia" | "settleMedia" | "releaseMedia" | "answeredMedia" | "unconfirmMedia">
+    | Pick<
+        UsageStore,
+        | "reserveMedia"
+        | "settleMedia"
+        | "releaseMedia"
+        | "answeredMedia"
+        | "unconfirmMedia"
+        | "generationMedia"
+      >
     | undefined;
   /**
    * The key generation (관리자 → 미디어 생성's `<process>:<changes>`): a key swapped and swapped back during a call's
@@ -449,9 +457,10 @@ export class MediaGenerator {
     // A 200 is not a record: the model's endpoints, each with its parameters and its price list (OpenAPI required).
     const endpoints = Array.isArray(answer.endpoints) ? answer.endpoints : [];
     if (
-      (answer.id !== undefined && answer.id !== ctx.model) ||
+      answer.id !== ctx.model ||
       !endpoints.length ||
-      !endpoints.every((e) => isObj(e) && isObj(e.supported_parameters) && Array.isArray(e.pricing))
+      // Prices missing or empty are the cost bound's business (`media_no_price`), not a failed lookup.
+      !endpoints.every((e) => isObj(e) && isObj(e.supported_parameters))
     )
       throw new MediaToolError("media_lookup_failed");
     const params = mergeParams(endpoints.map((e) => (e as Record<string, unknown>).supported_parameters));
@@ -525,7 +534,8 @@ export class MediaGenerator {
         MIN_KNOWN_LENGTH,
         ...Object.values(this.o.secrets ?? {})
           .filter(Boolean)
-          .map((v) => [...v].length),
+          // UTF-16 units, as the registry measures (MIN_KNOWN_LENGTH) and as `textRuns` counts.
+          .map((v) => v.length),
       ),
     );
     return files.map((f) => {
@@ -647,6 +657,20 @@ export class MediaGenerator {
   }
 
   /**
+   * The 2xx headers came: OpenRouter's generation id (validated) is written on the reserving row at once — before
+   * the body is read or the cost looked up — so a process that stops now leaves a row the next one can settle.
+   */
+  private headersCame(ctx: CallCtx, callId: string, res: Response): string | null {
+    const raw = res.headers.get("x-generation-id");
+    const id = raw && GENERATION_ID.test(raw) ? raw : null;
+    if (id)
+      this.write(ctx, "settle", () =>
+        this.o.usage?.generationMedia(mediaRunKey(ctx.scope.runId, callId), id),
+      );
+    return id;
+  }
+
+  /**
    * After a 2xx: the reported cost settles the row; without one, the row waits for its cost (`awaiting_cost`, the
    * settler looks the generation id up later) or — no id to look up — can never be confirmed (`unconfirmed`). The
    * bound holds the budget until then.
@@ -675,7 +699,7 @@ export class MediaGenerator {
       throw this.refused(ctx, callId, e);
     }
     // 2xx: the reserving row stays; from here the money may be spent whatever happens to the answer.
-    const generationId = res.headers.get("x-generation-id");
+    const generationId = this.headersCame(ctx, callId, res);
     let answer: unknown;
     try {
       answer = JSON.parse(new TextDecoder().decode(await readBytes(res, IMAGE_ANSWER_MAX)));
@@ -722,7 +746,7 @@ export class MediaGenerator {
       throw this.refused(ctx, callId, e);
     }
     // 2xx: the reserving row stays, and the cost is looked up whatever happens to the body or the file.
-    const generation = res.headers.get("x-generation-id");
+    const generation = this.headersCame(ctx, callId, res);
     let bytes: Buffer | null = null;
     if (/json/i.test(res.headers.get("content-type") ?? "")) await res.body?.cancel().catch(() => {});
     else {
@@ -858,11 +882,12 @@ export async function generationCost(
   id: string,
   apiKey: string,
   fetchImpl?: typeof fetch | undefined,
+  signal?: AbortSignal | undefined,
 ): Promise<number | null> {
   const url = generationUrl(id);
   if (!url) return null;
   try {
-    const a = await openRouterGet(url, { apiKey, ...(fetchImpl ? { fetchImpl } : {}) });
+    const a = await openRouterGet(url, { apiKey, signal, ...(fetchImpl ? { fetchImpl } : {}) });
     const c = isObj(a) && isObj(a.data) ? a.data.total_cost : undefined;
     return typeof c === "number" && Number.isFinite(c) && c >= 0 ? c : null;
   } catch {

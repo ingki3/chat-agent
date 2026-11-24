@@ -607,9 +607,15 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const usageService = new UsageService(
       opts.db!,
       settingsStore,
-      (amountUsd, thresholdUsd) => {
+      (amountUsd, thresholdUsd, pastDay) => {
         for (const admin of connectionStore.admins())
-          notifications.publish(admin, { kind: "daily_cost", amountUsd, thresholdUsd, url: "/admin" });
+          notifications.publish(admin, {
+            kind: "daily_cost",
+            amountUsd,
+            thresholdUsd,
+            url: "/admin",
+            ...(pastDay ? { pastDay } : {}),
+          });
       },
       app.log,
       { timeZone: DEFAULT_TIME_ZONE, ...opts.usage },

@@ -43,7 +43,10 @@ export function tokenText(t: Pick<UsageTotals, "requests" | "tokensMissing" | "t
 }
 
 /** One record's cost. */
-export function recordCost(r: Pick<UsageRecordView, "authType" | "costUsd">): string {
+export function recordCost(
+  r: Pick<UsageRecordView, "authType" | "costUsd"> & Partial<Pick<UsageRecordView, "costPending">>,
+): string {
+  if (r.costPending && r.costUsd === null) return PENDING;
   if (r.authType === "subscription") return "구독 · 비용 없음";
   if (r.authType === "unknown") return `${UNKNOWN} (${NOT_PROVIDED})`;
   if (r.authType === null) return "—";

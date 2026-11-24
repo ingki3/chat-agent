@@ -34,7 +34,9 @@ const price = (v: unknown): number | undefined => {
  * An image request's bound from its model's endpoint records (`ImageEndpoint.pricing: [{billable, unit, cost_usd,
  * variant?}]`): the dearest endpoint; per billable part its dearest line (a variant is a tier) times its most
  * possible quantity. Every endpoint must list its output image's price (`0` = confirmed free). `references`: the
- * megapixels of each reference image actually sent. Null = no bound.
+ * megapixels of each reference image actually sent — each billed as at least 1 and rounded up to a whole megapixel
+ * (providers round per image: BFL, review r3), so small references never reserve less than they cost. Null = no
+ * bound.
  */
 export function imageCostBound(
   endpoints: readonly unknown[],
@@ -75,7 +77,11 @@ function imageQuantity(
   const refs = o.references;
   switch (billable) {
     case "output_image":
-      return unit === "image" || unit === "request" ? 1 : unit === "megapixel" ? MAX_IMAGE_MEGAPIXELS : null;
+      return unit === "image" || unit === "request"
+        ? 1
+        : unit === "megapixel"
+          ? Math.ceil(MAX_IMAGE_MEGAPIXELS)
+          : null;
     case "input_text":
       return unit === "token" ? utf8(o.prompt) + 64 : unit === "request" ? 1 : null;
     case "input_image":
@@ -84,7 +90,8 @@ function imageQuantity(
       return unit === "image"
         ? refs.length
         : unit === "megapixel"
-          ? refs.reduce((a, b) => a + b, 0)
+          ? // Per reference, rounded up to whole megapixels with at least one (providers bill each image so).
+            refs.reduce((a, b) => a + Math.max(1, Math.ceil(b)), 0)
           : unit === "request"
             ? 1
             : null;

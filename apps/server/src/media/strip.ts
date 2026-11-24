@@ -258,7 +258,7 @@ const ok = (width: number, height: number) =>
 
 /**
  * The text runs in binary data, for the egress check: printable ASCII and well-formed UTF-8 sequences, at least
- * `min` characters long (the shortest secret the server checks for). A secret written into a file is such a run;
+ * `min` UTF-16 units long (the shortest secret the server checks for, measured as the registry measures). A secret written into a file is such a run;
  * compressed pixel data has only short accidental ones. Null when there are more than `MAX_RUNS` or they add up to
  * more than `maxTotal` characters — the caller refuses such a file, it never goes unchecked.
  */
@@ -287,7 +287,9 @@ export function textRuns(b: Buffer, min = 8, maxTotal = 1024 * 1024): string[] |
       continue;
     }
     if (start < 0) start = i;
-    chars++;
+    // UTF-16 units — what the secret registry measures (`MIN_KNOWN_LENGTH`, String.length): a character outside the
+    // BMP (a 4-byte sequence) is two, so a registered value of exactly the minimum is never too short here.
+    chars += n === 4 ? 2 : 1;
     i += n;
   }
   return close(b.length) ? runs : null;

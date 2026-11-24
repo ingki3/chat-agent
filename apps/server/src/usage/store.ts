@@ -1,4 +1,4 @@
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import type { UsagePurpose } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { connections, usageRecords } from "../db/schema.js";
@@ -288,14 +288,59 @@ export class UsageStore {
       .run();
   }
 
-  /** Generations waiting for their cost (`awaiting_cost`), oldest first. */
-  awaitingMedia(limit = 50): {
-    runKey: string;
-    generationId: string | null;
-    tries: number;
-    createdAt: number;
-    updatedAt: number;
-  }[] {
+  /**
+   * The generation id of a reserved generation, written as soon as the 2xx headers came (before its body is read
+   * or its cost looked up): a process that stops right then leaves a row the next one can still settle.
+   */
+  generationMedia(runKey: string, generationId: string): void {
+    this.db
+      .update(usageRecords)
+      .set({ mediaGenerationId: generationId, updatedAt: this.now() })
+      .where(
+        and(
+          eq(usageRecords.runId, runKey),
+          eq(usageRecords.purpose, "media"),
+          eq(usageRecords.mediaSettlement, "reserved"),
+        ),
+      )
+      .run();
+  }
+
+  /**
+   * At start: `reserved` rows made before `before` (a previous process's — it stopped between sending and
+   * settling) wait for their cost when they have a generation id, else are `unconfirmed` (their reserved amount
+   * stays). Returns how many were taken up.
+   */
+  recoverReservedMedia(before: number): number {
+    const at = this.now();
+    const stale = and(
+      eq(usageRecords.purpose, "media"),
+      eq(usageRecords.mediaSettlement, "reserved"),
+      lt(usageRecords.createdAt, before),
+    );
+    const a = this.db
+      .update(usageRecords)
+      .set({ mediaSettlement: "awaiting_cost", updatedAt: at })
+      .where(and(stale, isNotNull(usageRecords.mediaGenerationId)))
+      .run().changes;
+    const b = this.db
+      .update(usageRecords)
+      .set({ mediaSettlement: "unconfirmed", updatedAt: at })
+      .where(and(stale, isNull(usageRecords.mediaGenerationId)))
+      .run().changes;
+    return a + b;
+  }
+
+  /**
+   * Generations waiting for their cost (`awaiting_cost`) that are due at `at`: their backoff since the last try
+   * (1 min · 2^tries, at most 6 h) has passed, or they are to be given up (no id, too many tries, too old) — the due
+   * ones are chosen first, then at most `limit`, oldest try first.
+   */
+  dueMedia(
+    at: number,
+    o: { maxTries: number; maxAgeMs: number; limit: number },
+  ): { runKey: string; generationId: string | null; tries: number; createdAt: number; updatedAt: number }[] {
+    const tries = sql`coalesce(${usageRecords.mediaSettleTries}, 0)`;
     return this.db
       .select({
         runKey: usageRecords.runId,
@@ -305,9 +350,20 @@ export class UsageStore {
         updatedAt: usageRecords.updatedAt,
       })
       .from(usageRecords)
-      .where(and(eq(usageRecords.purpose, "media"), eq(usageRecords.mediaSettlement, "awaiting_cost")))
+      .where(
+        and(
+          eq(usageRecords.purpose, "media"),
+          eq(usageRecords.mediaSettlement, "awaiting_cost"),
+          or(
+            isNull(usageRecords.mediaGenerationId),
+            sql`${tries} >= ${o.maxTries}`,
+            lt(usageRecords.createdAt, at - o.maxAgeMs),
+            sql`${usageRecords.updatedAt} + min(21600000, 60000 * (1 << min(${tries}, 20))) <= ${at}`,
+          ),
+        ),
+      )
       .orderBy(asc(usageRecords.updatedAt))
-      .limit(limit)
+      .limit(o.limit)
       .all()
       .map((r) => ({ ...r, tries: r.tries ?? 0 }));
   }

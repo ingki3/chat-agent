@@ -42,6 +42,12 @@ const RECENT = 50;
 
 type Row = UsageRow & { userName: string | null; connectionLabel: string | null };
 
+/** A media generation still going, or waiting for its cost (#238): "진행 중" in totals and in the record list alike. */
+export const isPending = (r: Pick<UsageRow, "purpose" | "pricedCostMicros" | "mediaSettlement">): boolean =>
+  r.purpose === "media" &&
+  r.pricedCostMicros === null &&
+  (r.mediaSettlement === "reserved" || r.mediaSettlement === "awaiting_cost");
+
 export function emptyTotals(): UsageTotals {
   return {
     requests: 0,
@@ -80,7 +86,7 @@ export function addRow(t: UsageTotals, r: UsageRow): void {
     t.apiKeyRequests += r.requestCount;
     if (r.pricedCostMicros !== null) t.costMicroUsd += r.pricedCostMicros;
     // A media generation still going, or waiting for its cost (#238): "진행 중", not "미제공".
-    else if (r.mediaSettlement === "reserved" || r.mediaSettlement === "awaiting_cost") t.costPending += 1;
+    else if (isPending(r)) t.costPending += 1;
     else t.costMissing += 1;
   } else if (r.authType === "subscription") t.subscriptionRequests += r.requestCount;
   else if (r.authType === "unknown") {
@@ -142,7 +148,8 @@ export class UsageService {
   constructor(
     private readonly db: Db,
     private readonly settings: SettingsLike,
-    private readonly notifyAdmins: (amountUsd: number, thresholdUsd: number) => void,
+    /** `pastDay`: the day the cost belongs to when it is not today (a late media settlement, #238). */
+    private readonly notifyAdmins: (amountUsd: number, thresholdUsd: number, pastDay?: string) => void,
     private readonly log: EventLogger | undefined,
     opts: UsageServiceOptions = {},
   ) {
@@ -212,6 +219,7 @@ export class UsageService {
       totalTokens: r.inputTokens === null || r.outputTokens === null ? null : r.inputTokens + r.outputTokens,
       costUsd: r.authType === "api_key" && r.pricedCostMicros !== null ? toUsd(r.pricedCostMicros) : null,
       priceVersion: r.priceVersion,
+      ...(isPending(r) ? { costPending: true } : {}),
     }));
     return {
       month: m.month,
@@ -289,7 +297,9 @@ export class UsageService {
       });
       if (!claimed) return;
       logEvent(this.log, "info", "usage.daily_cost_alert", { costUsd: amount });
-      this.notifyAdmins(amount, threshold);
+      const today = monthInfo(this.now(), this.timeZone).today;
+      if (day === today) this.notifyAdmins(amount, threshold);
+      else this.notifyAdmins(amount, threshold, day);
     } catch (e) {
       logEvent(this.log, "warn", "usage.alert_failed", { err: e });
     }

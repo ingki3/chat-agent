@@ -2471,6 +2471,14 @@ OpenRouter 모델로 이미지·음성(TTS)·음악·영상을 만드는 기능�
   - **참고 이미지 파서:** WebP 애니메이션 프레임(`ANMF`) 안도 VP8·VP8L·ALPH만 남기고, 프레임에 그림이 없거나 RIFF 크기·청크 길이·패딩이 맞지 않으면(잘린 파일) 거절한다. PNG는 IHDR(첫 청크, 13바이트)·IDAT·IEND가 있어야 하고 JPEG는 SOF·SOS·EOI가 있어야 한다. 청크·세그먼트는 이미지당 4096개, 비밀값 검사용 문자열은 2만 개·100만 자까지 — 넘으면 더 만들기 전에 거절. 비밀값 검사는 인쇄 가능 ASCII와 올바른 UTF-8 문자의 연속을, 서버가 확인하는 가장 짧은 비밀값 길이(등록 비밀값 8자, `.env` 값이 더 짧으면 그 길이, 최소 4자)부터 본다.
   - **Range:** `If-Range`가 있으면 항상 전체 200(이 경로는 ETag·Last-Modified가 없다). 단위 `bytes`는 대소문자를 가리지 않고, 앞의 0과 아주 긴 숫자도 넘침 없이 파일 크기와 비교한다.
   - **사용량 화면:** 진행 중(`reserved`)·비용 대기(`awaiting_cost`) 미디어 행은 "미제공"이 아니라 "진행 중 n건"으로 따로 센다(`UsageTotals.costPending`). `unconfirmed`는 미제공.
+- **리뷰 3차 보강:**
+  - **참고 이미지 megapixel 올림:** 입력 megapixel 단가는 참고 이미지마다 최소 1MP, 소수는 올림한 값으로 예약한다(공급자가 장마다 올림해 청구한다 — 64×64 두 장도 2MP). 출력 megapixel도 올림(68MP).
+  - **이미지 모델 기록의 `id`:** 없거나 고른 모델과 다르면 `media_lookup_failed`(보내지 않음). 그 모델의 기록인데 가격이 없거나(필드 자체가 없어도) 비었으면 `media_no_price`로 같게 처리한다.
+  - **2xx 헤더 즉시 id 기록:** `X-Generation-Id`(검증한 `gen-…`)를 본문을 읽거나 비용을 조회하기 **전에** 예약 행에 쓴다. 서버가 시작할 때 정산기가 이전 프로세스가 남긴 `reserved` 행(이 프로세스 시작 전에 만든 행)을 찾아, id가 있으면 `awaiting_cost`(다시 조회), 없으면 `unconfirmed`(예약액 유지)로 바꾼다.
+  - **정산기:** 백오프가 지난 행(또는 포기할 행)을 먼저 고른 뒤 100건씩 처리한다. 종료하면 새 조회를 시작하지 않고 진행 중인 조회를 중단한다(그 행은 다음 시작 때 이어 간다).
+  - **비밀값 길이 단위:** 등록기(`MIN_KNOWN_LENGTH`, 문자열 길이 = UTF-16 단위)와 참고 이미지 검사(`textRuns`)가 같은 단위를 쓴다 — BMP 밖 문자(이모지 등)는 2단위.
+  - **늦은 비용 알림의 날짜:** 지난 날의 비용이면 알림 제목·본문이 "오늘" 대신 그 날짜("11월 22일 비용이 기준을 넘었어요")를 말한다.
+  - **사용량 최근 요청 목록:** 진행 중인 미디어 행은 합계와 같게 "진행 중"으로 보인다(`UsageRecordView.costPending`).
 - **음성 생성이 없을 때(사용자 요구, 운영에서 관찰):** 실행의 도구 목록에 `speech_generate`가 없으면(음성 꺼짐·모델 없음·키 없음·예약 실행) 시스템 지침에 짧은 규칙이 붙는다(`instructions/assemble.ts` `SPEECH_OFF_RULE`, Claude·Codex 공통): 음성을 만들지 않는다 — 브라우저 `speechSynthesis`·Web Speech API·OS TTS·그것을 쓰는 아티팩트로 대신하지 않고, 음성 생성 기능이 꺼져 있다(관리자 → 미디어 생성에서 켤 수 있다)고 알린다. 음성과 관계없는 아티팩트는 그대로 만든다. 운영에서 음성 도구가 없을 때 에이전트가 `speechSynthesis`로 대본을 읽는 HTML 아티팩트를 만든 일이 있어 넣었다.
 - **로그:** `media.finished` 한 줄 — 도구 이름, 고정 코드(`mediaCode`), 걸린 시간, ID만. 프롬프트·글·목소리·파일은 남기지 않는다. 실패는 관리자 → 오류 목록에 코드로.
 - **채팅 표시:** 답의 `file_ref`가 이미지(png·jpg·webp)면 그 자리에 미리보기(`<img>`, 최대 480px), 음성(mp3·m4a·wav)이면 `<audio controls>` 재생기, 그 아래 내려받기 칩. 둘 다 `/api/files/<id>/content?inline=1`에서 받는다. 파일 원본 응답은 권한 검사를 마친 뒤 **단일 byte range**를 받는다(`Accept-Ranges: bytes`, `Range: bytes=a-b`·`a-`·`-n` → 206 + `Content-Range`, 파일 끝을 넘으면 416 + `Content-Range: bytes */크기`; 여러 범위나 형식이 다른 헤더는 전체 200) — iOS의 재생·건너뛰기용. 인라인으로 주는 종류(`INLINE_KINDS`)는 png·jpg·webp·m4a·mp3·wav뿐이고, 원본 응답의 CSP(`FILE_CSP`)에 `media-src 'self'`를 더했다(그 밖은 그대로 — `sandbox`, `default-src 'none'`). 사용자가 올린 첨부(사용자 메시지)는 예전처럼 칩만 보인다. WebP는 이번에 파일 종류로 더해져 업로드도 받는다(내용 서명 `RIFF…WEBP` 확인).

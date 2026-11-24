@@ -20,6 +20,7 @@ import { byteRange, FILE_CSP } from "../src/files/routes.js";
 import { imageCostBound, speechCostBound } from "../src/media/cost.js";
 import { imageSize, MAX_PARTS, MAX_RUNS, stripImage, textRuns } from "../src/media/strip.js";
 import { MAX_TRIES, MediaSettler } from "../src/media/settle.js";
+import { compose } from "../src/notifications/compose.js";
 import { usageRecords } from "../src/db/schema.js";
 import { addRow, emptyTotals, UsageService } from "../src/usage/service.js";
 import { mediaRunKey, UsageStore } from "../src/usage/store.js";
@@ -1093,6 +1094,7 @@ describe("media tools: review round 1 regressions (#246)", () => {
       fetchImpl: overriding({
         [IMAGE_RECORD]: () =>
           Response.json({
+            id: "fixture/image-one",
             endpoints: [
               {
                 supported_parameters: { aspect_ratio: { type: "enum", values: ["1:1", secret, "<b>x</b>"] } },
@@ -1169,6 +1171,7 @@ describe("media tools: review round 1 regressions (#246)", () => {
       fetchImpl: overriding({
         [IMAGE_RECORD]: () =>
           Response.json({
+            id: "fixture/image-one",
             endpoints: [
               {
                 supported_parameters: { output_format: { type: "enum", values: formats } },
@@ -1410,6 +1413,7 @@ describe("media tools: review round 2 regressions (#246)", () => {
 
   it("P2: input references priced per megapixel are reserved on their real area; an oversized one is refused", async () => {
     const record = {
+      id: "fixture/image-one",
       endpoints: [
         {
           supported_parameters: {},
@@ -1447,10 +1451,8 @@ describe("media tools: review round 2 regressions (#246)", () => {
     expect(
       (await t.app.media!.tools.run("image", scope, { prompt: "밝게", referenceFileIds: [small] })).ok,
     ).toBe(true);
-    // (0.04 + 64·64 / 1e6 × $1) × 1.2 — the reference's real area, not 67 megapixels' worth.
-    expect(t.usageRows()[before]!.estimated_cost_micros).toBe(
-      Math.ceil((0.04 + (64 * 64) / 1e6) * 1.2 * 1e6),
-    );
+    // (0.04 + 1 MP × $1) × 1.2 — the reference's real area rounded up per image (review r3), not 67 MP's worth.
+    expect(t.usageRows()[before]!.estimated_cost_micros).toBe(Math.ceil((0.04 + 1) * 1.2 * 1e6));
     const posts = t.posts().length;
     expect(
       await t.app.media!.tools.run("image", scope, { prompt: "밝게", referenceFileIds: [big] }),
@@ -1521,13 +1523,13 @@ describe("media tools: review round 2 regressions (#246)", () => {
       .prepare("INSERT INTO users (id, email, name, role) VALUES ('u1', 'u1@x.test', 'u1', 'member')")
       .run();
     const kv = new Map<string, string>([["usage.daily_cost_threshold_usd", "1.5"]]);
-    const alerts: number[] = [];
+    const alerts: [number, string | undefined][] = [];
     const service = new UsageService(
       db,
       { get: (k) => kv.get(k), set: (k, v) => void kv.set(k, v) },
-      (amount) => void alerts.push(amount),
+      (amount, _threshold, pastDay) => void alerts.push([amount, pastDay]),
       undefined,
-      { timeZone: "Asia/Seoul" },
+      { timeZone: "Asia/Seoul", now: () => now },
     );
     let now = Date.UTC(2026, 10, 11, 14, 50); // 23:50 in Seoul
     const store = new UsageStore(db, () => now, { onRecorded: (at) => service.checkDailyCost(at) });
@@ -1557,10 +1559,14 @@ describe("media tools: review round 2 regressions (#246)", () => {
       model: "m",
       costUsd: 2,
     });
-    expect(alerts).toEqual([2]);
+    expect(alerts).toEqual([[2, undefined]]);
     // …then yesterday's call is settled: the 11th goes over and alerts once, the 12th does not again.
     store.settleMedia(mediaRunKey("b", "2"), 1);
-    expect(alerts).toEqual([2, 2]);
+    // The 11th's alert says which day it is (not "today").
+    expect(alerts).toEqual([
+      [2, undefined],
+      [2, "2026-11-11"],
+    ]);
     store.recordMedia({
       userId: "u1",
       conversationId: null,
@@ -1569,13 +1575,14 @@ describe("media tools: review round 2 regressions (#246)", () => {
       model: "m",
       costUsd: 1,
     });
-    expect(alerts).toEqual([2, 2]);
+    expect(alerts).toHaveLength(2);
     expect(JSON.parse(kv.get("usage.daily_cost_alerted_day")!)).toEqual(["2026-11-11", "2026-11-12"]);
   });
 
   it("P2: a 200 that is not a model record is media_lookup_failed; unreadable moderation stops a youth call", async () => {
     let speech: unknown = {};
     let image: unknown = {
+      id: "fixture/image-one",
       endpoints: [
         {
           supported_parameters: { moderation: { type: "enum", values: ["blocked-ish"] } },
@@ -1798,5 +1805,289 @@ describe("media tools: review round 2 regressions (#246)", () => {
     const t = emptyTotals();
     for (const r of db.select().from(usageRecords).all()) addRow(t, r);
     expect(t).toMatchObject({ requests: 3, costPending: 2, costMissing: 1, costMicroUsd: 0 });
+  });
+});
+
+// ---------------------------------------------------------------- review round 3 (#246)
+
+describe("media tools: review round 3 regressions (#246)", () => {
+  const MP_RECORD = {
+    id: "fixture/image-one",
+    endpoints: [
+      {
+        supported_parameters: {},
+        pricing: [
+          { billable: "output_image", unit: "image", cost_usd: 0.04 },
+          { billable: "input_image", unit: "megapixel", cost_usd: 0.015 },
+        ],
+      },
+    ],
+  };
+
+  it("P1: small references are reserved per image rounded up to whole megapixels", async () => {
+    // Two 64×64 references: billed 1 MP each by a provider that rounds per image ($0.04 + 2 × $0.015 = $0.07).
+    expect(
+      imageCostBound(MP_RECORD.endpoints, { prompt: "x", references: [0.004096, 0.004096] }),
+    ).toBeCloseTo((0.04 + 2 * 0.015) * 1.2, 9);
+    expect(imageCostBound(MP_RECORD.endpoints, { prompt: "x", references: [2.1] })).toBeCloseTo(
+      (0.04 + 3 * 0.015) * 1.2,
+      9,
+    );
+    const t = await start({ fetchImpl: overriding({ [IMAGE_RECORD]: () => Response.json(MP_RECORD) }) });
+    t.enable(
+      settingsWith(
+        { image: "fixture/image-one" },
+        { perRunLimits: { image: 10, speech: 3, music: 1, video: 1 } },
+      ),
+    );
+    const conv = t.app.conversations!.create(t.f.users.owner.id);
+    const a = String(outputOf(await t.send(conv.id, "/image 하나")).fileId);
+    const b = String(outputOf(await t.send(conv.id, "/image 둘")).fileId);
+    const scope = await t.scopeOf(conv.id);
+    // $0.06 left: more than the old estimate ($0.048), less than what the call can cost ($0.07 → $0.084 bound).
+    const spent = t.usageRows().reduce((x, r) => x + (r.cost_usd ?? 0), 0);
+    t.app.usageStore!.recordMedia({
+      userId: t.f.users.owner.id,
+      conversationId: conv.id,
+      runId: "earlier",
+      callId: "c",
+      model: "m",
+      costUsd: +(49.94 - spent).toFixed(6),
+    });
+    const posts = t.posts().length;
+    expect(
+      await t.app.media!.tools.run("image", scope, { prompt: "합치기", referenceFileIds: [a, b] }),
+    ).toMatchObject({ code: "media_budget" });
+    expect(t.posts()).toHaveLength(posts);
+  });
+
+  it("P2: the generation id is on the row as soon as the 2xx headers came; a previous process's reservations are taken up", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const t = await start({
+      fetchImpl: overriding({
+        [OPENROUTER_SPEECH_URL]: () =>
+          new Response(
+            new ReadableStream({
+              async start(c) {
+                await gate;
+                c.enqueue(new Uint8Array(silentMp3()));
+                c.close();
+              },
+            }),
+            { headers: { "content-type": "audio/mpeg", "x-generation-id": FIXTURE_GENERATION_ID } },
+          ),
+      }),
+    });
+    t.enable(settingsWith({ speech: "fixture/voice-one" }));
+    const conv = t.app.conversations!.create(t.f.users.owner.id);
+    const scope = await t.scopeOf(conv.id);
+    const call = t.app.media!.tools.run("speech", scope, { text: "안녕" });
+    const row = () =>
+      t.db.$client
+        .prepare(
+          "SELECT media_settlement s, media_generation_id g FROM usage_records WHERE purpose = 'media'",
+        )
+        .all() as { s: string; g: string | null }[];
+    // The body is still held: the row is reserved, and already carries the id.
+    await vi.waitFor(() => expect(row()).toEqual([{ s: "reserved", g: FIXTURE_GENERATION_ID }]));
+    release();
+    expect((await call).ok).toBe(true);
+    // A previous process's rows: one with an id, one without (it stopped before the headers).
+    t.app.usageStore!.reserveMedia({
+      userId: t.f.users.owner.id,
+      conversationId: conv.id,
+      runId: "old",
+      callId: "1",
+      model: "m",
+      estimateUsd: 0.5,
+    });
+    t.app.usageStore!.generationMedia(mediaRunKey("old", "1"), "gen-old-1");
+    t.app.usageStore!.reserveMedia({
+      userId: t.f.users.owner.id,
+      conversationId: conv.id,
+      runId: "old",
+      callId: "2",
+      model: "m",
+      estimateUsd: 0.25,
+    });
+    const later = Date.now() + 10;
+    const settler = new MediaSettler({
+      usage: t.app.usageStore!,
+      keys: t.app.media!.keys,
+      fetchImpl: t.fetchImpl,
+      now: () => later + 5,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(settler.recover()).toBe(2);
+    const states = t.db.$client
+      .prepare(
+        "SELECT run_id r, media_settlement s, estimated_cost_micros e FROM usage_records WHERE run_id LIKE 'old%' ORDER BY run_id",
+      )
+      .all();
+    expect(states).toEqual([
+      { r: mediaRunKey("old", "1"), s: "awaiting_cost", e: 500_000 },
+      { r: mediaRunKey("old", "2"), s: "unconfirmed", e: 250_000 },
+    ]);
+    // Rows of this process's calls in flight (newer than its start) are not touched.
+    t.app.usageStore!.reserveMedia({
+      userId: t.f.users.owner.id,
+      conversationId: conv.id,
+      runId: "new",
+      callId: "1",
+      model: "m",
+      estimateUsd: 0.1,
+    });
+    const fresh = new MediaSettler({ usage: t.app.usageStore!, keys: t.app.media!.keys, now: () => 0 });
+    expect(fresh.recover()).toBe(0);
+  });
+
+  it("P2: an image model record without its id (or another id) is media_lookup_failed — no POST", async () => {
+    let record: Record<string, unknown> = {
+      endpoints: [
+        { supported_parameters: {}, pricing: [{ billable: "output_image", unit: "image", cost_usd: 0.04 }] },
+      ],
+    };
+    const t = await start({ fetchImpl: overriding({ [IMAGE_RECORD]: () => Response.json(record) }) });
+    t.enable(settingsWith({ image: "fixture/image-one" }));
+    const conv = t.app.conversations!.create(t.f.users.owner.id);
+    const scope = await t.scopeOf(conv.id);
+    expect(await t.app.media!.tools.run("image", scope, { prompt: "산" })).toMatchObject({
+      code: "media_lookup_failed",
+    });
+    record = { ...record, id: "other/model" };
+    expect(await t.app.media!.tools.run("image", scope, { prompt: "산" })).toMatchObject({
+      code: "media_lookup_failed",
+    });
+    // P3: a record of the model whose prices are missing (not only empty) is media_no_price, like an empty list.
+    record = { id: "fixture/image-one", endpoints: [{ supported_parameters: {} }] };
+    expect(await t.app.media!.tools.run("image", scope, { prompt: "산" })).toMatchObject({
+      code: "media_no_price",
+    });
+    expect(t.posts()).toEqual([]);
+  });
+
+  it("P2: secret lengths are counted in UTF-16 units by the registry and the reference scan alike", () => {
+    // Four characters outside the BMP: 8 UTF-16 units — the registry's minimum.
+    const value = "😀😀😀😀";
+    expect(value.length).toBe(8);
+    expect(textRuns(Buffer.from(`\x00${value}\x00`, "utf8"), 8)).toEqual([value]);
+    // Three of them (6 units) stay under it.
+    expect(textRuns(Buffer.from("\x00😀😀😀\x00", "utf8"), 8)).toEqual([]);
+    knownSecrets.add(`gate-${value}`, { fresh: true });
+    const runs = textRuns(Buffer.from(`\x01\x02gate-${value}\x03`, "utf8"), 8)!;
+    expect(runs).toEqual([`gate-${value}`]);
+  });
+
+  it("P2: a late daily-cost alert names its day (not 오늘)", () => {
+    const n = compose({ kind: "daily_cost", amountUsd: 2, thresholdUsd: 1.5, pastDay: "2026-11-22" });
+    expect(n.title).toBe("11월 22일 비용이 기준을 넘었어요");
+    expect(n.body).toMatch(/^11월 22일 /);
+    const today = compose({ kind: "daily_cost", amountUsd: 2, thresholdUsd: 1.5 });
+    expect(today.title).toBe("오늘 비용이 기준을 넘었어요");
+  });
+
+  it("P3: the settler starts no new lookup once stopped, and aborts the one under way", async () => {
+    let started = 0;
+    let aborted = 0;
+    const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+      started++;
+      return new Promise<Response>((_, reject) =>
+        init?.signal?.addEventListener("abort", () => {
+          aborted++;
+          reject(new Error("aborted"));
+        }),
+      );
+    }) as typeof fetch;
+    const db = createTestDb();
+    db.$client
+      .prepare("INSERT INTO users (id, email, name, role) VALUES ('u1', 'u1@x.test', 'u1', 'member')")
+      .run();
+    const store = new UsageStore(db, () => 0);
+    for (const i of [1, 2, 3]) {
+      store.reserveMedia({
+        userId: "u1",
+        conversationId: null,
+        runId: "r",
+        callId: String(i),
+        model: "m",
+        estimateUsd: 1,
+      });
+      store.answeredMedia(mediaRunKey("r", String(i)), `gen-${i}`);
+    }
+    const settler = new MediaSettler({
+      usage: store,
+      keys: { resolve: () => ({ key: KEY, source: "env" }) },
+      fetchImpl,
+      now: () => 10 * 60_000,
+    });
+    const pass = settler.runOnce();
+    await vi.waitFor(() => expect(started).toBe(1));
+    await settler.stop();
+    await pass;
+    expect(started).toBe(1);
+    expect(aborted).toBe(1);
+    // Nothing recorded for the aborted one: all three still wait (looked up again at the next start).
+    expect(store.dueMedia(10 * 60_000, { maxTries: 12, maxAgeMs: 1e12, limit: 10 })).toHaveLength(3);
+    await settler.runOnce();
+    expect(started).toBe(1);
+  });
+
+  it("P3: due rows are chosen before the batch limit", () => {
+    const db = createTestDb();
+    db.$client
+      .prepare("INSERT INTO users (id, email, name, role) VALUES ('u1', 'u1@x.test', 'u1', 'member')")
+      .run();
+    let now = 1_000_000;
+    const store = new UsageStore(db, () => now);
+    // An old row that was tried long ago (due), then 100 rows tried just now (backoff not passed).
+    store.reserveMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "due",
+      callId: "0",
+      model: "m",
+      estimateUsd: 1,
+    });
+    store.answeredMedia(mediaRunKey("due", "0"), "gen-due");
+    now += 10 * 60_000;
+    for (let i = 0; i < 100; i++) {
+      store.reserveMedia({
+        userId: "u1",
+        conversationId: null,
+        runId: "w",
+        callId: String(i),
+        model: "m",
+        estimateUsd: 1,
+      });
+      store.answeredMedia(mediaRunKey("w", String(i)), `gen-w-${i}`);
+    }
+    // Make the old one the newest-tried but due (its backoff of 2 min passed), the others not due.
+    db.$client
+      .prepare("UPDATE usage_records SET updated_at = ?, media_settle_tries = 1 WHERE run_id LIKE 'due%'")
+      .run(now - 3 * 60_000);
+    db.$client.prepare("UPDATE usage_records SET updated_at = ? WHERE run_id LIKE 'w#%'").run(now - 10);
+    const due = store.dueMedia(now, { maxTries: 12, maxAgeMs: 1e12, limit: 100 });
+    expect(due.map((r) => r.runKey)).toEqual([mediaRunKey("due", "0")]);
+  });
+
+  it("P3: the recent-request list says 진행 중 for a reservation, like the totals", async () => {
+    const t = await start();
+    t.app.usageStore!.reserveMedia({
+      userId: t.f.users.owner.id,
+      conversationId: null,
+      runId: "r",
+      callId: "1",
+      model: "fixture/image-one",
+      estimateUsd: 0.05,
+    });
+    const r = await t.api(t.f.cookies.admin, "GET", "/api/admin/usage");
+    expect(r.statusCode, r.body).toBe(200);
+    const report = r.json<{
+      total: { costPending: number };
+      recent: { costPending?: boolean; costUsd: null }[];
+    }>();
+    expect(report.total.costPending).toBe(1);
+    expect(report.recent[0]).toMatchObject({ costPending: true, costUsd: null });
   });
 });
