@@ -18,12 +18,13 @@ import { FileAddCancelledError, FileLimitError, type FileRow, type FileStore } f
 import { logEvent, type EventLogger } from "../logging.js";
 import type { ErrorLog } from "../observability/errors.js";
 import { carriesSecret } from "../secrets/egress.js";
-import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
+import { MIN_KNOWN_LENGTH, scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 import type { UsageStore } from "../usage/store.js";
 import type { MediaBudget } from "./budget.js";
-import { imageCostBound, speechCostBound } from "./cost.js";
+import { imageCostBound, MAX_IMAGE_PIXELS, speechCostBound } from "./cost.js";
 import type { OpenRouterKeys } from "./keys.js";
 import {
+  GENERATION_ID,
   generationUrl,
   imageEndpointsUrl,
   MediaHttpError,
@@ -37,9 +38,10 @@ import {
   readBytes,
   speechModelUrl,
 } from "./openrouter.js";
-import { moderationFor, withMediaPolicy } from "./policy.js";
+import { moderationFor, STRICTNESS, withMediaPolicy } from "./policy.js";
+import { mediaRunKey } from "../usage/store.js";
 import type { MediaSettingsStore } from "./settings.js";
-import { printableRuns, stripImage } from "./strip.js";
+import { imageSize, stripImage, textRuns } from "./strip.js";
 
 /**
  * `image_generate` and `speech_generate` (#238 stage 2): one synchronous OpenRouter generation per call, stored as
@@ -79,7 +81,14 @@ export type MediaGeneratorOptions = {
   keys: Pick<OpenRouterKeys, "resolve">;
   settings: Pick<MediaSettingsStore, "get" | "revision">;
   budget: Pick<MediaBudget, "allows">;
-  usage: Pick<UsageStore, "reserveMedia" | "settleMedia" | "releaseMedia"> | undefined;
+  usage:
+    | Pick<UsageStore, "reserveMedia" | "settleMedia" | "releaseMedia" | "answeredMedia" | "unconfirmMedia">
+    | undefined;
+  /**
+   * The key generation (관리자 → 미디어 생성's `<process>:<changes>`): a key swapped and swapped back during a call's
+   * lookup (A→B→A) is a change too. Without it only the key itself is compared.
+   */
+  keyGeneration?: () => string;
   users: Pick<UserStore, "byId">;
   fetchImpl?: typeof fetch | undefined;
   /** The `.env` skill secrets (by env name): the egress check knows them too. */
@@ -245,6 +254,7 @@ export class MediaGenerator {
     const parsed = z.strictObject(tool.input).safeParse(raw);
     if (!parsed.success) throw new MediaToolError("media_bad_input");
     const revision = this.o.settings.revision();
+    const generation = this.o.keyGeneration?.();
     const settings = this.o.settings.get();
     const k = settings.kinds[kind];
     if (!k.enabled || !k.model) throw new MediaToolError("media_disabled");
@@ -293,6 +303,14 @@ export class MediaGenerator {
     this.running++;
     this.byUser.set(scope.userId, mine + 1);
     let holdsFile = false;
+    const releaseFile = () => {
+      if (!holdsFile) return;
+      holdsFile = false;
+      const left = (this.filesInFlight.get(scope.conversationId) ?? 1) - 1;
+      if (left > 0) this.filesInFlight.set(scope.conversationId, left);
+      else this.filesInFlight.delete(scope.conversationId);
+    };
+    ctx.fileSaved = releaseFile;
     try {
       const plan =
         kind === "image"
@@ -304,20 +322,22 @@ export class MediaGenerator {
       if (
         this.o.settings.revision() !== revision ||
         nowKey?.key !== key.key ||
+        this.o.keyGeneration?.() !== generation ||
         !nowKind.enabled ||
         nowKind.model !== model
       )
         throw new MediaToolError("media_changed");
       if (this.secret(plan.texts)) throw new MediaToolError("media_secret_blocked");
       if (plan.bound === null) throw new MediaToolError("media_no_price");
-      if (!this.takeCall(scope.runId, kind, settings.perRunLimits[kind]))
-        throw new MediaToolError("media_quota");
-      // A place among the conversation's files, counting the calls in flight — before anything is paid for.
+      // A place among the conversation's files, counting the calls in flight — before anything is paid for, and
+      // before the run's call is counted (a refusal here leaves the run its call).
       const inFlight = this.filesInFlight.get(scope.conversationId) ?? 0;
       if (store.count(scope.conversationId) + inFlight >= FILE_LIMITS.perConversation)
         throw new MediaToolError("media_file_limit");
       this.filesInFlight.set(scope.conversationId, inFlight + 1);
       holdsFile = true;
+      if (!this.takeCall(scope.runId, kind, settings.perRunLimits[kind]))
+        throw new MediaToolError("media_quota");
       if (!alive()) throw new MediaToolError("media_cancelled");
       // The budget check and the reserving row in one synchronous step.
       const callId = crypto.randomUUID();
@@ -332,11 +352,7 @@ export class MediaGenerator {
         ? await this.image(ctx, callId, plan.body)
         : await this.speech(ctx, callId, plan.body, plan.voice);
     } finally {
-      if (holdsFile) {
-        const left = (this.filesInFlight.get(scope.conversationId) ?? 1) - 1;
-        if (left > 0) this.filesInFlight.set(scope.conversationId, left);
-        else this.filesInFlight.delete(scope.conversationId);
-      }
+      releaseFile();
       this.running--;
       const left = (this.byUser.get(scope.userId) ?? 1) - 1;
       if (left > 0) this.byUser.set(scope.userId, left);
@@ -404,6 +420,22 @@ export class MediaGenerator {
     return a;
   }
 
+  /**
+   * The moderation values a model lists, checked: none listed = confirmed "no moderation option"; a descriptor
+   * whose values cannot be read, or that names none this server knows the order of, cannot be judged — for a youth
+   * account that is `media_lookup_failed` (never sent with moderation unconfirmed).
+   */
+  private moderation(ctx: CallCtx, params: Params): string | null {
+    if (!params.has("moderation")) return null;
+    const vals = params.get("moderation");
+    const known = vals ? [...vals].filter((v) => (STRICTNESS as readonly string[]).includes(v)) : [];
+    if (!known.length) {
+      if (ctx.youth) throw new MediaToolError("media_lookup_failed");
+      return null;
+    }
+    return moderationFor({ youth: ctx.youth }, known);
+  }
+
   /** Listed values that may go into a hint: plain identifiers that carry no known secret. */
   private hintValues(vals: Iterable<string>, max: number): string {
     return [...vals]
@@ -414,9 +446,15 @@ export class MediaGenerator {
 
   private async planImage(ctx: CallCtx, input: ImageInput): Promise<Plan> {
     const answer = await this.lookup(imageEndpointsUrl(ctx.model), ctx.apiKey);
-    const endpoints = Array.isArray(answer.endpoints) ? answer.endpoints.filter(isObj) : [];
-    if (!endpoints.length) throw new MediaToolError("media_lookup_failed");
-    const params = mergeParams(endpoints.map((e) => e.supported_parameters));
+    // A 200 is not a record: the model's endpoints, each with its parameters and its price list (OpenAPI required).
+    const endpoints = Array.isArray(answer.endpoints) ? answer.endpoints : [];
+    if (
+      (answer.id !== undefined && answer.id !== ctx.model) ||
+      !endpoints.length ||
+      !endpoints.every((e) => isObj(e) && isObj(e.supported_parameters) && Array.isArray(e.pricing))
+    )
+      throw new MediaToolError("media_lookup_failed");
+    const params = mergeParams(endpoints.map((e) => (e as Record<string, unknown>).supported_parameters));
     if (input.aspectRatio) {
       if (!params.has("aspect_ratio"))
         throw new MediaToolError(
@@ -436,11 +474,7 @@ export class MediaGenerator {
         throw new MediaToolError("media_unsupported_model");
     }
     const refs = input.referenceFileIds ? this.references(ctx, input.referenceFileIds) : [];
-    const moderationValues = params.get("moderation");
-    const moderation = moderationFor(
-      { youth: ctx.youth },
-      moderationValues ? [...moderationValues] : undefined,
-    );
+    const moderation = this.moderation(ctx, params);
     const body = withMediaPolicy({
       model: ctx.model,
       prompt: input.prompt,
@@ -468,7 +502,7 @@ export class MediaGenerator {
         outputFormat ?? "",
         moderation ?? "",
       ],
-      bound: imageCostBound(endpoints, { prompt: input.prompt, references: refs.length }),
+      bound: imageCostBound(endpoints, { prompt: input.prompt, references: refs.map((r) => r.megapixels) }),
     };
   }
 
@@ -476,10 +510,25 @@ export class MediaGenerator {
    * The reference images: this user's and conversation's sent png·jpg·webp files, read and hash-checked, their
    * metadata stripped (`strip.ts`) and what is left checked for known secrets.
    */
-  private references(ctx: CallCtx, ids: readonly string[]): { mediaType: string; data: Buffer }[] {
+  private references(
+    ctx: CallCtx,
+    ids: readonly string[],
+  ): { mediaType: string; data: Buffer; megapixels: number }[] {
     const bad = () => new MediaToolError("media_reference_invalid");
-    return [...new Set(ids)].map((id) => {
-      const f = ctx.store.get(id);
+    const files = [...new Set(ids)].map((id) => ctx.store.get(id));
+    // The whole request's processing is bounded before any file is read.
+    if (files.reduce((a, f) => a + (f?.bytes ?? 0), 0) > MEDIA_TOOL_LIMITS.referenceTotalBytes) throw bad();
+    // The shortest secret the egress check knows (a configured `.env` value may be shorter than the registry's).
+    const minRun = Math.max(
+      4,
+      Math.min(
+        MIN_KNOWN_LENGTH,
+        ...Object.values(this.o.secrets ?? {})
+          .filter(Boolean)
+          .map((v) => [...v].length),
+      ),
+    );
+    return files.map((f) => {
       if (
         !f ||
         f.userId !== ctx.scope.userId ||
@@ -499,9 +548,13 @@ export class MediaGenerator {
       if (!data || kind !== f.kind) throw bad();
       const clean = stripImage(data, kind);
       if (!clean || imageKindOf(clean) !== kind) throw bad();
-      const runs = printableRuns(clean);
-      if (!runs || this.secret(runs)) throw new MediaToolError("media_secret_blocked");
-      return { mediaType: f.mediaType, data: clean };
+      // Its real area (what an input priced per megapixel is reserved for), capped like an output.
+      const size = imageSize(clean, kind);
+      if (!size || size.width * size.height > MAX_IMAGE_PIXELS) throw bad();
+      const runs = textRuns(clean, minRun);
+      if (!runs) throw bad();
+      if (this.secret(runs)) throw new MediaToolError("media_secret_blocked");
+      return { mediaType: f.mediaType, data: clean, megapixels: (size.width * size.height) / 1_000_000 };
     });
   }
 
@@ -510,6 +563,19 @@ export class MediaGenerator {
       this.lookup(speechModelUrl(ctx.model), ctx.apiKey),
       this.lookup(modelEndpointsUrl(ctx.model), ctx.apiKey),
     ]);
+    // A 200 is not a record: the model itself, with its speech output's parameters; its endpoints' prices.
+    const data = isObj(priced.data) ? priced.data : {};
+    const endpoints = Array.isArray(data.endpoints) ? data.endpoints : [];
+    if (
+      answer.id !== ctx.model ||
+      !Array.isArray(answer.output_modalities) ||
+      !answer.output_modalities.some(
+        (m) => isObj(m) && m.type === "speech" && isObj(m.supported_parameters),
+      ) ||
+      data.id !== ctx.model ||
+      !endpoints.length
+    )
+      throw new MediaToolError("media_lookup_failed");
     const maps: unknown[] = [];
     const outs = [
       ...(Array.isArray(answer.output_modalities) ? answer.output_modalities : []),
@@ -540,11 +606,7 @@ export class MediaGenerator {
         );
     }
     voice ??= voices ? [...voices].find((v) => HINT_VALUE.test(v)) : undefined;
-    const moderationValues = params.get("moderation");
-    const moderation = moderationFor(
-      { youth: ctx.youth },
-      moderationValues ? [...moderationValues] : undefined,
-    );
+    const moderation = this.moderation(ctx, params);
     const body = withMediaPolicy({
       model: ctx.model,
       input: input.text,
@@ -553,8 +615,6 @@ export class MediaGenerator {
       ...(input.instructions ? { instructions: input.instructions } : {}),
       ...(moderation ? { moderation } : {}),
     });
-    const data = isObj(priced.data) ? priced.data : {};
-    const endpoints = Array.isArray(data.endpoints) ? data.endpoints : [];
     return {
       body,
       voice,
@@ -575,18 +635,32 @@ export class MediaGenerator {
   /** The answer before 2xx: a refusal (not billed) removes the reserving row; an unknown outcome keeps it. */
   private refused(ctx: CallCtx, callId: string, e: unknown): MediaToolError {
     if (e instanceof MediaHttpError && e.status > 0) {
-      this.write(ctx, "release", () => this.o.usage?.releaseMedia(ctx.scope.runId, callId));
+      this.write(ctx, "release", () => this.o.usage?.releaseMedia(mediaRunKey(ctx.scope.runId, callId)));
       if (e.status === 402) return new MediaToolError("media_payment");
       if (e.status === 429) return new MediaToolError("media_rate_limited");
       if (e.status === 400 || e.status === 403 || e.status === 422)
         return new MediaToolError("media_refused");
     }
+    // Sent, but whether it was billed is not known (network error, timeout): the bound stays, for good.
+    this.write(ctx, "settle", () => this.o.usage?.unconfirmMedia(mediaRunKey(ctx.scope.runId, callId)));
     return new MediaToolError("media_failed");
   }
 
-  private settle(ctx: CallCtx, callId: string, cost: number | null): void {
-    if (cost === null) return; // the bound keeps holding the budget
-    this.write(ctx, "settle", () => this.o.usage?.settleMedia(ctx.scope.runId, callId, cost));
+  /**
+   * After a 2xx: the reported cost settles the row; without one, the row waits for its cost (`awaiting_cost`, the
+   * settler looks the generation id up later) or — no id to look up — can never be confirmed (`unconfirmed`). The
+   * bound holds the budget until then.
+   */
+  private settle(ctx: CallCtx, callId: string, cost: number | null, generationId: string | null): void {
+    const key = mediaRunKey(ctx.scope.runId, callId);
+    this.write(ctx, "settle", () =>
+      cost !== null
+        ? this.o.usage?.settleMedia(key, cost)
+        : this.o.usage?.answeredMedia(
+            key,
+            generationId && GENERATION_ID.test(generationId) ? generationId : null,
+          ),
+    );
   }
 
   private async image(ctx: CallCtx, callId: string, body: Record<string, unknown>): Promise<MediaToolOutput> {
@@ -601,16 +675,18 @@ export class MediaGenerator {
       throw this.refused(ctx, callId, e);
     }
     // 2xx: the reserving row stays; from here the money may be spent whatever happens to the answer.
+    const generationId = res.headers.get("x-generation-id");
     let answer: unknown;
     try {
       answer = JSON.parse(new TextDecoder().decode(await readBytes(res, IMAGE_ANSWER_MAX)));
     } catch {
+      this.settle(ctx, callId, null, generationId);
       throw new MediaToolError("media_failed");
     }
     const usage = isObj(answer) && isObj(answer.usage) ? answer.usage : {};
     const cost =
       typeof usage.cost === "number" && Number.isFinite(usage.cost) && usage.cost >= 0 ? usage.cost : null;
-    this.settle(ctx, callId, cost);
+    this.settle(ctx, callId, cost, generationId);
     const first = isObj(answer) && Array.isArray(answer.data) && isObj(answer.data[0]) ? answer.data[0] : {};
     const b64 = typeof first.b64_json === "string" && B64.test(first.b64_json) ? first.b64_json : null;
     if (!b64) throw new MediaToolError("media_failed");
@@ -657,7 +733,7 @@ export class MediaGenerator {
       }
     }
     const cost = this.cost(generation, ctx.apiKey).then((c) => {
-      this.settle(ctx, callId, c);
+      this.settle(ctx, callId, c, generation);
       return c;
     });
     try {
@@ -683,21 +759,12 @@ export class MediaGenerator {
    * answer a little. Null when there is no id, or no cost came (the reserved bound then keeps holding).
    */
   private async cost(id: string | null, apiKey: string): Promise<number | null> {
-    const url = id ? generationUrl(id) : null;
-    if (!url) return null;
+    if (!id || !generationUrl(id)) return null;
     const sleep = this.o.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
     for (let i = 0; i < MEDIA_TOOL_LIMITS.costTries; i++) {
       if (i) await sleep(MEDIA_TOOL_LIMITS.costWaitMs * i);
-      try {
-        const a = await openRouterGet(url, {
-          apiKey,
-          ...(this.o.fetchImpl ? { fetchImpl: this.o.fetchImpl } : {}),
-        });
-        const c = isObj(a) && isObj(a.data) ? a.data.total_cost : undefined;
-        if (typeof c === "number" && Number.isFinite(c) && c >= 0) return c;
-      } catch {
-        // tried again
-      }
+      const c = await generationCost(id, apiKey, this.o.fetchImpl);
+      if (c !== null) return c;
     }
     return null;
   }
@@ -719,6 +786,8 @@ export class MediaGenerator {
         tmp,
         guard: ctx.alive,
       });
+      // Stored: the place it held among the conversation's files is now the file itself.
+      ctx.fileSaved?.();
       return {
         fileId: row.id,
         name: scrubKnown(row.name),
@@ -749,6 +818,8 @@ type CallCtx = {
   apiKey: string;
   youth: boolean;
   alive: () => boolean;
+  /** Releases the call's in-flight file place (once the file is stored, or when the call ends). */
+  fileSaved?: () => void;
 };
 type Plan = {
   body: Record<string, unknown>;
@@ -779,5 +850,22 @@ function readStored(store: FileStore, f: FileRow): Buffer | undefined {
     return buf;
   } finally {
     fs.closeSync(fd);
+  }
+}
+
+/** A generation's cost (`GET /generation?id=` → `data.total_cost`) once; null when not (yet) there. */
+export async function generationCost(
+  id: string,
+  apiKey: string,
+  fetchImpl?: typeof fetch | undefined,
+): Promise<number | null> {
+  const url = generationUrl(id);
+  if (!url) return null;
+  try {
+    const a = await openRouterGet(url, { apiKey, ...(fetchImpl ? { fetchImpl } : {}) });
+    const c = isObj(a) && isObj(a.data) ? a.data.total_cost : undefined;
+    return typeof c === "number" && Number.isFinite(c) && c >= 0 ? c : null;
+  } catch {
+    return null;
   }
 }

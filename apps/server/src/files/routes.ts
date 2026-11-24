@@ -59,19 +59,35 @@ export function byteRange(
   size: number,
 ): { start: number; end: number } | "unsatisfiable" | undefined {
   if (typeof header !== "string") return undefined;
-  const m = /^bytes=(\d{0,15})-(\d{0,15})$/.exec(header.trim());
+  // The unit is case-insensitive (RFC 9110 §14.1); numbers may have leading zeros and any length.
+  const m = /^bytes=(\d*)-(\d*)$/i.exec(header.trim());
   if (!m || (!m[1] && !m[2])) return undefined;
   if (!m[1]) {
-    // A suffix: the last N bytes.
-    const n = Number(m[2]);
+    // A suffix: the last N bytes (more than the file: all of it).
+    const n = bounded(m[2]!, size);
     if (n === 0 || size === 0) return "unsatisfiable";
     return { start: Math.max(0, size - n), end: size - 1 };
   }
-  const start = Number(m[1]);
-  const end = m[2] ? Number(m[2]) : size - 1;
-  if (m[2] && end < start) return undefined;
+  const start = bounded(m[1], size);
+  const end = m[2] ? bounded(m[2], size) : size - 1;
+  if (m[2] && !lessOrEqual(m[1], m[2])) return undefined;
   if (start >= size) return "unsatisfiable";
   return { start, end: Math.min(end, size - 1) };
+}
+
+/** A decimal string as a number, or `size` when it is larger than `size` (never an unsafe integer). */
+function bounded(digits: string, size: number): number {
+  const d = digits.replace(/^0+(?=\d)/, "");
+  if (d.length > String(size).length) return size;
+  const n = Number(d);
+  return n > size ? size : n;
+}
+
+/** Whether decimal `a` ≤ decimal `b`, compared as strings (no overflow). */
+function lessOrEqual(a: string, b: string): boolean {
+  const x = a.replace(/^0+(?=\d)/, "");
+  const y = b.replace(/^0+(?=\d)/, "");
+  return x.length !== y.length ? x.length < y.length : x <= y;
 }
 
 const ERROR_STATUS: Record<FileError | "invalid_request", number> = {
@@ -351,7 +367,9 @@ export function registerFileRoutes(
         .type(f.mediaType);
       // One byte range (#238: the chat's audio player seeks with it; iOS needs it to play) — after every check
       // above. Several ranges, or a header that does not parse, get the whole file (RFC 9110 lets a server ignore it).
-      const range = byteRange(req.headers.range, f.bytes);
+      // `If-Range` asks for the range only if the file is unchanged — this route gives no validator (no ETag or
+      // Last-Modified), so a conditional range always gets the whole file (RFC 9110 §13.1.5).
+      const range = req.headers["if-range"] === undefined ? byteRange(req.headers.range, f.bytes) : undefined;
       if (range === "unsatisfiable") {
         fs.closeSync(fd);
         return reply.code(416).header("Content-Range", `bytes */${f.bytes}`).send();

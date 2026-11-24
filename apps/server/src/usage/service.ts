@@ -54,6 +54,7 @@ export function emptyTotals(): UsageTotals {
     costMicroUsd: 0,
     costUsd: 0,
     costMissing: 0,
+    costPending: 0,
     apiKeyRequests: 0,
     subscriptionRequests: 0,
     unknownRequests: 0,
@@ -77,8 +78,10 @@ export function addRow(t: UsageTotals, r: UsageRow): void {
   else t.totalTokens += r.inputTokens + r.outputTokens;
   if (r.authType === "api_key") {
     t.apiKeyRequests += r.requestCount;
-    if (r.pricedCostMicros === null) t.costMissing += 1;
-    else t.costMicroUsd += r.pricedCostMicros;
+    if (r.pricedCostMicros !== null) t.costMicroUsd += r.pricedCostMicros;
+    // A media generation still going, or waiting for its cost (#238): "진행 중", not "미제공".
+    else if (r.mediaSettlement === "reserved" || r.mediaSettlement === "awaiting_cost") t.costPending += 1;
+    else t.costMissing += 1;
   } else if (r.authType === "subscription") t.subscriptionRequests += r.requestCount;
   else if (r.authType === "unknown") {
     t.unknownRequests += r.requestCount;
@@ -253,19 +256,35 @@ export class UsageService {
    * send one notification. Never throws: a failure is logged with a fixed code and the run carries on. Only
    * notifies; never blocks anything.
    */
+  /** The days already alerted (the setting is a JSON list; an older single day string is read as one). */
+  private alertedDays(): string[] {
+    const raw = this.settings.get(ALERTED_KEY);
+    if (!raw) return [];
+    try {
+      const v = JSON.parse(raw) as unknown;
+      if (Array.isArray(v)) return v.filter((d): d is string => typeof d === "string");
+    } catch {
+      // a plain day string (before #238)
+    }
+    return [raw];
+  }
+
   checkDailyCost(at: number): void {
     try {
       const { dailyCostThresholdUsd: threshold } = this.getSettings();
       if (threshold === null) return;
       const day = monthInfo(at, this.timeZone).today;
-      if (this.settings.get(ALERTED_KEY) === day) return;
+      if (this.alertedDays().includes(day)) return;
       // Integers on both sides: a cost of exactly the threshold is not above it.
       const micros = this.todayCostMicros(at);
       if (!(micros > toMicros(threshold))) return;
       const amount = toUsd(micros);
+      // Per day (#238 review r2): a cost settled late for an earlier day checks that day — and alerting it must not
+      // let today alert again, so the recent alerted days are kept, not only the last one.
       const claimed = this.db.transaction(() => {
-        if (this.settings.get(ALERTED_KEY) === day) return false;
-        this.settings.set(ALERTED_KEY, day);
+        const days = this.alertedDays();
+        if (days.includes(day)) return false;
+        this.settings.set(ALERTED_KEY, JSON.stringify([...days, day].sort().slice(-14)));
         return true;
       });
       if (!claimed) return;

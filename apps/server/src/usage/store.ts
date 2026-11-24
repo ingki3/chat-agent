@@ -170,6 +170,7 @@ export class UsageStore {
         cacheReadTokens: null,
         cacheWriteTokens: null,
         costUsd: usd,
+        mediaSettlement: usd === null ? "unconfirmed" : "settled",
         requestCount: 1,
         updatedAt: at,
       })
@@ -177,7 +178,10 @@ export class UsageStore {
         target: [usageRecords.runId, usageRecords.attempt],
         // A re-report without a cost keeps the cost already known; a cost (a first one, or a correction — $0
         // included) replaces it.
-        set: usd === null ? { updatedAt: at } : { costUsd: usd, pricedCostMicros: micros, updatedAt: at },
+        set:
+          usd === null
+            ? { updatedAt: at }
+            : { costUsd: usd, pricedCostMicros: micros, mediaSettlement: "settled", updatedAt: at },
       })
       .run();
     this.onRecorded?.(at);
@@ -185,9 +189,10 @@ export class UsageStore {
 
   /**
    * 미디어 생성 (#238): a paid generation's row written **before** its request, holding the call's reserved upper
-   * bound (`estimated_cost_micros`) and no cost yet. The daily media budget counts the bound until a cost is settled
-   * — also when none ever comes. Throws when the row cannot be written (then nothing is sent). Synchronous: the
-   * caller checks the budget and writes this in one go, so two calls cannot both take the last of the budget.
+   * bound (`estimated_cost_micros`), state `reserved` and no cost yet. The daily media budget counts the bound until
+   * a cost is settled — also when none ever comes. Throws when the row cannot be written (then nothing is sent).
+   * Synchronous: the caller checks the budget and writes this in one go, so two calls cannot both take the last of
+   * the budget.
    */
   reserveMedia(m: {
     userId: string;
@@ -214,6 +219,8 @@ export class UsageStore {
         priceVersion: null,
         pricedCostMicros: null,
         estimatedCostMicros: Math.ceil(m.estimateUsd * 1_000_000),
+        mediaSettlement: "reserved",
+        mediaSettleTries: 0,
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -225,24 +232,91 @@ export class UsageStore {
       .run();
   }
 
-  /** The reported cost of a reserved generation (it replaces the bound in the budget). */
-  settleMedia(runId: string, callId: string, costUsd: number): void {
-    const at = this.now();
+  /**
+   * The reported cost of a reserved generation (it replaces the bound in the budget). The daily cost check runs for
+   * the day the row belongs to (its `created_at`), not the day the cost arrived — a call made before midnight and
+   * settled after it counts for the day it was made.
+   */
+  settleMedia(runKey: string, costUsd: number): void {
     const usd = cost(costUsd);
     if (usd === null) return;
+    const row = this.db
+      .update(usageRecords)
+      .set({
+        costUsd: usd,
+        pricedCostMicros: Math.round(usd * 1_000_000),
+        mediaSettlement: "settled",
+        updatedAt: this.now(),
+      })
+      .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
+      .returning({ createdAt: usageRecords.createdAt })
+      .get();
+    if (row) this.onRecorded?.(row.createdAt);
+  }
+
+  /**
+   * A generation answered without a cost: `awaiting_cost` with OpenRouter's generation id (looked up again later by
+   * the settler), or `unconfirmed` when there is no id to look up. The bound keeps holding the budget either way.
+   */
+  answeredMedia(runKey: string, generationId: string | null): void {
     this.db
       .update(usageRecords)
-      .set({ costUsd: usd, pricedCostMicros: Math.round(usd * 1_000_000), updatedAt: at })
-      .where(eq(usageRecords.runId, mediaRunKey(runId, callId)))
+      .set({
+        mediaGenerationId: generationId,
+        mediaSettlement: generationId ? "awaiting_cost" : "unconfirmed",
+        updatedAt: this.now(),
+      })
+      .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
       .run();
-    this.onRecorded?.(at);
+  }
+
+  /** A generation whose cost can never be confirmed (an unknown outcome, or the lookups gave up). */
+  unconfirmMedia(runKey: string): void {
+    this.db
+      .update(usageRecords)
+      .set({ mediaSettlement: "unconfirmed", updatedAt: this.now() })
+      .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
+      .run();
+  }
+
+  /** One more cost lookup that found nothing (the settler's backoff counts these). */
+  triedMedia(runKey: string, tries: number): void {
+    this.db
+      .update(usageRecords)
+      .set({ mediaSettleTries: tries, updatedAt: this.now() })
+      .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
+      .run();
+  }
+
+  /** Generations waiting for their cost (`awaiting_cost`), oldest first. */
+  awaitingMedia(limit = 50): {
+    runKey: string;
+    generationId: string | null;
+    tries: number;
+    createdAt: number;
+    updatedAt: number;
+  }[] {
+    return this.db
+      .select({
+        runKey: usageRecords.runId,
+        generationId: usageRecords.mediaGenerationId,
+        tries: usageRecords.mediaSettleTries,
+        createdAt: usageRecords.createdAt,
+        updatedAt: usageRecords.updatedAt,
+      })
+      .from(usageRecords)
+      .where(and(eq(usageRecords.purpose, "media"), eq(usageRecords.mediaSettlement, "awaiting_cost")))
+      .orderBy(asc(usageRecords.updatedAt))
+      .limit(limit)
+      .all()
+      .map((r) => ({ ...r, tries: r.tries ?? 0 }));
   }
 
   /** A reserved generation OpenRouter refused (no charge): its row goes. */
-  releaseMedia(runId: string, callId: string): void {
+  releaseMedia(runKey: string): void {
     this.db
       .delete(usageRecords)
-      .where(eq(usageRecords.runId, mediaRunKey(runId, callId)))
+      .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
       .run();
   }
 

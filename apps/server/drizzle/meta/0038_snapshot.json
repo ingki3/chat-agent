@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "2294b7c1-45b6-46c0-aaaa-e0d0affb32a8",
+  "id": "dc60569c-1195-4be4-b728-bf56476142e0",
   "prevId": "9ba044d1-13f3-48f5-98d9-872fffbbf7e6",
   "tables": {
     "access_syncs": {
@@ -5712,6 +5712,27 @@
         },
         "estimated_cost_micros": {
           "name": "estimated_cost_micros",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "media_generation_id": {
+          "name": "media_generation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "media_settlement": {
+          "name": "media_settlement",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "media_settle_tries": {
+          "name": "media_settle_tries",
           "type": "integer",
           "primaryKey": false,
           "notNull": false,

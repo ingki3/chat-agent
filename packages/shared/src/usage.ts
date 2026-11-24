@@ -109,6 +109,11 @@ export const UsageTotals = z.object({
    * `unknown` rows (their connection could not be found, so whether they cost anything is not known).
    */
   costMissing: z.number().int(),
+  /**
+   * 미디어 생성 (#238): generations still in progress or waiting for OpenRouter's cost ("진행 중") — not in
+   * `costMissing` until their cost can no longer come.
+   */
+  costPending: z.number().int().default(0),
   /** Rows on API key connections (costed) and on subscriptions (requests and tokens only). */
   apiKeyRequests: z.number().int(),
   subscriptionRequests: z.number().int(),

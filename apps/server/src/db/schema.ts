@@ -579,6 +579,18 @@ export const usageRecords = sqliteTable(
      * `priced_cost_micros` is NULL (no cost reported yet, or never) the daily media budget counts this instead.
      */
     estimatedCostMicros: integer("estimated_cost_micros"),
+    /** 미디어 생성 (#238): OpenRouter's generation id (`gen-…`, from the 2xx answer), to look its cost up later. */
+    mediaGenerationId: text("media_generation_id"),
+    /**
+     * 미디어 생성 (#238): where the row's cost stands — `reserved` (sent, no answer yet), `awaiting_cost` (answered,
+     * the cost not reported yet: looked up again later), `settled`, `unconfirmed` (it can never be confirmed: no id,
+     * an unknown outcome, or the lookups gave up). NULL for every other purpose.
+     */
+    mediaSettlement: text("media_settlement", {
+      enum: ["reserved", "awaiting_cost", "settled", "unconfirmed"],
+    }),
+    /** Cost lookups after the call (the background settler's backoff). */
+    mediaSettleTries: integer("media_settle_tries"),
   },
   (t) => [
     uniqueIndex("usage_records_run_attempt_idx").on(t.runId, t.attempt),

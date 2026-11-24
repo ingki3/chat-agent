@@ -193,6 +193,8 @@ export const MEDIA_TOOL_LIMITS = {
   /** Conversation images an image call may take as references (png·jpg·webp of the same conversation). */
   referenceFiles: 4,
   referenceBytes: 10 * 1024 * 1024,
+  /** All references of one call together (what one request may make the server parse). */
+  referenceTotalBytes: 20 * 1024 * 1024,
   /** How long one generation may take (the image providers can take a minute). */
   imageTimeoutMs: 180_000,
   speechTimeoutMs: 120_000,

@@ -18,7 +18,11 @@ import { createTestDb } from "../src/db/client.js";
 import zlib from "node:zlib";
 import { byteRange, FILE_CSP } from "../src/files/routes.js";
 import { imageCostBound, speechCostBound } from "../src/media/cost.js";
-import { printableRuns, stripImage } from "../src/media/strip.js";
+import { imageSize, MAX_PARTS, MAX_RUNS, stripImage, textRuns } from "../src/media/strip.js";
+import { MAX_TRIES, MediaSettler } from "../src/media/settle.js";
+import { usageRecords } from "../src/db/schema.js";
+import { addRow, emptyTotals, UsageService } from "../src/usage/service.js";
+import { mediaRunKey, UsageStore } from "../src/usage/store.js";
 import {
   FIXTURE_GENERATION_ID,
   FIXTURE_IMAGE_COST,
@@ -153,7 +157,19 @@ async function start(o: { fetchImpl?: typeof fetch; key?: string | null } = {}) 
       estimated_cost_micros: number | null;
     }[];
   const posts = () => rec.requests.filter((r) => r.method === "POST");
-  return { app, db, f, api, send, scopeOf, enable, usageRows, posts, requests: rec.requests };
+  return {
+    app,
+    db,
+    f,
+    api,
+    send,
+    scopeOf,
+    enable,
+    usageRows,
+    posts,
+    requests: rec.requests,
+    fetchImpl: rec.fetchImpl,
+  };
 }
 
 async function waitRun(app: App, id: string) {
@@ -830,7 +846,7 @@ describe("media tools: review round 1 regressions (#246)", () => {
         { billable: "input_text", unit: "token", cost_usd: 0.000001 },
         { billable: "input_image", unit: "image", cost_usd: 0.01 },
       ]),
-      { prompt: "abcd", references: 2 },
+      { prompt: "abcd", references: [1.5, 2.5] },
     )!;
     expect(b).toBeCloseTo((0.12 + 0.000001 * (4 + 64) + 0.02) * 1.2, 9);
     // The dearest of several endpoints.
@@ -840,17 +856,17 @@ describe("media tools: review round 1 regressions (#246)", () => {
           { pricing: [{ billable: "output_image", unit: "image", cost_usd: 0.01 }] },
           { pricing: [{ billable: "output_image", unit: "image", cost_usd: 0.05 }] },
         ],
-        { prompt: "x", references: 0 },
+        { prompt: "x", references: [] },
       ),
     ).toBeCloseTo(0.06, 9);
     // Per output token, or no records: no bound.
     expect(
       imageCostBound(ep([{ billable: "output_image", unit: "token", cost_usd: 0.00003 }]), {
         prompt: "x",
-        references: 0,
+        references: [],
       }),
     ).toBeNull();
-    expect(imageCostBound([], { prompt: "x", references: 0 })).toBeNull();
+    expect(imageCostBound([], { prompt: "x", references: [] })).toBeNull();
     // Speech: input prices × bytes, output prices × the longest audio as tokens, overrides' dearer tier, variable = none.
     const sp = speechCostBound([{ pricing: { prompt: "0.000001", completion: "0.0001" } }], { text: "ab" })!;
     expect(sp).toBeCloseTo((0.000001 * (2 + 64) + 0.0001 * (2 * 0.5 + 30) * 50) * 1.2, 9);
@@ -1287,6 +1303,7 @@ describe("media tools: review round 1 regressions (#246)", () => {
       seg(0xe1, Buffer.from("Exif\0\0SECRETEXIF", "latin1")),
       seg(0xfe, Buffer.from("a comment", "latin1")),
       seg(0xdb, Buffer.alloc(65)),
+      seg(0xc0, Buffer.from([8, 0, 4, 0, 4, 1, 1, 0x11, 0])),
       seg(0xda, Buffer.alloc(8)),
       Buffer.from([0x12, 0x34, 0xff, 0x00, 0x56]),
       Buffer.from([0xff, 0xd9]),
@@ -1320,7 +1337,7 @@ describe("media tools: review round 1 regressions (#246)", () => {
     expect(s3[20]! & 0x2c).toBe(0);
     expect(s3.readUInt32LE(4)).toBe(s3.length - 8);
     expect(stripImage(Buffer.from("not an image"), "png")).toBeNull();
-    expect(printableRuns(Buffer.from("\x00\x01abcdefghij\x02xy\x03", "latin1"))).toEqual(["abcdefghij"]);
+    expect(textRuns(Buffer.from("\x00\x01abcdefghij\x02xy\x03", "latin1"))).toEqual(["abcdefghij"]);
   });
 });
 
@@ -1334,3 +1351,452 @@ function pngIdat(text: string): Buffer {
   crc.writeUInt32BE(zlib.crc32(td) >>> 0);
   return Buffer.concat([len, td, crc]);
 }
+
+// ---------------------------------------------------------------- review round 2 (#246)
+
+describe("media tools: review round 2 regressions (#246)", () => {
+  it("P1: a missing price is not free — empty lists, missing output or required keys, -1 anywhere", () => {
+    const img = (pricing: unknown) => imageCostBound([{ pricing }], { prompt: "x", references: [] });
+    expect(img([])).toBeNull();
+    expect(img(undefined)).toBeNull();
+    // Only input lines: the output's price is missing.
+    expect(img([{ billable: "input_text", unit: "token", cost_usd: 0.000001 }])).toBeNull();
+    expect(img([{ billable: "output_image", unit: "image", cost_usd: "n/a" }])).toBeNull();
+    // An explicit 0 is a confirmed free one.
+    expect(img([{ billable: "output_image", unit: "image", cost_usd: 0 }])).toBe(0);
+    const sp = (pricing: unknown) => speechCostBound([{ pricing }], { text: "ab" });
+    expect(sp({})).toBeNull();
+    expect(sp({ prompt: "0.000001" })).toBeNull(); // completion missing
+    expect(sp({ prompt: "0", completion: "0" })).toBe(0);
+    // A key only in an override counts; a -1 anywhere is no bound — not hidden behind a positive price.
+    expect(sp({ prompt: "0", completion: "0", overrides: [{ audio_output: "0.001" }] })!).toBeCloseTo(
+      0.001 * (2 * 0.5 + 30) * 50 * 1.2,
+      9,
+    );
+    expect(sp({ prompt: "0.000001", completion: "0", overrides: [{ prompt: "-1" }] })).toBeNull();
+    expect(sp({ prompt: "0.000001", completion: "-1", overrides: [{ completion: "0.5" }] })).toBeNull();
+    expect(sp({ prompt: "abc", completion: "0" })).toBeNull();
+    // Condition fields of an override are not prices.
+    expect(
+      sp({
+        prompt: "0.000001",
+        completion: "0",
+        overrides: [{ prompt: "0.000002", min_prompt_tokens: 200000 }],
+      }),
+    ).toBeCloseTo(0.000002 * 66 * 1.2, 9);
+  });
+
+  it("P1: through the tool, an empty image price list is media_no_price before any POST", async () => {
+    const t = await start({
+      fetchImpl: overriding({
+        [IMAGE_RECORD]: () =>
+          Response.json({ id: "fixture/image-one", endpoints: [{ supported_parameters: {}, pricing: [] }] }),
+        [SPEECH_PRICES]: () =>
+          Response.json({ data: { id: "fixture/voice-one", endpoints: [{ pricing: {} }] } }),
+      }),
+    });
+    t.enable(settingsWith({ image: "fixture/image-one", speech: "fixture/voice-one" }));
+    const conv = t.app.conversations!.create(t.f.users.owner.id);
+    const scope = await t.scopeOf(conv.id);
+    expect(await t.app.media!.tools.run("image", scope, { prompt: "산" })).toMatchObject({
+      code: "media_no_price",
+    });
+    expect(await t.app.media!.tools.run("speech", scope, { text: "안녕" })).toMatchObject({
+      code: "media_no_price",
+    });
+    expect(t.posts()).toEqual([]);
+    expect(t.usageRows()).toEqual([]);
+  });
+
+  it("P2: input references priced per megapixel are reserved on their real area; an oversized one is refused", async () => {
+    const record = {
+      endpoints: [
+        {
+          supported_parameters: {},
+          pricing: [
+            { billable: "output_image", unit: "image", cost_usd: 0.04 },
+            { billable: "input_image", unit: "megapixel", cost_usd: 1 },
+          ],
+        },
+      ],
+    };
+    let answer = solidPng(64, 64, [1, 2, 3]);
+    const t = await start({
+      fetchImpl: overriding({
+        [IMAGE_RECORD]: () => Response.json(record),
+        [OPENROUTER_IMAGES_URL]: () =>
+          Response.json({ data: [{ b64_json: answer.toString("base64") }], usage: { cost: 0.04 } }),
+      }),
+    });
+    t.enable(
+      settingsWith(
+        { image: "fixture/image-one" },
+        { perRunLimits: { image: 10, speech: 3, music: 1, video: 1 } },
+      ),
+    );
+    const conv = t.app.conversations!.create(t.f.users.owner.id);
+    const small = String(outputOf(await t.send(conv.id, "/image 작은 그림")).fileId);
+    // A PNG whose header claims 9000×9000 (over the 8192² cap the bound uses).
+    const huge = Buffer.from(solidPng(4, 4, [0, 0, 0]));
+    huge.writeUInt32BE(9000, 16);
+    huge.writeUInt32BE(9000, 20);
+    answer = huge;
+    const big = String(outputOf(await t.send(conv.id, "/image 큰 그림")).fileId);
+    const scope = await t.scopeOf(conv.id);
+    const before = t.usageRows().length;
+    expect(
+      (await t.app.media!.tools.run("image", scope, { prompt: "밝게", referenceFileIds: [small] })).ok,
+    ).toBe(true);
+    // (0.04 + 64·64 / 1e6 × $1) × 1.2 — the reference's real area, not 67 megapixels' worth.
+    expect(t.usageRows()[before]!.estimated_cost_micros).toBe(
+      Math.ceil((0.04 + (64 * 64) / 1e6) * 1.2 * 1e6),
+    );
+    const posts = t.posts().length;
+    expect(
+      await t.app.media!.tools.run("image", scope, { prompt: "밝게", referenceFileIds: [big] }),
+    ).toMatchObject({ code: "media_reference_invalid" });
+    expect(t.posts()).toHaveLength(posts);
+    void record;
+  });
+
+  it("P2: a cost that comes late is settled later on the same row (also after a restart); one that never comes is unconfirmed", async () => {
+    let costReady = false;
+    const t = await start({
+      fetchImpl: overriding({
+        [`https://openrouter.ai/api/v1/generation?id=${FIXTURE_GENERATION_ID}`]: () =>
+          costReady
+            ? Response.json({ data: { total_cost: FIXTURE_SPEECH_COST } })
+            : Response.json({ error: { code: 404 } }, { status: 404 }),
+      }),
+    });
+    t.enable(settingsWith({ speech: "fixture/voice-one" }));
+    const conv = t.app.conversations!.create(t.f.users.owner.id);
+    const scope = await t.scopeOf(conv.id);
+    expect(await t.app.media!.tools.run("speech", scope, { text: "안녕" })).toMatchObject({
+      ok: true,
+      output: { costUsd: null },
+    });
+    const state = () =>
+      t.db.$client
+        .prepare(
+          "SELECT media_settlement s, media_generation_id g, media_settle_tries n, cost_usd c FROM usage_records WHERE purpose = 'media'",
+        )
+        .get() as { s: string; g: string; n: number; c: number | null };
+    expect(state()).toMatchObject({ s: "awaiting_cost", g: FIXTURE_GENERATION_ID, n: 0, c: null });
+    // A settler of a new process (the id and tries are on the row): not due yet, then one try that finds nothing.
+    let now = Date.now();
+    const settler = new MediaSettler({
+      usage: t.app.usageStore!,
+      keys: t.app.media!.keys,
+      fetchImpl: t.fetchImpl,
+      now: () => now,
+    });
+    await settler.runOnce();
+    expect(state().n).toBe(0);
+    now += 2 * 60_000;
+    await settler.runOnce();
+    expect(state()).toMatchObject({ s: "awaiting_cost", n: 1 });
+    costReady = true;
+    now += 10 * 60_000;
+    await settler.runOnce();
+    expect(state()).toMatchObject({ s: "settled", c: FIXTURE_SPEECH_COST });
+    expect(t.app.media!.budget.remaining(t.f.users.owner.id)).toMatchObject({
+      spentUsd: FIXTURE_SPEECH_COST,
+      pendingUsd: 0,
+    });
+    // One that never comes: after MAX_TRIES it is unconfirmed (its bound stays held).
+    t.db.$client
+      .prepare(
+        "UPDATE usage_records SET media_settlement = 'awaiting_cost', cost_usd = NULL, priced_cost_micros = NULL, media_settle_tries = ?",
+      )
+      .run(MAX_TRIES);
+    await settler.runOnce();
+    expect(state().s).toBe("unconfirmed");
+    expect(t.app.media!.budget.remaining(t.f.users.owner.id).pendingUsd).toBeGreaterThan(0);
+  });
+
+  it("P2: a late settlement checks the day the call was made, and each day alerts once", () => {
+    const db = createTestDb();
+    db.$client
+      .prepare("INSERT INTO users (id, email, name, role) VALUES ('u1', 'u1@x.test', 'u1', 'member')")
+      .run();
+    const kv = new Map<string, string>([["usage.daily_cost_threshold_usd", "1.5"]]);
+    const alerts: number[] = [];
+    const service = new UsageService(
+      db,
+      { get: (k) => kv.get(k), set: (k, v) => void kv.set(k, v) },
+      (amount) => void alerts.push(amount),
+      undefined,
+      { timeZone: "Asia/Seoul" },
+    );
+    let now = Date.UTC(2026, 10, 11, 14, 50); // 23:50 in Seoul
+    const store = new UsageStore(db, () => now, { onRecorded: (at) => service.checkDailyCost(at) });
+    store.recordMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "a",
+      callId: "1",
+      model: "m",
+      costUsd: 1,
+    });
+    store.reserveMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "b",
+      callId: "2",
+      model: "m",
+      estimateUsd: 2,
+    });
+    now = Date.UTC(2026, 10, 11, 15, 10); // 00:10 the next day
+    // Today (the 12th) alerts first with its own cost…
+    store.recordMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "c",
+      callId: "3",
+      model: "m",
+      costUsd: 2,
+    });
+    expect(alerts).toEqual([2]);
+    // …then yesterday's call is settled: the 11th goes over and alerts once, the 12th does not again.
+    store.settleMedia(mediaRunKey("b", "2"), 1);
+    expect(alerts).toEqual([2, 2]);
+    store.recordMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "d",
+      callId: "4",
+      model: "m",
+      costUsd: 1,
+    });
+    expect(alerts).toEqual([2, 2]);
+    expect(JSON.parse(kv.get("usage.daily_cost_alerted_day")!)).toEqual(["2026-11-11", "2026-11-12"]);
+  });
+
+  it("P2: a 200 that is not a model record is media_lookup_failed; unreadable moderation stops a youth call", async () => {
+    let speech: unknown = {};
+    let image: unknown = {
+      endpoints: [
+        {
+          supported_parameters: { moderation: { type: "enum", values: ["blocked-ish"] } },
+          pricing: [{ billable: "output_image", unit: "image", cost_usd: 0.04 }],
+        },
+      ],
+    };
+    const t = await start({
+      fetchImpl: overriding({
+        [SPEECH_RECORD]: () => Response.json(speech),
+        [IMAGE_RECORD]: () => Response.json(image),
+      }),
+    });
+    t.enable(settingsWith({ image: "fixture/image-one", speech: "fixture/voice-one" }));
+    const conv = t.app.conversations!.create(t.f.users.owner.id);
+    const scope = await t.scopeOf(conv.id);
+    expect(await t.app.media!.tools.run("speech", scope, { text: "안녕" })).toMatchObject({
+      code: "media_lookup_failed",
+    });
+    speech = { id: "another/model", output_modalities: [{ type: "speech", supported_parameters: {} }] };
+    expect(await t.app.media!.tools.run("speech", scope, { text: "안녕" })).toMatchObject({
+      code: "media_lookup_failed",
+    });
+    // An adult: a moderation option it cannot read is simply not sent.
+    expect((await t.app.media!.tools.run("image", scope, { prompt: "산" })).ok).toBe(true);
+    expect(t.posts()[0]!.body).not.toHaveProperty("moderation");
+    // A youth account: not sent with moderation unconfirmed.
+    t.db.$client.prepare("UPDATE users SET youth = 1 WHERE id = ?").run(t.f.users.owner.id);
+    expect(await t.app.media!.tools.run("image", scope, { prompt: "산" })).toMatchObject({
+      code: "media_lookup_failed",
+    });
+    image = { endpoints: [{ pricing: [] }] }; // no supported_parameters: not a record
+    t.db.$client.prepare("UPDATE users SET youth = 0 WHERE id = ?").run(t.f.users.owner.id);
+    expect(await t.app.media!.tools.run("image", scope, { prompt: "산" })).toMatchObject({
+      code: "media_lookup_failed",
+    });
+    expect(t.posts()).toHaveLength(1);
+  });
+
+  it("P2: a key swapped and swapped back during the lookup (A→B→A) is a change", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const t = await start({
+      fetchImpl: overriding({
+        [IMAGE_RECORD]: async (init) => {
+          await gate;
+          return fixtureOpenRouterFetch()(IMAGE_RECORD, init);
+        },
+      }),
+    });
+    t.enable(settingsWith({ image: "fixture/image-one" }));
+    const conv = t.app.conversations!.create(t.f.users.owner.id);
+    const scope = await t.scopeOf(conv.id);
+    const call = t.app.media!.tools.run("image", scope, { prompt: "산" });
+    await vi.waitFor(() => expect(t.requests.some((q) => q.url === IMAGE_RECORD)).toBe(true));
+    const admin = t.app.media!.admin;
+    const B = `${FIXTURE_OPENROUTER_KEY_PREFIX}-synthetic-B000000000000000000000bbbb`;
+    await admin.registerKey(B, admin.generation(), () => true);
+    await admin.deleteKey(admin.generation(), () => true); // back to the .env key (A)
+    expect(t.app.media!.keys.resolve()?.key).toBe(KEY);
+    release();
+    expect(await call).toMatchObject({ code: "media_changed" });
+    expect(t.posts()).toEqual([]);
+  });
+
+  it("P2: a stored file frees its in-flight place at once; a refused file place leaves the run its call", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const t = await start({
+      fetchImpl: overriding({
+        [`https://openrouter.ai/api/v1/generation?id=${FIXTURE_GENERATION_ID}`]: async () => {
+          await gate;
+          return Response.json({ data: { total_cost: FIXTURE_SPEECH_COST } });
+        },
+      }),
+    });
+    t.enable(
+      settingsWith(
+        { speech: "fixture/voice-one", image: "fixture/image-one" },
+        { perRunLimits: { image: 1, speech: 3, music: 1, video: 1 } },
+      ),
+    );
+    const conv = t.app.conversations!.create(t.f.users.owner.id);
+    const scope = await t.scopeOf(conv.id);
+    const insert = t.db.$client.prepare(
+      `INSERT INTO files (id, user_id, conversation_id, message_id, upload_id, name, kind, media_type, bytes, sha256, created_at)
+       VALUES (?, ?, ?, NULL, NULL, 'x.txt', 'txt', 'text/plain', 1, 'x', 1)`,
+    );
+    for (let i = 0; i < 18; i++) insert.run(`f${i}`, t.f.users.owner.id, conv.id);
+    // The speech file is stored (19 files) while its cost lookup is still held: the 20th place is free.
+    const speech = t.app.media!.tools.run("speech", scope, { text: "안녕" });
+    await vi.waitFor(() => expect(t.app.files!.count(conv.id)).toBe(19));
+    expect((await t.app.media!.tools.run("image", scope, { prompt: "산" })).ok).toBe(true);
+    release();
+    expect((await speech).ok).toBe(true);
+    // Now full: refused for the file place — and the image's per-run call (limit 1, used) is not the reason.
+    const next = await t.scopeOf(conv.id);
+    expect(await t.app.media!.tools.run("image", next, { prompt: "또" })).toMatchObject({
+      code: "media_file_limit",
+    });
+    t.db.$client.prepare("DELETE FROM files WHERE id = 'f0'").run();
+    expect((await t.app.media!.tools.run("image", next, { prompt: "또" })).ok).toBe(true);
+  });
+
+  it("P2 strip: WebP frames keep image chunks only; truncated containers and missing PNG parts are refused; caps", () => {
+    const chunk = (fourcc: string, data: Buffer) => {
+      const h = Buffer.alloc(8);
+      h.write(fourcc, 0, "latin1");
+      h.writeUInt32LE(data.length, 4);
+      return Buffer.concat([h, data, data.length % 2 ? Buffer.alloc(1) : Buffer.alloc(0)]);
+    };
+    const webp = (chunks: Buffer[]) => {
+      const body = Buffer.concat(chunks);
+      const head = Buffer.alloc(12);
+      head.write("RIFF", 0, "latin1");
+      head.writeUInt32LE(body.length + 4, 4);
+      head.write("WEBP", 8, "latin1");
+      return Buffer.concat([head, body]);
+    };
+    const frame = chunk(
+      "ANMF",
+      Buffer.concat([
+        Buffer.alloc(16),
+        chunk("VP8 ", Buffer.alloc(10)),
+        chunk("XMP ", Buffer.from("FRAMESECRET")),
+      ]),
+    );
+    const animated = webp([
+      chunk("VP8X", Buffer.from([0x12, 0, 0, 0, 3, 0, 0, 3, 0, 0])),
+      chunk("ANIM", Buffer.alloc(6)),
+      frame,
+    ]);
+    const s = stripImage(animated, "webp")!;
+    expect(s.toString("latin1")).not.toContain("FRAMESECRET");
+    expect(s.toString("latin1")).toContain("ANMF");
+    expect(imageSize(s, "webp")).toEqual({ width: 4, height: 4 });
+    // Truncated: the RIFF size says more than the file has.
+    expect(stripImage(animated.subarray(0, animated.length - 4), "webp")).toBeNull();
+    // A frame without an image is refused.
+    expect(
+      stripImage(
+        webp([chunk("ANMF", Buffer.concat([Buffer.alloc(16), chunk("XMP ", Buffer.alloc(4))]))]),
+        "webp",
+      ),
+    ).toBeNull();
+    // PNG without IDAT, or with IHDR not first.
+    const png = solidPng(2, 2, [0, 0, 0]);
+    const idatAt = png.indexOf("IDAT") - 4;
+    const idatLen = png.readUInt32BE(idatAt) + 12;
+    expect(
+      stripImage(Buffer.concat([png.subarray(0, idatAt), png.subarray(idatAt + idatLen)]), "png"),
+    ).toBeNull();
+    // Too many chunks: refused before building more.
+    const many = pngWith(
+      Array.from({ length: MAX_PARTS + 1 }, () => ["tIME", Buffer.alloc(7)] as [string, Buffer]),
+    );
+    expect(stripImage(many, "png")).toBeNull();
+    // Text runs: UTF-8 and the shortest configured secret's length; too many runs → refused.
+    expect(textRuns(Buffer.from("\x00비밀값입니다\x00", "utf8"), 4)).toEqual(["비밀값입니다"]);
+    expect(textRuns(Buffer.from("\x00abcd\x00", "latin1"), 4)).toEqual(["abcd"]);
+    expect(textRuns(Buffer.from("abcd\x00".repeat(MAX_RUNS + 1), "latin1"), 4)).toBeNull();
+    expect(imageSize(solidPng(7, 3, [0, 0, 0]), "png")).toEqual({ width: 7, height: 3 });
+  });
+
+  it("P2 Range: If-Range gets the whole file; the unit is case-insensitive; long numbers do not overflow", () => {
+    expect(byteRange("Bytes=0-1", 10)).toEqual({ start: 0, end: 1 });
+    expect(byteRange("BYTES=-3", 10)).toEqual({ start: 7, end: 9 });
+    expect(byteRange("bytes=0000000000000002-0000000000000003", 10)).toEqual({ start: 2, end: 3 });
+    expect(byteRange("bytes=0-99999999999999999999999", 10)).toEqual({ start: 0, end: 9 });
+    expect(byteRange("bytes=99999999999999999999999-", 10)).toBe("unsatisfiable");
+    expect(byteRange("bytes=-99999999999999999999999", 10)).toEqual({ start: 0, end: 9 });
+    expect(byteRange("bytes=00005-00002", 10)).toBeUndefined();
+  });
+
+  it("P2 Range: a request with If-Range is answered whole (no validators on this route)", async () => {
+    const t = await start();
+    t.enable(settingsWith({ speech: "fixture/voice-one" }));
+    const conv = t.app.conversations!.create(t.f.users.owner.id);
+    const id = String(outputOf(await t.send(conv.id, "/speech 안녕")).fileId);
+    const r = await t.app.inject({
+      url: `/api/files/${id}/content?inline=1`,
+      headers: { ...LOCAL, cookie: t.f.cookies.owner, range: "bytes=0-1", "if-range": '"abc"' },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.rawPayload.length).toBe(silentMp3().length);
+  });
+
+  it("P3 usage screen: a reservation in progress is 진행 중, not 미제공; an unconfirmed one is 미제공", () => {
+    const db = createTestDb();
+    db.$client
+      .prepare("INSERT INTO users (id, email, name, role) VALUES ('u1', 'u1@x.test', 'u1', 'member')")
+      .run();
+    const store = new UsageStore(db, () => 1);
+    store.reserveMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "a",
+      callId: "1",
+      model: "m",
+      estimateUsd: 1,
+    });
+    store.reserveMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "b",
+      callId: "2",
+      model: "m",
+      estimateUsd: 1,
+    });
+    store.answeredMedia(mediaRunKey("b", "2"), "gen-x");
+    store.reserveMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "c",
+      callId: "3",
+      model: "m",
+      estimateUsd: 1,
+    });
+    store.unconfirmMedia(mediaRunKey("c", "3"));
+    const t = emptyTotals();
+    for (const r of db.select().from(usageRecords).all()) addRow(t, r);
+    expect(t).toMatchObject({ requests: 3, costPending: 2, costMissing: 1, costMicroUsd: 0 });
+  });
+});

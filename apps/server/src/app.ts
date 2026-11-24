@@ -105,6 +105,7 @@ import { MediaAdminService } from "./media/service.js";
 import { registerMediaRoutes } from "./media/routes.js";
 import { fixtureOpenRouterFetch } from "./media/fixture.js";
 import { MediaGenerator } from "./media/generate.js";
+import { MediaSettler } from "./media/settle.js";
 import { youtubeState, type YoutubeState } from "./youtube/packages.js";
 import { sandboxedYoutubeRunner, type YoutubeRunner } from "./youtube/runner.js";
 import { YoutubeAudioFetcher } from "./youtube/service.js";
@@ -219,6 +220,7 @@ declare module "fastify" {
           budget: MediaBudget;
           admin: MediaAdminService;
           tools: MediaGenerator;
+          settler: MediaSettler;
         }
       | undefined;
     /**
@@ -654,14 +656,27 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       secrets: config.skillSecrets,
       log: app.log,
       errors,
+      keyGeneration: () => mediaAdmin.generation(),
       ...(opts.media?.sleep ? { sleep: opts.media.sleep } : {}),
     });
+    // Late cost settlement (#238 review r2): generations still waiting for their cost are looked up again with a
+    // backoff, also after a restart. Not in tests (they drive `runOnce`).
+    const mediaSettler = new MediaSettler({
+      usage,
+      keys: openRouterKeys,
+      fetchImpl: mediaFetchImpl,
+      ...(opts.media?.now ? { now: opts.media.now } : {}),
+      log: app.log,
+    });
+    if (config.env !== "test") app.addHook("onReady", async () => mediaSettler.start());
+    app.addHook("preClose", async () => mediaSettler.stop());
     app.decorate("media", {
       keys: openRouterKeys,
       settings: mediaSettings,
       budget: mediaBudget,
       admin: mediaAdmin,
       tools: mediaTools,
+      settler: mediaSettler,
     });
     registerMediaRoutes(app, { users, media: mediaAdmin });
     // Web search and fetch (#50): results are stored as sources of the run's conversation.
