@@ -12,6 +12,7 @@ import { admin, ApiError, errorText } from "../api.js";
 import { usd } from "../usage-format.js";
 import {
   catalogView,
+  conflictNotice,
   draftBase,
   expectedRevision,
   formState,
@@ -286,11 +287,14 @@ function SettingsForm({
   m,
   screen,
   shownTicket,
+  statusReadFailed,
 }: {
   m: MediaAdminView;
   screen: Screen;
   /** The ticket of the status read shown (`m`). */
   shownTicket: number;
+  /** The last status read failed and none is under way (the banner above offers the retry). */
+  statusReadFailed: boolean;
 }) {
   // The admin's unsaved edit and the version it started from; null = the form follows the latest status read (or a
   // failed save's values, kept in the store).
@@ -440,9 +444,8 @@ function SettingsForm({
           <p className="error small" role="alert">
             {failedKind && `${MEDIA_KIND_LABEL[failedKind]}: `}
             {/* Until a read started after the refusal is shown, the latest values are not here yet. */}
-            {failed === "media_settings_changed" && !refreshed
-              ? "다른 곳에서 설정이 바뀌었어요. 최신 값을 불러오는 중…"
-              : errorText(new ApiError(0, failed))}
+            {(failed === "media_settings_changed" && conflictNotice(refreshed, statusReadFailed)) ||
+              errorText(new ApiError(0, failed))}
           </p>
         )}
         {saved && (
@@ -587,7 +590,12 @@ export function MediaAdmin() {
         </p>
       )}
       <KeySection m={m} screen={screen} />
-      <SettingsForm m={m} screen={screen} shownTicket={shownTicket} />
+      <SettingsForm
+        m={m}
+        screen={screen}
+        shownTicket={shownTicket}
+        statusReadFailed={q.isError && !q.isFetching}
+      />
     </section>
   );
 }

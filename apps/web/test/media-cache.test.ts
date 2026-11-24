@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_MEDIA_SETTINGS, MEDIA_KINDS, type MediaAdmin, type MediaCatalog } from "@agentlee/shared";
 import {
   catalogView,
+  conflictNotice,
   draftBase,
   expectedRevision,
   formState,
@@ -404,5 +405,21 @@ describe("media admin screen rules (#238)", () => {
       failed: "media_settings_changed",
       refreshed: true,
     });
+  });
+
+  it("r11: a conflict says 'loading' only while a read is under way; a failed read points at the retry", () => {
+    expect(conflictNotice(false, false)).toBe("다른 곳에서 설정이 바뀌었어요. 최신 값을 불러오는 중…");
+    expect(conflictNotice(false, true)).toBe(
+      "다른 곳에서 설정이 바뀌었어요. 최신 값을 불러오지 못했어요 — 위의 '다시 시도'를 눌러 주세요.",
+    );
+    // The latest values are here: no notice of its own (the server's message), whatever the last read did.
+    expect(conflictNotice(true, false)).toBeNull();
+    expect(conflictNotice(true, true)).toBeNull();
+    // And the re-save stays closed until a fresh read arrives (refreshed), a failed read or not.
+    const t = store();
+    const before = t.st.reads.start();
+    const id = t.st.beginSave(twenty, "R1")!;
+    t.st.settleSave(id, { ok: false, code: "media_settings_changed" });
+    expect(shown(t.st, fifty, before).refreshed).toBe(false);
   });
 });

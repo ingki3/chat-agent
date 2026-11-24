@@ -302,6 +302,18 @@ export function formState(o: {
 }
 
 /**
+ * What a settings conflict says before the latest values are here (review r10–r11): "불러오는 중…" only while a
+ * status read is actually under way; when it failed (and nothing reads), point at the banner's retry. Null once the
+ * latest values are here (the server's own message then).
+ */
+export function conflictNotice(refreshed: boolean, statusReadFailed: boolean): string | null {
+  if (refreshed) return null;
+  return statusReadFailed
+    ? "다른 곳에서 설정이 바뀌었어요. 최신 값을 불러오지 못했어요 — 위의 '다시 시도'를 눌러 주세요."
+    : "다른 곳에서 설정이 바뀌었어요. 최신 값을 불러오는 중…";
+}
+
+/**
  * The revision a save is made from: the one the admin's edit started from (an edit started before another save
  * elsewhere must not overwrite it — the server answers `media_settings_changed`), else the revision shown.
  */
