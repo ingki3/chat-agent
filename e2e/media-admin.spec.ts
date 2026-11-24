@@ -149,8 +149,22 @@ test("the admin registers an OpenRouter key, picks a model per kind and sets the
   await expect(form.getByRole("alert").filter({ hasText: "최신 값을 불러오지 못했어요" })).toBeVisible();
   await expect(limit).toHaveValue("44");
   await page.context().setOffline(false);
+  // Review r8: the read held back, the menu re-entered — a save cannot start while the read holds the slot.
+  const releases: (() => void)[] = [];
+  await page.route("**/api/admin/media", async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    await new Promise<void>((r) => releases.push(r));
+    await route.continue().catch(() => {});
+  });
   await form.getByRole("button", { name: "최신 값 불러오기" }).click();
+  await reenter();
+  await expect(form.getByRole("button", { name: "이 값으로 다시 저장" })).toBeDisabled();
+  await expect(limit).toBeDisabled();
+  await expect(limit).toHaveValue("44");
+  releases.splice(0).forEach((r) => r());
   await expect(limit).toHaveValue("33");
+  await expect(limit).toBeEnabled();
+  await page.unroute("**/api/admin/media");
 
   // Turning a kind on needs a model (the save button waits for one).
   await form.getByLabel("음성 생성 켜기").check();

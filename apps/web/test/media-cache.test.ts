@@ -278,7 +278,8 @@ describe("media admin screen rules (#238)", () => {
 
   it("r6: a save waiting for its confirming read stays with the QueryClient — a re-entered form is still locked", () => {
     const qc = {};
-    mediaScreenStore(qc).setSave({ phase: "confirming", values: twenty, base: 4, version: 5 });
+    const first = mediaScreenStore(qc);
+    first.settleSave(first.beginSave(twenty, 4)!, { ok: true, version: 5 });
     // The menu is left and entered again (a new form): the same store, the same lock.
     const again = mediaScreenStore(qc);
     expect(formState({ edit: null, save: again.save, server: fifty, serverVersion: 4 })).toMatchObject({
@@ -315,11 +316,11 @@ describe("media admin screen rules (#238)", () => {
 
   it("r7: a save sent from one form and answered after re-entry settles in the form mounted now (success)", () => {
     const t = store();
-    t.st.setSave({ phase: "sending", values: twenty, base: 0 });
+    const id = t.st.beginSave(twenty, 0)!;
     // The menu is left and entered again: the new form reads the same store (and is subscribed to it).
     const renders = t.renders();
     // The PUT answers (mutation callback, whatever form is mounted): v1 to wait for.
-    t.st.setSave({ phase: "confirming", values: twenty, base: 0, version: 1 });
+    expect(t.st.settleSave(id, { ok: true, version: 1 })).toBe(true);
     expect(t.renders()).toBeGreaterThan(renders);
     expect(formState({ edit: null, save: t.st.save, server: fifty, serverVersion: 0 })).toMatchObject({
       values: twenty,
@@ -340,8 +341,8 @@ describe("media admin screen rules (#238)", () => {
 
   it("r7: a save refused after re-entry — the form mounted now shows the error and keeps the values as the draft", () => {
     const t = store();
-    t.st.setSave({ phase: "sending", values: twenty, base: 3 });
-    t.st.setSave({ phase: "failed", values: twenty, base: 3, code: "media_settings_changed" });
+    const id = t.st.beginSave(twenty, 3)!;
+    t.st.settleSave(id, { ok: false, code: "media_settings_changed" });
     const st = formState({ edit: null, save: t.st.save, server: fifty, serverVersion: 4 });
     expect(st).toEqual({ values: twenty, locked: false, saved: false, failed: "media_settings_changed" });
     // The draft keeps its own base (a plain save again would be refused too; "이 값으로 다시 저장" uses v4).
@@ -371,6 +372,69 @@ describe("media admin screen rules (#238)", () => {
     expect(t.reads()).toBe(2);
     // Errors that are not stale are shown and start nothing by themselves.
     expect(t.st.stale({ code: "media_key_invalid" }, "p:3")).toBe(true);
+    t.flush();
+    expect(t.reads()).toBe(2);
+  });
+
+  // ---- round 8 ----------------------------------------------------------------------------------------------
+
+  it("r8: one settings-operation slot — a reload in flight, the menu re-entered, a save cannot start", () => {
+    const t = store();
+    const reload = t.st.beginReload()!;
+    expect(t.st.op).toBe("reload");
+    // A newly mounted form sees the slot taken: locked, and a save attempt starts nothing.
+    expect(
+      formState({ edit: null, save: t.st.save, server: fifty, serverVersion: 1, busy: t.st.op !== null })
+        .locked,
+    ).toBe(true);
+    expect(t.st.beginSave(twenty, 1)).toBeNull();
+    expect(t.st.beginReload()).toBeNull();
+    expect(t.st.save).toBeNull();
+    // The read answers: the slot is free again.
+    expect(t.st.settleReload(reload, true)).toBe(true);
+    expect(t.st.op).toBeNull();
+    expect(t.st.beginSave(twenty, 1)).not.toBeNull();
+  });
+
+  it("r8: a late answer of an older operation is ignored — reload then save", () => {
+    const t = store();
+    const reload = t.st.beginReload()!;
+    t.st.settleReload(reload, false); // gave up (nothing arrived): the draft stays, retry offered
+    expect(t.st.reloadFailed).toBe(true);
+    const save = t.st.beginSave(twenty, 2)!;
+    // The old read's answer comes again (late): it neither frees the slot nor drops the save.
+    expect(t.st.settleReload(reload, true)).toBe(false);
+    expect(t.st.op).toBe("save");
+    expect(t.st.save).toMatchObject({ phase: "sending", values: twenty });
+    expect(t.st.settleSave(save, { ok: true, version: 3 })).toBe(true);
+    expect(t.st.save).toMatchObject({ phase: "confirming", version: 3 });
+  });
+
+  it("r8: a late answer of an older operation is ignored — save then reload", () => {
+    const t = store();
+    const save = t.st.beginSave(twenty, 2)!;
+    t.st.settleSave(save, { ok: false, code: "media_settings_changed" });
+    const reload = t.st.beginReload()!;
+    // The save's answer arrives again (a retry of the same mutation): ignored, the read keeps the slot.
+    expect(t.st.settleSave(save, { ok: true, version: 9 })).toBe(false);
+    expect(t.st.op).toBe("reload");
+    expect(t.st.save).toMatchObject({ phase: "failed" });
+    expect(t.st.settleReload(reload, true)).toBe(true);
+    expect(t.st.save).toBeNull();
+  });
+
+  it("r8: stale() asks for a read only on the first refusal of a generation, whatever the turns", () => {
+    const t = store();
+    expect(t.st.stale({ code: "media_key_changed" }, "p:5")).toBe(false);
+    t.flush();
+    // More refusals of p:5 in later turns (other kinds, a key write).
+    for (let i = 0; i < 3; i++) {
+      expect(t.st.stale({ code: "media_key_changed" }, "p:5")).toBe(false);
+      t.flush();
+    }
+    expect(t.reads()).toBe(1);
+    // Another generation: its own one.
+    t.st.stale({ code: "media_no_key" }, "p:6");
     t.flush();
     expect(t.reads()).toBe(2);
   });

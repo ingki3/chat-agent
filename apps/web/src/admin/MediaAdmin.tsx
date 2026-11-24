@@ -27,6 +27,8 @@ import {
 } from "./media-cache.js";
 
 export const MEDIA_KEY = ["admin", "media"] as const;
+/** "최신 값 불러오기" gives up after this (the draft stays, a retry is offered). */
+const RELOAD_TIMEOUT_MS = 20_000;
 /** Every catalog query; each one is keyed by the server's key generation too (a list of another key never shows). */
 export const MEDIA_CATALOG_KEY = ["admin", "media-catalog"] as const;
 const catalogKey = (generation: string, kind: MediaKind) => [...MEDIA_CATALOG_KEY, generation, kind] as const;
@@ -286,8 +288,9 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
   // The save itself lives in the screen store: whichever form is mounted when it settles shows its outcome.
   const { store } = screen;
   const pending = store.save;
-  const [reloading, setReloading] = useState(false);
-  const [reloadFailed, setReloadFailed] = useState(false);
+  // The one settings-operation slot (a save or a "최신 값 불러오기" read) is the store's, not this form's.
+  const reloading = store.op === "reload";
+  const reloadFailed = store.reloadFailed;
   const {
     values: draft,
     locked,
@@ -298,43 +301,40 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
     save: pending,
     server: m.settings,
     serverVersion: m.settingsVersion,
-    busy: reloading,
+    busy: store.op !== null,
   });
   const base = draftBase(editBase, pending);
   const conflict = failed === "media_settings_changed";
   const save = useMutation({
     // Only the values and version fixed at the click are sent.
-    mutationFn: (o: { values: MediaSettings; version: number }) =>
+    mutationFn: (o: { id: number; values: MediaSettings; version: number }) =>
       admin.saveMediaSettings(o.values, o.version),
-    // These run on the mutation, mounted form or not: the outcome goes to the store.
-    onSuccess: (r, o) =>
-      store.setSave({ phase: "confirming", values: o.values, base: o.version, version: r.settingsVersion }),
+    // These run on the mutation, mounted form or not: the outcome goes to the store — for this operation's id only.
+    onSuccess: (r, o) => void store.settleSave(o.id, { ok: true, version: r.settingsVersion }),
     // An error keeps the admin's values as the draft (never silently replaced).
     onError: (e, o) =>
-      store.setSave({
-        phase: "failed",
-        values: o.values,
-        base: o.version,
+      void store.settleSave(o.id, {
+        ok: false,
         code: e instanceof ApiError ? e.code : "unknown",
         kind: e instanceof ApiError ? (e.body as { kind?: string } | undefined)?.kind : undefined,
       }),
     onSettled: screen.refresh,
   });
   const submit = (version: number) => {
-    setReloadFailed(false);
+    // Nothing starts while another settings operation holds the slot (the form is locked then anyway).
+    const id = store.beginSave(draft, version);
+    if (id === null) return;
     setEdit(null);
     setEditBase(null);
-    store.setSave({ phase: "sending", values: draft, base: version });
-    save.mutate({ values: draft, version });
+    save.mutate({ id, values: draft, version });
   };
   const hasKey = m.key.source !== "none";
   const set = (patch: Partial<MediaSettings>) => {
     if (locked) return;
-    setReloadFailed(false);
     setEditBase(base ?? m.settingsVersion);
     setEdit({ ...draft, ...patch });
     // An edit takes over from a finished or failed save.
-    if (pending && pending.phase !== "sending") store.setSave(null);
+    if (pending) store.clearSave();
   };
   const invalid = MEDIA_KINDS.some((k) => draft.kinds[k].enabled && !draft.kinds[k].model);
   const failedKind =
@@ -459,18 +459,16 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
               type="button"
               disabled={locked}
               onClick={() => {
-                // The draft goes only once a new status actually arrived; offline or failed, it stays.
-                setReloading(true);
-                setReloadFailed(false);
-                void screen
-                  .reload()
-                  .then((arrived) => {
-                    if (!arrived) return setReloadFailed(true);
+                // The draft goes only once a new status actually arrived; offline or failed, it stays. The read
+                // holds the slot; its outcome counts only while it still does.
+                const id = store.beginReload();
+                if (id === null) return;
+                void screen.reload().then((arrived) => {
+                  if (store.settleReload(id, arrived) && arrived) {
                     setEdit(null);
                     setEditBase(null);
-                    store.setSave(null);
-                  })
-                  .finally(() => setReloading(false));
+                  }
+                });
               }}
             >
               최신 값 불러오기
@@ -526,7 +524,11 @@ export function MediaAdmin() {
       const before = qc.getQueryState(MEDIA_KEY)?.dataUpdatedAt ?? 0;
       try {
         await qc.cancelQueries({ queryKey: MEDIA_KEY });
-        await qc.refetchQueries({ queryKey: MEDIA_KEY, type: "all" }, { throwOnError: true });
+        // Bounded: a read that never answers must not hold the settings slot for good.
+        await Promise.race([
+          qc.refetchQueries({ queryKey: MEDIA_KEY, type: "all" }, { throwOnError: true }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), RELOAD_TIMEOUT_MS)),
+        ]);
       } catch {
         return false;
       }

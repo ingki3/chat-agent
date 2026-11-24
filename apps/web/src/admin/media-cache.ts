@@ -81,6 +81,8 @@ export const formValue = (edit: MediaSettings | null, server: MediaSettings): Me
  * form is mounted now sees its changes — the settings save in progress, the rejected generations — and every
  * request to read the status again goes through one place (`requestRefresh`), coalesced into one read per turn.
  */
+export type SettingsOp = "save" | "reload";
+
 export class MediaScreenStore {
   readonly reads = new StatusReads();
   readonly rejected = new RejectedGenerations();
@@ -105,9 +107,79 @@ export class MediaScreenStore {
   get save(): SettingsSave | null {
     return this.pending;
   }
-  setSave(v: SettingsSave | null): void {
-    this.pending = v;
+  /** Drops a finished or failed save (an edit takes over). A save still being sent stays. */
+  clearSave(): void {
+    if (this.pending?.phase === "sending") return;
+    this.pending = null;
     this.emit();
+  }
+
+  // ---- the one settings-operation slot (review r8) -------------------------------------------------------
+  // At most one settings operation — a save, or a "최신 값 불러오기" read — is in flight, each with its own id.
+  // Starting one needs the slot free (every mounted form is locked while it is taken); a completion counts only
+  // when its id is the slot's current one, so a late answer of an older operation changes nothing.
+  private slot: { id: number; kind: SettingsOp } | null = null;
+  private nextId = 0;
+  private failedReload = false;
+
+  get op(): SettingsOp | null {
+    return this.slot?.kind ?? null;
+  }
+  get reloadFailed(): boolean {
+    return this.failedReload;
+  }
+  private take(kind: SettingsOp): number | null {
+    if (this.slot) return null;
+    this.slot = { id: ++this.nextId, kind };
+    return this.slot.id;
+  }
+  private owns(id: number): boolean {
+    return this.slot?.id === id;
+  }
+
+  /** A save of `values` made from version `base`; null (nothing starts) while another operation runs. */
+  beginSave(values: MediaSettings, base: number): number | null {
+    const id = this.take("save");
+    if (id === null) return null;
+    this.failedReload = false;
+    this.pending = { phase: "sending", values, base };
+    this.emit();
+    return id;
+  }
+  /** The save's answer: the version to wait for, or the server's code. Ignored unless it is the current one. */
+  settleSave(
+    id: number,
+    r: { ok: true; version: number } | { ok: false; code: string; kind?: string | undefined },
+  ): boolean {
+    if (!this.owns(id) || this.pending?.phase !== "sending") return false;
+    const { values, base } = this.pending;
+    this.pending = r.ok
+      ? { phase: "confirming", values, base, version: r.version }
+      : { phase: "failed", values, base, code: r.code, kind: r.kind };
+    this.slot = null;
+    this.emit();
+    return true;
+  }
+
+  /** "최신 값 불러오기": null (nothing starts) while another operation runs. */
+  beginReload(): number | null {
+    const id = this.take("reload");
+    if (id === null) return null;
+    this.failedReload = false;
+    this.emit();
+    return id;
+  }
+  /**
+   * The read's outcome. Only a new status that actually arrived drops the save's draft; otherwise the draft stays
+   * and a retry is offered. Ignored (false) unless it is the current operation.
+   */
+  settleReload(id: number, arrived: boolean): boolean {
+    if (!this.owns(id)) return false;
+    this.slot = null;
+    if (arrived) this.pending = null;
+    else this.failedReload = true;
+    this.emit();
+    return true;
   }
 
   /** How the status is read again (set by the mounted screen; the QueryClient's, so any screen's will do). */
@@ -130,8 +202,11 @@ export class MediaScreenStore {
    */
   stale(e: unknown, generation: string): boolean {
     if (!isStaleKeyError(e)) return true;
-    if (this.rejected.reject(generation)) this.emit();
-    this.requestRefresh();
+    // Only the first refusal of a generation starts a read (later ones, in any turn, find it under way).
+    if (this.rejected.reject(generation)) {
+      this.emit();
+      this.requestRefresh();
+    }
     return false;
   }
 }
