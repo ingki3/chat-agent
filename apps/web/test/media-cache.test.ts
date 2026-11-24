@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_MEDIA_SETTINGS, MEDIA_KINDS, type MediaAdmin, type MediaCatalog } from "@agentlee/shared";
 import {
   catalogView,
+  expectedVersion,
+  formState,
+  mediaScreenStore,
   formValue,
   isStaleKeyError,
   onCatalogError,
@@ -33,6 +36,7 @@ const status = (
     ...extra,
   },
   settings,
+  settingsVersion: 0,
   youthStrictModeration: true,
 });
 const catalog = (generation: string, id = "d/model"): MediaCatalog => ({
@@ -172,5 +176,80 @@ describe("media admin screen rules (#238)", () => {
     const b = r.start();
     expect(r.isLatest(a)).toBe(false);
     expect(r.isLatest(b)).toBe(true);
+  });
+
+  // ---- round 5 ----------------------------------------------------------------------------------------------
+
+  const fifty = DEFAULT_MEDIA_SETTINGS;
+  const twenty = { ...fifty, dailyCostLimitUsd: 20 };
+
+  it("r5: $20 saved, then only the image count edited — the form never builds the next save on the old $50", () => {
+    // Sent: the submitted $20 is shown and the form is locked.
+    let st = formState({
+      edit: null,
+      save: { phase: "sending", values: twenty },
+      server: fifty,
+      serverVersion: 0,
+    });
+    expect(st).toEqual({ values: twenty, locked: true });
+    // Saved as v1, but the status read still shows v0 ($50): still $20, still locked.
+    const confirming = { phase: "confirming" as const, values: twenty, version: 1 };
+    st = formState({ edit: null, save: confirming, server: fifty, serverVersion: 0 });
+    expect(st).toEqual({ values: twenty, locked: true });
+    // The read shows v1: unlocked, following it; an edit now starts from $20.
+    st = formState({ edit: null, save: confirming, server: twenty, serverVersion: 1 });
+    expect(st).toEqual({ values: twenty, locked: false });
+    const next = { ...st.values, perRunLimits: { ...st.values.perRunLimits, image: 2 } };
+    expect(next).toMatchObject({ dailyCostLimitUsd: 20, perRunLimits: { image: 2 } });
+    expect(expectedVersion(1, 1)).toBe(1);
+  });
+
+  it("r5: an edit typed while a save is in flight is impossible (locked), never dropped silently", () => {
+    const st = formState({
+      edit: null,
+      save: { phase: "sending", values: twenty },
+      server: fifty,
+      serverVersion: 0,
+    });
+    expect(st.locked).toBe(true);
+  });
+
+  it("r5: an edit begun before another tab saved names its own base version (the server refuses it)", () => {
+    // Edit started at v1; meanwhile the status read shows v2: the save still says v1 → media_settings_changed.
+    expect(expectedVersion(1, 2)).toBe(1);
+    // No edit: the version shown.
+    expect(expectedVersion(null, 2)).toBe(2);
+  });
+
+  it("r5: a failed save (or re-read) keeps the admin's values as their edit", () => {
+    // After an error the component puts the submitted values back as the edit: they win over any read.
+    expect(formState({ edit: twenty, save: null, server: fifty, serverVersion: 3 })).toEqual({
+      values: twenty,
+      locked: false,
+    });
+  });
+
+  it("r5: the rejected generations and read tickets live with the QueryClient — a re-entered menu still hides lists", () => {
+    const qc = {};
+    const first = mediaScreenStore(qc);
+    first.rejected.reject("p:7");
+    const t = first.reads.start();
+    // The menu is left and entered again: a new component, the same QueryClient.
+    const again = mediaScreenStore(qc);
+    expect(again).toBe(first);
+    expect(catalogView(status("p:7"), catalog("p:7"), again.rejected)).toBeUndefined();
+    expect(again.reads.isLatest(t)).toBe(true);
+    // Another QueryClient (another app instance) has its own.
+    expect(mediaScreenStore({}).rejected.has("p:7")).toBe(false);
+  });
+
+  it("r5: a deletion finished while away — the read started before it is never the one shown", () => {
+    const s = screen(status("p:3", "admin", { last4: "aaaa" }));
+    const before = s.begin(); // a re-check's read, still in flight when the admin leaves
+    const afterDelete = s.writeSettled(); // the delete finished: it starts (and cancels for) a new read
+    s.answer(before, status("p:3", "admin", { last4: "aaaa" }));
+    expect(s.shown!.key.last4).toBe("aaaa"); // unchanged so far: the old read was not taken
+    s.answer(afterDelete, status("p:4", "none"));
+    expect(s.shown!.key.source).toBe("none");
   });
 });

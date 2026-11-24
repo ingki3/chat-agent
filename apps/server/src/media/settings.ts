@@ -2,6 +2,8 @@ import { DEFAULT_MEDIA_SETTINGS, MediaSettings } from "@agentlee/shared";
 import type { SettingsStore } from "../db/settings-store.js";
 
 export const MEDIA_SETTINGS_KEY = "media.settings";
+/** Bumped by every save (#238 review r5): a save must name the version it was made from. */
+export const MEDIA_SETTINGS_VERSION_KEY = "media.settings_version";
 
 /**
  * The admin's media settings (#238) as one JSON row of `settings`. A missing or unreadable row is the defaults
@@ -23,8 +25,16 @@ export class MediaSettingsStore {
     return structuredClone(DEFAULT_MEDIA_SETTINGS);
   }
 
-  set(s: MediaSettings): MediaSettings {
+  /** The settings' version: 0 before the first save, +1 per save. */
+  version(): number {
+    const n = Number(this.settings?.get(MEDIA_SETTINGS_VERSION_KEY) ?? "0");
+    return Number.isSafeInteger(n) && n >= 0 ? n : 0;
+  }
+
+  /** Writes the settings and their new version (the caller runs both in one transaction). */
+  set(s: MediaSettings, version: number = this.version() + 1): MediaSettings {
     this.settings?.set(MEDIA_SETTINGS_KEY, JSON.stringify(MediaSettings.parse(s)));
+    this.settings?.set(MEDIA_SETTINGS_VERSION_KEY, String(version));
     return this.get();
   }
 }

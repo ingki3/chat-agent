@@ -111,6 +111,8 @@ export type MediaKeyView = z.infer<typeof MediaKeyView>;
 export const MediaAdmin = z.object({
   key: MediaKeyView,
   settings: MediaSettings,
+  /** Bumped by every settings save: a save names the version it was made from (`MediaSettingsRequest`). */
+  settingsVersion: z.number().int().min(0),
   /**
    * Youth accounts see media generation (user decision 2026-11-24); their requests ask the provider for its
    * strictest moderation where it has one. Fixed policy, shown so the admin knows.
@@ -120,7 +122,18 @@ export const MediaAdmin = z.object({
 export type MediaAdmin = z.infer<typeof MediaAdmin>;
 
 /** `PUT /api/admin/media/key`: a new key, checked with OpenRouter before it is saved. */
-export const MediaKeyRequest = z.object({ key: z.string().trim().min(8).max(300).regex(/^\S+$/) }).strict();
+/** The key generation a key write was made from (`MediaKeyView.generation`). */
+const Generation = z.string().regex(/^[0-9A-Za-z-]{1,64}:\d{1,12}$/);
+export const MediaKeyRequest = z
+  .object({ key: z.string().trim().min(8).max(300).regex(/^\S+$/), expectedGeneration: Generation })
+  .strict();
+/** `DELETE /api/admin/media/key`, `POST /api/admin/media/key/check`: the generation the screen showed. */
+export const MediaKeyWriteRequest = z.object({ expectedGeneration: Generation }).strict();
+/** `PUT /api/admin/media/settings`: the new settings and the version they were made from. */
+export const MediaSettingsRequest = z
+  .object({ settings: MediaSettings, expectedVersion: z.number().int().min(0) })
+  .strict();
+export type MediaSettingsRequest = z.infer<typeof MediaSettingsRequest>;
 export type MediaKeyRequest = z.infer<typeof MediaKeyRequest>;
 
 /** One model in a kind's catalog, as the screen lists it. */
@@ -156,5 +169,7 @@ export const MEDIA_ERRORS: Record<string, string> = {
   media_no_key: "OpenRouter 키가 없어요. 먼저 키를 등록하세요(.env의 OPENROUTER_API_KEY도 쓸 수 있어요).",
   media_catalog_failed: "OpenRouter에서 모델 목록을 받지 못했어요. 잠시 뒤 다시 해 보세요.",
   media_key_changed: "그사이 OpenRouter 키가 바뀌었어요. 목록을 다시 불러오세요.",
+  media_settings_changed:
+    "다른 곳에서 설정이 바뀌었어요. 최신 값을 불러왔어요 — 다시 확인 후 저장하세요.",
   media_model_unknown: "고른 모델이 OpenRouter 목록에 없어요. 목록을 새로 불러와 다시 고르세요.",
 };

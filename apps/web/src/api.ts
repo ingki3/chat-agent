@@ -360,9 +360,12 @@ export const admin = {
     AudioAdmin.parse(await call("PUT", "/api/admin/audio", { fallback })),
   /** 미디어 생성 (#238): the OpenRouter key, per-kind models and the cost limits. */
   media: async () => MediaAdmin.parse(await call("GET", "/api/admin/media")),
-  setMediaKey: async (key: string) => MediaAdmin.parse(await call("PUT", "/api/admin/media/key", { key })),
-  deleteMediaKey: async () => MediaAdmin.parse(await call("DELETE", "/api/admin/media/key")),
-  checkMediaKey: async () => MediaAdmin.parse(await call("POST", "/api/admin/media/key/check", {})),
+  setMediaKey: async (key: string, expectedGeneration: string) =>
+    MediaAdmin.parse(await call("PUT", "/api/admin/media/key", { key, expectedGeneration })),
+  deleteMediaKey: async (expectedGeneration: string) =>
+    MediaAdmin.parse(await call("DELETE", "/api/admin/media/key", { expectedGeneration })),
+  checkMediaKey: async (expectedGeneration: string) =>
+    MediaAdmin.parse(await call("POST", "/api/admin/media/key/check", { expectedGeneration })),
   /** `generation`: the screen's key generation — the server refuses a read for another one (`media_key_changed`). */
   mediaCatalog: async (kind: MediaKind, fresh = false, generation?: string) => {
     const q = new URLSearchParams();
@@ -373,8 +376,8 @@ export const admin = {
       await call("GET", `/api/admin/media/catalog/${enc(kind)}${qs ? `?${qs}` : ""}`),
     );
   },
-  saveMediaSettings: async (settings: MediaSettings) =>
-    MediaAdmin.parse(await call("PUT", "/api/admin/media/settings", settings)),
+  saveMediaSettings: async (settings: MediaSettings, expectedVersion: number) =>
+    MediaAdmin.parse(await call("PUT", "/api/admin/media/settings", { settings, expectedVersion })),
   runtimes: async () => AdminRuntimesResponse.parse(await call("GET", "/api/admin/runtimes")).items,
   system: async () => SystemStatus.parse(await call("GET", "/api/admin/system")),
   /** Backups (#37): list and "지금 백업". Restore is the CLI only. */

@@ -75,3 +75,45 @@ export function catalogView(
 
 /** The settings the form shows: the admin's unsaved edit, else the latest status read's. */
 export const formValue = (edit: MediaSettings | null, server: MediaSettings): MediaSettings => edit ?? server;
+
+/**
+ * The screen's memory that must outlive the component (review r5): status read tickets and rejected generations
+ * live with the QueryClient — leaving the menu and coming back keeps them, as the query cache does.
+ */
+export type MediaScreenStore = { reads: StatusReads; rejected: RejectedGenerations };
+const stores = new WeakMap<object, MediaScreenStore>();
+export function mediaScreenStore(queryClient: object): MediaScreenStore {
+  let s = stores.get(queryClient);
+  if (!s) stores.set(queryClient, (s = { reads: new StatusReads(), rejected: new RejectedGenerations() }));
+  return s;
+}
+
+/**
+ * A settings save in progress (review r5): `sending` until the server answers, then `confirming` until a status read
+ * shows the saved version (or a later one). Throughout, the form shows the submitted values and is locked — no
+ * flash back to older values, no edit made meanwhile that the save would drop.
+ */
+export type SettingsSave =
+  | { phase: "sending"; values: MediaSettings }
+  | { phase: "confirming"; values: MediaSettings; version: number };
+
+export type FormState = { values: MediaSettings; locked: boolean };
+
+export function formState(o: {
+  edit: MediaSettings | null;
+  save: SettingsSave | null;
+  server: MediaSettings;
+  serverVersion: number;
+}): FormState {
+  const { save } = o;
+  if (save && (save.phase === "sending" || o.serverVersion < save.version))
+    return { values: save.values, locked: true };
+  return { values: formValue(o.edit, o.server), locked: false };
+}
+
+/**
+ * The version a save is made from: the version the admin's edit started from (an edit started before another save
+ * elsewhere must not overwrite it — the server answers `media_settings_changed`), else the version shown.
+ */
+export const expectedVersion = (editBase: number | null, serverVersion: number): number =>
+  editBase ?? serverVersion;

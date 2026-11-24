@@ -70,6 +70,36 @@ test("the admin registers an OpenRouter key, picks a model per kind and sets the
   await expect(form.getByLabel("1인당 하루 비용 한도 (USD)")).toHaveValue("20");
   await expect(form.getByLabel("한 번 실행에서 이미지 최대 횟수")).toHaveValue("2");
 
+  // Review r5: right after a save, only another field is edited and saved — the first save's value stays.
+  await form.getByLabel("1인당 하루 비용 한도 (USD)").fill("15");
+  await form.getByRole("button", { name: "확인하고 저장" }).click();
+  await expect(form.getByRole("status")).toHaveText("저장했어요.");
+  await form.getByLabel("한 번 실행에서 이미지 최대 횟수").fill("3");
+  await form.getByRole("button", { name: "확인하고 저장" }).click();
+  await expect(form.getByRole("status")).toHaveText("저장했어요.");
+  await page.reload();
+  await expect(form.getByLabel("1인당 하루 비용 한도 (USD)")).toHaveValue("15");
+  await expect(form.getByLabel("한 번 실행에서 이미지 최대 횟수")).toHaveValue("3");
+
+  // A save made from an older version (another tab saved meanwhile) is refused; the admin's value stays.
+  const version = (await (await page.request.get("/api/admin/media")).json()) as {
+    settingsVersion: number;
+    settings: unknown;
+  };
+  const otherSave = await page.request.put("/api/admin/media/settings", {
+    headers: csrf(baseURL!),
+    data: { settings: version.settings, expectedVersion: version.settingsVersion },
+  });
+  expect(otherSave.status()).toBe(200);
+  await form.getByLabel("1인당 하루 비용 한도 (USD)").fill("12");
+  await form.getByRole("button", { name: "확인하고 저장" }).click();
+  await expect(form.getByRole("alert")).toContainText("다른 곳에서 설정이 바뀌었어요");
+  await expect(form.getByLabel("1인당 하루 비용 한도 (USD)")).toHaveValue("12");
+  await form.getByRole("button", { name: "이 값으로 다시 저장" }).click();
+  await expect(form.getByRole("status")).toHaveText("저장했어요.");
+  await page.reload();
+  await expect(form.getByLabel("1인당 하루 비용 한도 (USD)")).toHaveValue("12");
+
   // Turning a kind on needs a model (the save button waits for one).
   await form.getByLabel("음성 생성 켜기").check();
   await expect(form.getByText("켜려면 모델을 골라요.")).toBeVisible();
@@ -78,9 +108,13 @@ test("the admin registers an OpenRouter key, picks a model per kind and sets the
 
   // Another tab swaps the key (review r3): this tab still shows wxyz. A manual refresh is refused for the old key
   // generation, the status is read again, and the new key's own list shows — never its list next to wxyz.
+  // The other tab names the generation it shows, as this screen does.
+  const generation = async () =>
+    ((await (await page.request.get("/api/admin/media")).json()) as { key: { generation: string } }).key
+      .generation;
   const other = await page.request.put("/api/admin/media/key", {
     headers: csrf(baseURL!),
-    data: { key: "sk-or-v1-e2e-synthetic-other-tab-00000000000dddd" },
+    data: { key: "sk-or-v1-e2e-synthetic-other-tab-00000000000dddd", expectedGeneration: await generation() },
   });
   expect(other.status()).toBe(200);
   await expect(keyForm.getByTestId("media-key")).toContainText("wxyz");
@@ -106,7 +140,15 @@ test("the admin registers an OpenRouter key, picks a model per kind and sets the
   await expect(keyForm.getByTestId("media-key")).toContainText("vvvv");
   await expect(form.getByTestId("media-model-image")).toContainText("$0.04/image");
   // Another tab deletes it: a manual refresh here ends in "키 없음" with no list and no error left over.
-  expect((await page.request.delete("/api/admin/media/key", { headers: csrf(baseURL!) })).status()).toBe(200);
+  const shownGeneration = await generation();
+  expect(
+    (
+      await page.request.delete("/api/admin/media/key", {
+        headers: csrf(baseURL!),
+        data: { expectedGeneration: shownGeneration },
+      })
+    ).status(),
+  ).toBe(200);
   await form.getByRole("button", { name: "이미지 목록 새로 고침" }).click();
   await expect(keyForm.getByTestId("media-key")).toContainText("키 없음");
   await expect(form.getByTestId("media-model-image")).toHaveCount(0);

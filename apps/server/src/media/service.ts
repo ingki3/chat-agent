@@ -132,6 +132,7 @@ export class MediaAdminService {
     return {
       key: this.keyView(),
       settings: this.o.store.get(),
+      settingsVersion: this.o.store.version(),
       youthStrictModeration: YOUTH_STRICT_MODERATION,
     };
   }
@@ -150,13 +151,15 @@ export class MediaAdminService {
    * A new admin key: checked with OpenRouter, then the key (encrypted) and its check saved in **one** transaction —
    * a failed write keeps the old key and its check as they were. Only its last 4 characters are ever shown.
    */
-  registerKey(key: string, authorize: () => boolean): Promise<MediaAdmin> {
+  registerKey(key: string, expectedGeneration: string, authorize: () => boolean): Promise<MediaAdmin> {
     return this.exclusive(async () => {
       if (!authorize()) throw new MediaError(403, "forbidden");
+      this.expectGeneration(expectedGeneration);
       const st = await this.check(key);
       if (!authorize()) throw new MediaError(403, "forbidden");
       const stored: StoredStatus = { ...st, source: "admin", last4: key.slice(-4), checkedAt: this.now() };
       this.o.transaction(() => {
+        this.expectGeneration(expectedGeneration);
         this.o.settings.setSecret(OPENROUTER_KEY_SETTING, key);
         this.o.settings.set(OPENROUTER_KEY_STATUS_SETTING, JSON.stringify(stored));
       });
@@ -165,35 +168,51 @@ export class MediaAdminService {
     });
   }
 
+  /**
+   * Every key write names the key generation the screen showed (#238 review r5): another one (the key was changed
+   * elsewhere meanwhile) is `media_key_changed` and nothing changes — a delete never removes a key the screen did
+   * not show.
+   */
+  private expectGeneration(expected: string): void {
+    if (expected !== this.generation()) throw new MediaError(409, "media_key_changed");
+  }
+
   /** The admin's key and its check go in one statement (the `.env` key, if any, is then the one in use). */
-  deleteKey(authorize: () => boolean): Promise<MediaAdmin> {
+  deleteKey(expectedGeneration: string, authorize: () => boolean): Promise<MediaAdmin> {
     return this.exclusive(async () => {
       if (!authorize()) throw new MediaError(403, "forbidden");
-      this.o.remove([OPENROUTER_KEY_SETTING, OPENROUTER_KEY_STATUS_SETTING]);
+      this.o.transaction(() => {
+        this.expectGeneration(expectedGeneration);
+        this.o.remove([OPENROUTER_KEY_SETTING, OPENROUTER_KEY_STATUS_SETTING]);
+      });
       this.keyChanged();
       return this.view();
     });
   }
 
   /** Checks the key in use again (the admin's — stored — or `.env`'s — kept in memory) and its limit left. */
-  refreshKey(authorize: () => boolean): Promise<MediaAdmin> {
+  refreshKey(expectedGeneration: string, authorize: () => boolean): Promise<MediaAdmin> {
     return this.exclusive(async () => {
       if (!authorize()) throw new MediaError(403, "forbidden");
+      this.expectGeneration(expectedGeneration);
       const resolved = this.o.keys.resolve();
       if (!resolved) throw new MediaError(400, "media_no_key");
       const st = await this.check(resolved.key);
       if (!authorize()) throw new MediaError(403, "forbidden");
-      if (resolved.source === "env")
-        this.envStatus = { ...st, fp: fingerprint(resolved.key), checkedAt: this.now() };
-      else {
-        const stored: StoredStatus = {
-          ...st,
-          source: "admin",
-          last4: resolved.key.slice(-4),
-          checkedAt: this.now(),
-        };
-        this.o.settings.set(OPENROUTER_KEY_STATUS_SETTING, JSON.stringify(stored));
-      }
+      this.o.transaction(() => {
+        this.expectGeneration(expectedGeneration);
+        if (resolved.source === "env")
+          this.envStatus = { ...st, fp: fingerprint(resolved.key), checkedAt: this.now() };
+        else {
+          const stored: StoredStatus = {
+            ...st,
+            source: "admin",
+            last4: resolved.key.slice(-4),
+            checkedAt: this.now(),
+          };
+          this.o.settings.set(OPENROUTER_KEY_STATUS_SETTING, JSON.stringify(stored));
+        }
+      });
       return this.view();
     });
   }
@@ -247,9 +266,14 @@ export class MediaAdminService {
    * catalog fetched again right now (`media_model_unknown` when the model is not in it). Turning a kind off with its
    * model kept, clearing a model, or changing only the limits needs no OpenRouter call.
    */
-  saveSettings(next: MediaSettings, authorize: () => boolean): Promise<MediaAdmin> {
+  saveSettings(next: MediaSettings, expectedVersion: number, authorize: () => boolean): Promise<MediaAdmin> {
+    // Made from another version than the stored one (saved elsewhere meanwhile): nothing is saved.
+    const expectVersion = () => {
+      if (this.o.store.version() !== expectedVersion) throw new MediaError(409, "media_settings_changed");
+    };
     return this.exclusive(async () => {
       if (!authorize()) throw new MediaError(403, "forbidden");
+      expectVersion();
       const current = this.o.store.get();
       for (const kind of MEDIA_KINDS) {
         const n = next.kinds[kind];
@@ -263,7 +287,10 @@ export class MediaAdminService {
           throw new MediaError(409, "media_model_unknown", kind);
       }
       if (!authorize()) throw new MediaError(403, "forbidden");
-      this.o.store.set(next);
+      this.o.transaction(() => {
+        expectVersion();
+        this.o.store.set(next, expectedVersion + 1);
+      });
       return this.view();
     });
   }

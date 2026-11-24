@@ -1,5 +1,5 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { MediaKeyRequest, MediaKind, MediaSettings } from "@agentlee/shared";
+import { MediaKeyRequest, MediaKeyWriteRequest, MediaKind, MediaSettingsRequest } from "@agentlee/shared";
 import { passwordChangePending } from "../auth/plugin.js";
 import type { UserStore } from "../auth/users.js";
 import { MediaError, type MediaAdminService } from "./service.js";
@@ -34,23 +34,27 @@ export function registerMediaRoutes(
     const r = MediaKeyRequest.safeParse(req.body);
     if (!r.success) return bad(reply);
     try {
-      return send(reply, await media.registerKey(r.data.key, stillAdmin(req)));
+      return send(reply, await media.registerKey(r.data.key, r.data.expectedGeneration, stillAdmin(req)));
     } catch (e) {
       return refuse(reply, e);
     }
   });
 
   app.delete("/api/admin/media/key", { config: admin }, async (req, reply) => {
+    const r = MediaKeyWriteRequest.safeParse(req.body);
+    if (!r.success) return bad(reply);
     try {
-      return send(reply, await media.deleteKey(stillAdmin(req)));
+      return send(reply, await media.deleteKey(r.data.expectedGeneration, stillAdmin(req)));
     } catch (e) {
       return refuse(reply, e);
     }
   });
 
   app.post("/api/admin/media/key/check", { config: admin }, async (req, reply) => {
+    const r = MediaKeyWriteRequest.safeParse(req.body);
+    if (!r.success) return bad(reply);
     try {
-      return send(reply, await media.refreshKey(stillAdmin(req)));
+      return send(reply, await media.refreshKey(r.data.expectedGeneration, stillAdmin(req)));
     } catch (e) {
       return refuse(reply, e);
     }
@@ -71,10 +75,10 @@ export function registerMediaRoutes(
   });
 
   app.put("/api/admin/media/settings", { config: admin }, async (req, reply) => {
-    const r = MediaSettings.safeParse(req.body);
+    const r = MediaSettingsRequest.safeParse(req.body);
     if (!r.success) return bad(reply);
     try {
-      return send(reply, await media.saveSettings(r.data, stillAdmin(req)));
+      return send(reply, await media.saveSettings(r.data.settings, r.data.expectedVersion, stillAdmin(req)));
     } catch (e) {
       return refuse(reply, e);
     }

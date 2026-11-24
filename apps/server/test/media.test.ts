@@ -19,7 +19,7 @@ import { settings as settingsTable, users } from "../src/db/schema.js";
 import { MediaBudget } from "../src/media/budget.js";
 import { SettingsStore } from "../src/db/settings-store.js";
 import { MediaAdminService } from "../src/media/service.js";
-import { MediaSettingsStore } from "../src/media/settings.js";
+import { MEDIA_SETTINGS_VERSION_KEY, MediaSettingsStore } from "../src/media/settings.js";
 import { OPENROUTER_KEY_STATUS_SETTING } from "../src/media/keys.js";
 import { OpenRouterKeys, OPENROUTER_KEY_SETTING } from "../src/media/keys.js";
 import {
@@ -96,13 +96,37 @@ async function start(
   );
   closers.push(() => app.close());
   const f = await createFamily(app);
-  const api = (cookie: string, method: "GET" | "PUT" | "POST" | "DELETE", url: string, payload?: unknown) =>
-    app.inject({
+  /**
+   * Media writes name what the screen showed (review r5): unless a test gives them, the current key generation and
+   * settings version are filled in (and plain settings are wrapped), as the screen does.
+   */
+  const fill = (method: string, url: string, payload: unknown): unknown => {
+    const keyWrite =
+      (url === "/api/admin/media/key" && (method === "PUT" || method === "DELETE")) ||
+      url === "/api/admin/media/key/check";
+    if (keyWrite) {
+      const body = (payload ?? {}) as Record<string, unknown>;
+      return "expectedGeneration" in body
+        ? body
+        : { ...body, expectedGeneration: app.media!.admin.generation() };
+    }
+    if (url === "/api/admin/media/settings" && method === "PUT") {
+      const body = payload as Record<string, unknown>;
+      return body && "settings" in body && "expectedVersion" in body
+        ? body
+        : { settings: body, expectedVersion: app.media!.settings.version() };
+    }
+    return payload;
+  };
+  const api = (cookie: string, method: "GET" | "PUT" | "POST" | "DELETE", url: string, raw?: unknown) => {
+    const payload = fill(method, url, raw);
+    return app.inject({
       method,
       url,
       headers: { ...WRITE, cookie, ...(payload === undefined ? {} : { "content-type": "application/json" }) },
       ...(payload === undefined ? {} : { payload: payload as Record<string, unknown> }),
     });
+  };
   return { app, db, f, api, requests: rec.requests };
 }
 
@@ -739,23 +763,23 @@ describe("media: review round 1 regressions (#244)", () => {
       fetchImpl: o.fetchImpl ?? fixtureOpenRouterFetch(),
       ...(o.bootId ? { bootId: o.bootId } : {}),
     });
-    return { db, svc, keys, removes, fail: (on: boolean) => (failStatus = on) };
+    return { db, real, svc, keys, removes, fail: (on: boolean) => (failStatus = on) };
   }
   const yes = () => true;
   const KEY_B = `${FIXTURE_OPENROUTER_KEY_PREFIX}-second-00000000000000000000bbbb`;
 
   it("key and check are saved in one transaction: a failed second write keeps the old key and its check", async () => {
     const t = service();
-    await t.svc.registerKey(GOOD_KEY, yes);
+    await t.svc.registerKey(GOOD_KEY, t.svc.generation(), yes);
     const before = t.svc.view().key;
     expect(before).toMatchObject({ source: "admin", last4: "abcd", limitRemainingUsd: 87.5 });
     t.fail(true);
-    await expect(t.svc.registerKey(KEY_B, yes)).rejects.toThrow("disk full");
+    await expect(t.svc.registerKey(KEY_B, t.svc.generation(), yes)).rejects.toThrow("disk full");
     expect(t.keys.resolve()).toEqual({ key: GOOD_KEY, source: "admin" });
     expect(t.svc.view().key).toEqual(before);
     t.fail(false);
     // Delete is one statement for both rows.
-    await t.svc.deleteKey(yes);
+    await t.svc.deleteKey(t.svc.generation(), yes);
     expect(t.removes).toEqual([[OPENROUTER_KEY_SETTING, OPENROUTER_KEY_STATUS_SETTING]]);
     expect(
       t.db
@@ -795,28 +819,28 @@ describe("media: review round 1 regressions (#244)", () => {
       return inner(u, init);
     }) as typeof fetch;
     const t = service({ fetchImpl });
-    await t.svc.registerKey(GOOD_KEY, yes);
+    await t.svc.registerKey(GOOD_KEY, t.svc.generation(), yes);
     hold = true;
     const pending = t.svc.catalog("image");
-    await t.svc.deleteKey(yes);
+    await t.svc.deleteKey(t.svc.generation(), yes);
     release();
     await expect(pending).rejects.toMatchObject({ code: "media_key_changed", status: 409 });
     hold = false;
     await expect(t.svc.catalog("image")).rejects.toMatchObject({ code: "media_no_key" });
     // A new key reads its own list (the old one's cache, if any, is not used).
-    await t.svc.registerKey(KEY_B, yes);
+    await t.svc.registerKey(KEY_B, t.svc.generation(), yes);
     expect((await t.svc.catalog("image")).models.length).toBe(2);
   });
 
   it("a cached catalog is used only with the key it was read with", async () => {
     const rec = recordingFetch();
     const t = service({ fetchImpl: rec.fetchImpl });
-    await t.svc.registerKey(GOOD_KEY, yes);
+    await t.svc.registerKey(GOOD_KEY, t.svc.generation(), yes);
     await t.svc.catalog("speech");
     const n = rec.requests.length;
     await t.svc.catalog("speech");
     expect(rec.requests.length).toBe(n);
-    await t.svc.registerKey(KEY_B, yes);
+    await t.svc.registerKey(KEY_B, t.svc.generation(), yes);
     await t.svc.catalog("speech");
     const last = rec.requests.at(-1)!;
     expect(last.url).toBe(MEDIA_CATALOG_URLS.speech);
@@ -946,10 +970,10 @@ describe("media: review round 1 regressions (#244)", () => {
         return inner(u, init);
       }) as typeof fetch;
       const t = service({ fetchImpl });
-      await t.svc.registerKey(GOOD_KEY, yes);
+      await t.svc.registerKey(GOOD_KEY, t.svc.generation(), yes);
       hold = true;
       const pending = t.svc.catalog("video");
-      await t.svc.registerKey(KEY_B, yes);
+      await t.svc.registerKey(KEY_B, t.svc.generation(), yes);
       release();
       await expect(pending, String(status)).rejects.toMatchObject({ code: "media_key_changed", status: 409 });
       // The same key's own failure still maps as before.
@@ -999,9 +1023,9 @@ describe("media: review round 1 regressions (#244)", () => {
     const b = service({ bootId: "boot01" });
     const gens = async (t: ReturnType<typeof service>, key: string) => {
       const out = [t.svc.view().key.generation];
-      await t.svc.registerKey(key, yes);
+      await t.svc.registerKey(key, t.svc.generation(), yes);
       out.push(t.svc.view().key.generation);
-      await t.svc.deleteKey(yes);
+      await t.svc.deleteKey(t.svc.generation(), yes);
       out.push(t.svc.view().key.generation);
       return out;
     };
@@ -1014,7 +1038,7 @@ describe("media: review round 1 regressions (#244)", () => {
 
   it("round 3: a catalog answers with the generation it was read with; a read for another generation is refused", async () => {
     const t = service({ bootId: "boot02" });
-    await t.svc.registerKey(GOOD_KEY, yes);
+    await t.svc.registerKey(GOOD_KEY, t.svc.generation(), yes);
     expect((await t.svc.catalog("image")).generation).toBe("boot02:1");
     expect((await t.svc.catalog("image", false, "boot02:1")).generation).toBe("boot02:1");
     await expect(t.svc.catalog("image", false, "boot02:0")).rejects.toMatchObject({
@@ -1040,5 +1064,90 @@ describe("media: review round 1 regressions (#244)", () => {
     expect(stale.json()).toEqual({ error: "media_key_changed" });
     const bad = await app.api(app.f.cookies.admin, "GET", "/api/admin/media/catalog/image?generation=%20");
     expect(bad.statusCode).toBe(400);
+  });
+
+  it("round 5: settings saves name their version — a stale one is media_settings_changed and saves nothing", async () => {
+    const t = await start();
+    const put = (settings: unknown, expectedVersion: number) =>
+      t.api(t.f.cookies.admin, "PUT", "/api/admin/media/settings", { settings, expectedVersion });
+    const view = () => MediaAdmin.parse(t.app.media!.admin.view());
+    expect(view().settingsVersion).toBe(0);
+    // $20 saved from v0 → v1; then only the image count changed, made from v1 → v2: both kept.
+    const twenty = { ...DEFAULT_MEDIA_SETTINGS, dailyCostLimitUsd: 20 };
+    expect((await put(twenty, 0)).statusCode).toBe(200);
+    expect(view().settingsVersion).toBe(1);
+    const count = { ...twenty, perRunLimits: { ...twenty.perRunLimits, image: 2 } };
+    expect((await put(count, 1)).statusCode).toBe(200);
+    expect(view()).toMatchObject({
+      settingsVersion: 2,
+      settings: { dailyCostLimitUsd: 20, perRunLimits: { image: 2 } },
+    });
+    // A form still showing the old $50 (made from v1) cannot put it back.
+    const stale = await put({ ...DEFAULT_MEDIA_SETTINGS, perRunLimits: { ...count.perRunLimits } }, 1);
+    expect(stale.statusCode).toBe(409);
+    expect(stale.json()).toEqual({ error: "media_settings_changed" });
+    expect(view()).toMatchObject({ settingsVersion: 2, settings: { dailyCostLimitUsd: 20 } });
+    // The body must name a version.
+    expect(
+      (await t.api(t.f.cookies.admin, "PUT", "/api/admin/media/settings", { settings: twenty })).statusCode,
+    ).toBe(400);
+  });
+
+  it("round 5: the version is checked again inside the write's transaction", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    const inner = fixtureOpenRouterFetch();
+    let hold = false;
+    const fetchImpl = (async (u: string | URL | Request, init?: RequestInit) => {
+      if (hold && String(u) === MEDIA_CATALOG_URLS.image) await gate;
+      return inner(u, init);
+    }) as typeof fetch;
+    const t = service({ fetchImpl });
+    await t.svc.registerKey(GOOD_KEY, t.svc.generation(), yes);
+    hold = true;
+    const pending = t.svc.saveSettings(withKind("image", "fixture/image-one"), 0, yes);
+    await new Promise((r) => setTimeout(r, 10));
+    // Another writer bumps the version while the catalog is read (not through this queue).
+    t.real.set(MEDIA_SETTINGS_VERSION_KEY, "1");
+    release();
+    await expect(pending).rejects.toMatchObject({ code: "media_settings_changed", status: 409 });
+    expect(t.svc.view().settings).toEqual(DEFAULT_MEDIA_SETTINGS);
+  });
+
+  it("round 5: key writes name the generation shown — another one changes nothing (no delete of an unseen key)", async () => {
+    const t = await start();
+    const g0 = t.app.media!.admin.generation();
+    await t.api(t.f.cookies.admin, "PUT", "/api/admin/media/key", { key: GOOD_KEY, expectedGeneration: g0 });
+    const g1 = t.app.media!.admin.generation();
+    // Another tab replaced it with B (g1 → g2); this screen still shows g1.
+    await t.api(t.f.cookies.admin, "PUT", "/api/admin/media/key", { key: KEY_B, expectedGeneration: g1 });
+    const before = t.requests.length;
+    const del = await t.api(t.f.cookies.admin, "DELETE", "/api/admin/media/key", { expectedGeneration: g1 });
+    expect(del.statusCode).toBe(409);
+    expect(del.json()).toEqual({ error: "media_key_changed" });
+    expect(t.app.media!.keys.resolve()).toEqual({ key: KEY_B, source: "admin" });
+    const check = await t.api(t.f.cookies.admin, "POST", "/api/admin/media/key/check", {
+      expectedGeneration: g1,
+    });
+    expect(check.statusCode).toBe(409);
+    const reg = await t.api(t.f.cookies.admin, "PUT", "/api/admin/media/key", {
+      key: GOOD_KEY,
+      expectedGeneration: g1,
+    });
+    expect(reg.statusCode).toBe(409);
+    // Refused before OpenRouter is asked, nothing changed.
+    expect(t.requests.length).toBe(before);
+    expect(t.app.media!.keys.resolve()).toEqual({ key: KEY_B, source: "admin" });
+    // A write without the generation is a bad request.
+    expect(
+      (
+        await t.app.inject({
+          method: "DELETE",
+          url: "/api/admin/media/key",
+          headers: { ...WRITE, cookie: t.f.cookies.admin, "content-type": "application/json" },
+          payload: {},
+        })
+      ).statusCode,
+    ).toBe(400);
   });
 });
