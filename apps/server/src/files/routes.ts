@@ -50,6 +50,30 @@ export const INLINE_KINDS: ReadonlySet<FileKind> = new Set(["png", "jpg", "webp"
 export const FILE_CSP =
   "sandbox; default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'";
 
+/**
+ * A single `Range: bytes=…` of a file of `size` bytes: `{start, end}` (inclusive), "unsatisfiable" (416), or
+ * undefined (no header, several ranges, or one that does not parse — then the whole file is sent).
+ */
+export function byteRange(
+  header: string | undefined,
+  size: number,
+): { start: number; end: number } | "unsatisfiable" | undefined {
+  if (typeof header !== "string") return undefined;
+  const m = /^bytes=(\d{0,15})-(\d{0,15})$/.exec(header.trim());
+  if (!m || (!m[1] && !m[2])) return undefined;
+  if (!m[1]) {
+    // A suffix: the last N bytes.
+    const n = Number(m[2]);
+    if (n === 0 || size === 0) return "unsatisfiable";
+    return { start: Math.max(0, size - n), end: size - 1 };
+  }
+  const start = Number(m[1]);
+  const end = m[2] ? Number(m[2]) : size - 1;
+  if (m[2] && end < start) return undefined;
+  if (start >= size) return "unsatisfiable";
+  return { start, end: Math.min(end, size - 1) };
+}
+
 const ERROR_STATUS: Record<FileError | "invalid_request", number> = {
   file_too_large: 413,
   too_many_files: 409,
@@ -319,12 +343,27 @@ export function registerFileRoutes(
       const inline = req.query.inline === "1" && INLINE_KINDS.has(f.kind);
       const { base, ext } = nameParts(toUploadedFile(f).name);
       const disposition = attachment(base, ext || f.kind);
-      return reply
+      reply
         .headers(RAW_HEADERS)
         .header("Content-Security-Policy", FILE_CSP)
         .header("Content-Disposition", inline ? disposition.replace(/^attachment/, "inline") : disposition)
+        .header("Accept-Ranges", "bytes")
+        .type(f.mediaType);
+      // One byte range (#238: the chat's audio player seeks with it; iOS needs it to play) — after every check
+      // above. Several ranges, or a header that does not parse, get the whole file (RFC 9110 lets a server ignore it).
+      const range = byteRange(req.headers.range, f.bytes);
+      if (range === "unsatisfiable") {
+        fs.closeSync(fd);
+        return reply.code(416).header("Content-Range", `bytes */${f.bytes}`).send();
+      }
+      if (range)
+        return reply
+          .code(206)
+          .header("Content-Range", `bytes ${range.start}-${range.end}/${f.bytes}`)
+          .header("Content-Length", String(range.end - range.start + 1))
+          .send(fs.createReadStream("", { fd, autoClose: true, start: range.start, end: range.end }));
+      return reply
         .header("Content-Length", String(f.bytes))
-        .type(f.mediaType)
         .send(fs.createReadStream("", { fd, autoClose: true }));
     },
   );

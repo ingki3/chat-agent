@@ -22,7 +22,7 @@
 
 **가격 위치 (2단계에서 고침, OpenRouter 공개 OpenAPI 명세 `openrouter.ai/docs/openapi/openapi.yaml`·TTS 안내 문서, 2026-11-24).** 배포 뒤 실제 키로 열어 보니 이미지(71)·음성(38)·음악(4) 목록이 모두 "가격: 목록에 없음"이었다. 명세로 확인한 까닭과 고친 방법:
 - 이미지: `ImageModelListItem.endpoints`는 배열이 아니라 **문자열**(`"/api/v1/images/models/<author>/<slug>/endpoints"`)이다. 가격은 그 URL의 `ImageModelEndpointsResponse.endpoints[].pricing: ImagePricingEntry[]`(`{billable: output_image|input_image|input_text|…, unit: image|megapixel|token|request, cost_usd: number, variant?}`)에만 있다. → 모델마다 그 기록을 읽는다(URL은 응답의 문자열이 아니라 id로 서버가 만든다, `author/slug` 모양만). 출력 이미지 줄이 있으면 그것만 보인다. 71개면 71번 읽기라 한 번에 6개·전체 20초로 묶고, 저장 전 재확인은 목록만 받는다.
-- 음성: `SpeechModelResponse`·`SpeechModelEndpoint`에는 가격 필드가 **아예 없다**. TTS 문서: "per-character or per-second cost … via the Models API, where per-second models report their rate under `pricing.completion`". → `GET /models?output_modalities=speech`(`output_modalities`에 `speech` 값이 있다)의 `pricing`을 id로 맞춘다. `prompt`는 글자당, `completion`은 초당으로 표시한다.
+- 음성: `SpeechModelResponse`·`SpeechModelEndpoint`에는 가격 필드가 **아예 없다**. TTS 문서: "per-character or per-second cost … via the Models API, where per-second models report their rate under `pricing.completion`". → `GET /models?output_modalities=speech`(`output_modalities`에 `speech` 값이 있다)의 `pricing`을 id로 맞춘다. 단위는 모델마다 다르다(TTS 문서는 글자·초를 말하지만 Gemini TTS는 입력 텍스트 토큰·출력 오디오 토큰 — 리뷰 1차). 응답에 단위가 없어 `입력 단위`·`출력 단위`와 "(단위 미확정)"으로만 표시한다.
 - 음악: 일반 모델 목록의 `pricing`(`PublicPricing`: `prompt`·`completion`·`request`·`audio_output` 등 십진 문자열)을 읽는 것은 1단계와 같다. 다만 **Lyria의 곡당 가격**($0.08/song, 모델 페이지)은 명세의 어느 가격 필드에도 문서화돼 있지 않다 — 실제 응답에서 0이 아닌 값이 있으면 보이고, 모두 `"0"`이면 여전히 "목록에 없음"이다. 실제 키로 Lyria 항목의 `pricing`을 한 번 확인해야 한다(3단계 전 확인 과제).
 - 표시: 아주 작은 단가가 `$6e-7`처럼 지수로 나오지 않게 소수로(유효 숫자 6자리).
 
@@ -43,17 +43,22 @@
 
 ## 6. 도구 (2단계)
 - `image_generate`·`speech_generate`는 MCP 서버의 자체 도구(`packages/mcp-tools/src/media.ts`)라 Claude·Codex 런타임 모두 같은 도구 목록으로 본다. 스킬 권한이 아니라 **관리자의 종류 스위치**로 켜진다(켜짐 + 모델 + 키). 청소년 계정에도 보인다(사용자 결정). 예약 실행(스킬 범위가 있는 실행)에는 주지 않는다 — "사용자가 요청하지 않으면 부르지 않는다"를 서버가 지킬 수 있는 유일한 자리다.
-- 동기 호출: 이미지·음성은 수십 초 안에 끝나 깊이 조사 같은 job이 필요 없다. 시간 한도 이미지 180초·음성 120초, Codex의 MCP 도구 시간 한도(`tool_timeout_sec`)를 늘리는 목록에 넣었다.
-- 모델 정보(비율·목소리·moderation·response_format)는 **호출마다** 그 모델의 기록을 한 번 읽는다(관리자 화면의 캐시를 쓰지 않는다 — 도구 호출이 화면 캐시의 수명이나 키 세대에 묶이지 않게). 읽지 못하면 모르는 채 보내고 제공자가 판단한다.
-- 청소년 moderation: 이미지 요청 명세(`ImageGenerationRequest`)에는 `moderation` 필드가 없다(채팅의 이미지 생성 서버 도구 설정에만 `auto|low`). 그래서 **모델의 `supported_parameters`에 `moderation`이 있을 때만** 그 값 중 가장 엄격한 것을 최상위 매개변수로 보낸다(`supported_parameters`는 "그 엔드포인트가 받는 매개변수"). 없는 모델에는 보내지 않는다 — 제공자 기본값과 OpenRouter의 CSAM 검사가 적용된다.
-- 음성: `mp3`만 저장한다. PCM만 내는 모델(HeyGen, Gemini TTS)은 거부한다 — PCM을 WAV로 감싸는 것은 쉽지만 표본율이 모델마다 달라(24kHz, 44.1kHz) 문서로 확정되지 않았다. 필요하면 후속.
-- 목소리 복제 없음: 도구 입력에 참고 음성이 없고, 요청에 `input_references`를 넣지 않는다.
+- 동기 호출: 이미지·음성은 수십 초 안에 끝나 job이 필요 없다. 시간 한도 이미지 180초·음성 120초, Codex의 MCP 도구 시간 한도(`tool_timeout_sec`)를 늘리는 목록에 넣었다.
+- **모델 기록은 호출마다 읽고, 읽지 못하면 보내지 않는다**(리뷰 1차): 처음에는 "모르면 그냥 보낸다"였지만, 그러면 청소년 moderation을 확인하지 못한 채 보내고 비용 상한도 없다. 이제 `media_lookup_failed`(재시도 가능). 관리자 화면의 캐시는 쓰지 않는다(도구 호출이 화면 캐시의 수명·키 세대에 묶이지 않게). 기록을 읽는 동안 관리자가 설정을 저장하거나 키를 바꾸면(설정 리비전·키 비교) 보내지 않는다(`media_changed`).
+- 청소년 moderation: 이미지 요청 명세(`ImageGenerationRequest`)에는 `moderation` 필드가 없다(채팅의 이미지 생성 서버 도구 설정에만 `auto|low`). 그래서 **모델의 `supported_parameters`에 `moderation`이 있을 때만** 그 값 중 가장 엄격한 것을 최상위 매개변수로 보낸다(`supported_parameters`는 "그 엔드포인트가 받는 매개변수"). 기록을 확인해 없다고 나온 모델에는 보내지 않는다 — 제공자 기본값과 OpenRouter의 CSAM 검사가 적용된다.
+- 목소리: OpenRouter TTS 문서는 일부 제공자가 공개 목록 밖의 사용자 정의·복제 목소리 id를 받는다고 한다. 그래서 voice는 **확인된 공개 목록에 있을 때만** 보낸다(목록이 없으면 지정 거부). 도구 입력에 참고 음성이 없고 `input_references`도 넣지 않는다.
+- 음성은 `mp3`만 저장한다. PCM만 내는 모델(HeyGen, Gemini TTS)은 거부한다 — PCM을 WAV로 감싸는 것은 쉽지만 표본율이 모델마다 달라 문서로 확정되지 않았다.
+- 이미지 출력 형식: 기록의 `output_format`이 래스터를 포함하면 png→webp→jpeg 순으로 명시해 요청하고, 벡터(SVG)뿐이면 돈을 내기 전에 거부한다. 관리자 목록에서도 표시하고 그 모델은 저장하지 않는다(실제 목록의 `recraft/recraft-v4-vector`가 예, 리뷰 1차).
+- 비밀값: 사용자 글을 옵션 검사보다 **먼저** 검사한다(비밀값이 든 입력이 옵션 오류로 먼저 돌아가 다른 경로를 타지 않게). hint에 넣는 제공자 값은 영숫자 등 좁은 문법을 통과하고 비밀값이 아닌 것만. 도구 결과와 hint는 돌려주기 전에 한 번 더 가린다. 참고 이미지는 다시 인코딩하지 않고(새 의존성 없이) 메타데이터 청크·세그먼트를 구조적으로 버린 뒤, 남은 바이트의 출력 가능한 문자열을 검사한다 — 압축된 픽셀 자료에는 우연한 짧은 문자열만 있고, 파일에 써 넣은 비밀값은 출력 가능한 문자열로 남는다.
 
-## 7. 예산과 진행 중 예약 (1단계 이월)
-- 같은 사람의 생성이 동시에 진행될 때 둘 다 "남은 예산 있음"을 보고 한도를 넘는 문제를, **예상 비용 예약**으로 막았다: 호출은 예상 비용(이미지: 모델 기록의 장당 출력 가격 중 가장 싼 값)을 사용자별 메모리 합에 더하고, 예산 확인은 오늘 쓴 비용 + 예약 합 + 이번 예상으로 한다. 끝나면(성공·실패) 예약을 빼고 실제 비용은 사용량 행으로 들어간다.
-- 한계: 음성은 엔드포인트별 가격이 없어(일반 모델 목록의 글자당 가격뿐, 호출마다 그 큰 목록을 읽지 않는다) 예상 0 — 동시에 여러 음성 호출이 마지막 남은 예산을 함께 넘을 수 있다(음성 한 번은 보통 1센트 미만). 예약은 프로세스 메모리라 재시작 시 사라진다(그때 진행 중 호출도 끝난다). 실제 비용이 예상보다 크면(해상도별 가격 등) 한도를 조금 넘을 수 있다 — 한도는 "다음 호출을 막는" 선이다.
+## 7. 예산 — 비용 상한 예약 (리뷰 1차 P1)
+- 처음에는 이미지의 장당 가격만 메모리에 예약하고 음성은 0을 예약했는데, **음성 한 번으로도** $49.9999에서 $50.0002가 됐다. 그래서 모든 유료 호출이 **보수적인 최대 비용**(`media/cost.ts`)을 예약한다. 상한을 구할 수 없으면(출력 토큰 단가 이미지 모델, 음수 = 변동 가격, 기록 없음) 보내지 않는다(`media_no_price`).
+- 예약은 메모리가 아니라 **사용량 행**이다: 예산 확인과 `reserveMedia`(행을 쓰고 `estimated_cost_micros`에 상한, 마이그레이션 `0038_media_estimate`)를 한 동기 단계로 해서 두 호출이 마지막 남은 예산을 함께 가져가지 못하고, 재시작해도 남는다. 예산은 `priced_cost_micros`(알려진 비용)가 있으면 그것, 없으면 상한을 센다 — 비용이 끝내 오지 않은 생성은 그날 상한을 계속 잡는다(예산을 넘기지 않는 쪽). 거절(4xx·5xx)은 과금되지 않으므로 행을 지우고, 연결 오류·시간 초과는 결과를 모르므로 남긴다.
+- 상한을 잡는 방식: 단가의 단위가 응답에 적혀 있지 않으므로 **모든 해석을 덮는다** — 입력은 UTF-8 바이트(글자·토큰 어느 쪽도 넘지 않는다), 출력 음성은 가장 긴 길이(글자당 0.5초 + 30초)를 초당 50토큰으로 센다(Gemini TTS는 초당 32토큰; 초 단가여도 넘지 않는다), 이미지는 엔드포인트·변형 중 가장 비싼 값과 가장 큰 크기(8192²). 여유 1.2배. 초 단가 음성 모델은 예약이 실제의 수십 배일 수 있다 — 남은 예산이 적으면 그 모델은 거부된다(예약이 풀리는 것은 정산 때).
+- 남은 한계: 같은 대화에 그사이 업로드가 들어와 파일 자리를 가져가면, 결제한 뒤 저장 때 `media_file_limit`이 날 수 있다(비용은 기록된다). 실제 비용이 상한을 넘는 일은 상한 정의상 없어야 하지만, OpenRouter가 기록에 없는 가격으로 청구하면(예: Lyria의 곡당 가격처럼 문서에 없는 필드) 넘을 수 있다 — 그 경우 다음 호출부터 막힌다.
 
 ## 8. 채팅 표시와 파일
 - 생성 파일은 `files.addGenerated`로 실행의 답에 묶이고, 기존 `file_ref` 칩 흐름(`generatedFiles`)으로 답에 붙는다. 화면은 답의 `file_ref` 중 이름이 이미지·음성인 것을 미리보기·재생기로 보인다(사용자 첨부는 그대로 칩만).
 - `INLINE_KINDS`에 webp·m4a·mp3·wav를, `FILE_CSP`에 `media-src 'self'`를 더했다. 나머지(`sandbox`, `default-src 'none'`, 스크립트 없음)는 그대로다. 앱 페이지의 CSP는 `default-src 'self'`라 `<audio src>`(같은 출처)가 이미 허용된다.
+- 파일 원본 응답이 단일 byte range를 받는다(206/416, 권한 검사 뒤) — iOS Safari는 미디어를 Range로 받으며 이것 없이는 탐색이나 재생이 되지 않을 수 있다(Apple 안내). 여러 범위는 지원하지 않고 전체를 준다(RFC 9110 허용).
 - WebP를 파일 종류에 더했다(이미지 모델이 자주 낸다). 업로드도 받는다(내용 서명 검사). 저장 종류는 응답이 주장하는 `media_type`이 아니라 바이트 서명으로 정한다.

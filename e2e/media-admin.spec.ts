@@ -75,9 +75,9 @@ test("the admin registers an OpenRouter key, picks a model per kind and sets the
   await form.getByLabel("음악 모델").selectOption("fixture/music-clip");
   await expect(form.getByTestId("media-model-music")).toContainText("$0.04/request");
   await form.getByLabel("음악 모델").selectOption("");
-  // Speech: its price from the general Models API (the speech list has none).
+  // Speech: its price from the general Models API (the speech list has none), its unit not asserted.
   await form.getByLabel("음성 모델").selectOption("fixture/voice-one");
-  await expect(form.getByTestId("media-model-speech")).toContainText("$0.000015/character");
+  await expect(form.getByTestId("media-model-speech")).toContainText("$0.000015/입력 단위 (단위 미확정");
   await form.getByLabel("음성 모델").selectOption("");
 
   await expect(form.getByLabel("1인당 하루 비용 한도 (USD)")).toHaveValue("50");

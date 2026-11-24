@@ -32,6 +32,8 @@ export type UsageRow = typeof usageRecords.$inferSelect;
 
 /** The `runtime` of a media row (#238): the generation ran at OpenRouter, not in a runtime. */
 export const MEDIA_RUNTIME = "openrouter";
+/** One media generation's usage row key: `<runId>#media:<callId>`. */
+export const mediaRunKey = (runId: string, callId: string) => `${runId}#media:${callId}`;
 
 /** A token count as stored: a non-negative integer, or NULL when the runtime did not report it. */
 const tokens = (v: number | undefined): number | null =>
@@ -153,7 +155,7 @@ export class UsageStore {
       .values({
         userId: m.userId,
         conversationId: m.conversationId,
-        runId: `${m.runId}#media:${m.callId}`,
+        runId: mediaRunKey(m.runId, m.callId),
         attempt: 1,
         runtime: MEDIA_RUNTIME,
         model: m.model,
@@ -179,6 +181,69 @@ export class UsageStore {
       })
       .run();
     this.onRecorded?.(at);
+  }
+
+  /**
+   * 미디어 생성 (#238): a paid generation's row written **before** its request, holding the call's reserved upper
+   * bound (`estimated_cost_micros`) and no cost yet. The daily media budget counts the bound until a cost is settled
+   * — also when none ever comes. Throws when the row cannot be written (then nothing is sent). Synchronous: the
+   * caller checks the budget and writes this in one go, so two calls cannot both take the last of the budget.
+   */
+  reserveMedia(m: {
+    userId: string;
+    conversationId: string | null;
+    runId: string;
+    callId: string;
+    model: string;
+    estimateUsd: number;
+  }): void {
+    const at = this.now();
+    this.db
+      .insert(usageRecords)
+      .values({
+        userId: m.userId,
+        conversationId: m.conversationId,
+        runId: mediaRunKey(m.runId, m.callId),
+        attempt: 1,
+        runtime: MEDIA_RUNTIME,
+        model: m.model,
+        connectionId: null,
+        purpose: "media",
+        createdAt: at,
+        authType: "api_key",
+        priceVersion: null,
+        pricedCostMicros: null,
+        estimatedCostMicros: Math.ceil(m.estimateUsd * 1_000_000),
+        inputTokens: null,
+        outputTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        costUsd: null,
+        requestCount: 1,
+        updatedAt: at,
+      })
+      .run();
+  }
+
+  /** The reported cost of a reserved generation (it replaces the bound in the budget). */
+  settleMedia(runId: string, callId: string, costUsd: number): void {
+    const at = this.now();
+    const usd = cost(costUsd);
+    if (usd === null) return;
+    this.db
+      .update(usageRecords)
+      .set({ costUsd: usd, pricedCostMicros: Math.round(usd * 1_000_000), updatedAt: at })
+      .where(eq(usageRecords.runId, mediaRunKey(runId, callId)))
+      .run();
+    this.onRecorded?.(at);
+  }
+
+  /** A reserved generation OpenRouter refused (no charge): its row goes. */
+  releaseMedia(runId: string, callId: string): void {
+    this.db
+      .delete(usageRecords)
+      .where(eq(usageRecords.runId, mediaRunKey(runId, callId)))
+      .run();
   }
 
   /** A run's rows by attempt (tests, and the usage screen #32 later). */

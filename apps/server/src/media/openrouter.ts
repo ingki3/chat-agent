@@ -38,7 +38,9 @@ export const SPEECH_PRICING_URL = `${OPENROUTER_API}/models?output_modalities=sp
 /** `author/slug` (maybe `:variant`) — the only shape put into a per-model URL. */
 const MODEL_PATH = /^[A-Za-z0-9._~-]{1,100}\/[A-Za-z0-9._~:-]{1,100}$/;
 const modelPath = (id: string) =>
-  MODEL_PATH.test(id) && !id.includes("..") ? id.split("/").map(encodeURIComponent).join("/") : null;
+  MODEL_PATH.test(id) && !id.includes("..") && id.split("/").every((seg) => seg !== "." && seg !== "..")
+    ? id.split("/").map(encodeURIComponent).join("/")
+    : null;
 /** An image model's per-endpoint records (pricing, definitive parameters); null for an id of another shape. */
 export const imageEndpointsUrl = (id: string): string | null => {
   const p = modelPath(id);
@@ -48,6 +50,11 @@ export const imageEndpointsUrl = (id: string): string | null => {
 export const speechModelUrl = (id: string): string | null => {
   const p = modelPath(id);
   return p ? `${OPENROUTER_API}/audio/speech/models/${p}` : null;
+};
+/** A model's endpoints in the general Models API (`data.endpoints[].pricing` — a speech model's prices). */
+export const modelEndpointsUrl = (id: string): string | null => {
+  const p = modelPath(id);
+  return p ? `${OPENROUTER_API}/models/${p}/endpoints` : null;
 };
 export const OPENROUTER_IMAGES_URL = `${OPENROUTER_API}/images`;
 export const OPENROUTER_SPEECH_URL = `${OPENROUTER_API}/audio/speech`;
@@ -71,9 +78,16 @@ export class OpenRouterError extends Error {
 /** One GET to a fixed OpenRouter URL; the JSON answer, or `OpenRouterError`. */
 export async function openRouterGet(
   url: string,
-  o: { apiKey?: string | undefined; fetchImpl?: typeof fetch; timeoutMs?: number },
+  o: {
+    apiKey?: string | undefined;
+    fetchImpl?: typeof fetch;
+    timeoutMs?: number;
+    /** A caller's own stop (a shared deadline): aborts the request and the reading of its body. */
+    signal?: AbortSignal | undefined;
+  },
 ): Promise<unknown> {
   if (!url.startsWith(`${OPENROUTER_API}/`) || carriesSecret([url])) throw new OpenRouterError("failed");
+  const timeout = AbortSignal.timeout(o.timeoutMs ?? OPENROUTER_TIMEOUT_MS);
   const doFetch = o.fetchImpl ?? fetch;
   let res: Response;
   try {
@@ -81,7 +95,7 @@ export async function openRouterGet(
       method: "GET",
       headers: { Accept: "application/json", ...(o.apiKey ? { Authorization: `Bearer ${o.apiKey}` } : {}) },
       redirect: "error",
-      signal: AbortSignal.timeout(o.timeoutMs ?? OPENROUTER_TIMEOUT_MS),
+      signal: o.signal ? AbortSignal.any([o.signal, timeout]) : timeout,
     });
   } catch {
     throw new OpenRouterError("failed");
@@ -229,23 +243,14 @@ function entryPrice(e: Json): string | null {
   return null;
 }
 
-/** The lowest per-image output price of an image model's endpoint records (USD), for a call's estimate. */
-export function imageUnitCost(endpoints: unknown): number | null {
-  if (!Array.isArray(endpoints)) return null;
-  let best: number | null = null;
-  for (const ep of endpoints) {
-    if (!isObj(ep) || !Array.isArray(ep.pricing)) continue;
-    for (const l of ep.pricing) {
-      if (!isObj(l) || l.billable !== "output_image" || l.unit !== "image") continue;
-      const c = typeof l.cost_usd === "number" ? l.cost_usd : NaN;
-      if (Number.isFinite(c) && c >= 0) best = best === null ? c : Math.min(best, c);
-    }
-  }
-  return best;
-}
-
-/** Speech prices of the general Models API (`prompt`: per character of input, `completion`: per second). */
-const SPEECH_UNITS: Record<string, string> = { prompt: "character", completion: "second" };
+/**
+ * Speech prices of the general Models API. Their unit is the model's own and not stated in the answer: per
+ * character, per input text token (`prompt`), per second or per output audio token (`completion`) — OpenRouter's
+ * TTS guide names characters and seconds, but Gemini TTS bills tokens (#238 review r1). So the price shows which
+ * side it is and that its unit is not confirmed.
+ */
+const SPEECH_UNITS: Record<string, string> = { prompt: "입력 단위", completion: "출력 단위" };
+export const SPEECH_UNIT_NOTE = " (단위 미확정: 글자·토큰·초 중 모델마다 다름)";
 
 /**
  * Music: the general Models API lists every model with audio output — music models (Lyria) and voice-chat models
@@ -296,7 +301,33 @@ function parseEntry(kind: MediaKind, e: Json): MediaModel | null {
       outs.find((o) => isObj(o.supported_parameters))?.supported_parameters ?? e.supported_parameters;
     return { id, name, price: entryPrice(e), options: optionTexts(params) };
   }
-  return { id, name, price: entryPrice(e), options: optionTexts(e.supported_parameters) };
+  const vectorOnly = isVectorOnly(e.supported_parameters);
+  return {
+    id,
+    name,
+    price: entryPrice(e),
+    options: [...(vectorOnly ? [VECTOR_ONLY_NOTE] : []), ...optionTexts(e.supported_parameters)].slice(0, 12),
+    ...(vectorOnly ? { vectorOnly: true } : {}),
+  };
+}
+
+/** Raster formats this server stores (`output_format` values as OpenRouter names them). */
+export const RASTER_FORMATS = ["png", "jpeg", "jpg", "webp"] as const;
+export const VECTOR_ONLY_NOTE = "벡터(SVG) 전용 — 이 서버에 저장할 수 없음";
+
+/** The `output_format` values a model lists (lower-cased), or null when it lists none. */
+export function outputFormats(params: unknown): string[] | null {
+  if (!isObj(params) || !isObj(params.output_format) || !Array.isArray(params.output_format.values))
+    return null;
+  return params.output_format.values
+    .filter((v): v is string => typeof v === "string")
+    .map((v) => v.toLowerCase());
+}
+
+/** A model that lists its output formats and none of them is a raster one (SVG only, e.g. a vector model). */
+export function isVectorOnly(params: unknown): boolean {
+  const f = outputFormats(params);
+  return !!f && f.length > 0 && !f.some((x) => (RASTER_FORMATS as readonly string[]).includes(x));
 }
 
 /** Runs `fn` over `items`, at most `limit` at a time. */
@@ -335,7 +366,7 @@ async function addPrices(
       if (!isObj(e)) continue;
       const id = str(e.id);
       const price = priceText(e.pricing, (k) => SPEECH_UNITS[k] ?? k);
-      if (id && price && !byId.has(id)) byId.set(id, price);
+      if (id && price && !byId.has(id)) byId.set(id, `${price}${SPEECH_UNIT_NOTE}`);
     }
     for (const m of models) m.price ??= byId.get(m.id) ?? null;
     return;
@@ -346,7 +377,8 @@ async function addPrices(
   await eachLimited(missing, PRICE_READS_AT_ONCE, async (m) => {
     if (deadline.aborted) return;
     try {
-      const answer = await openRouterGet(imageEndpointsUrl(m.id)!, o);
+      // The shared deadline also stops reads already under way (review r1, P3).
+      const answer = await openRouterGet(imageEndpointsUrl(m.id)!, { ...o, signal: deadline });
       const eps = isObj(answer) && Array.isArray(answer.endpoints) ? answer.endpoints : [];
       m.price = entryPrice({ endpoints: eps });
     } catch {

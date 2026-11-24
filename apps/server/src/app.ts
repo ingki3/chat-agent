@@ -652,6 +652,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       users,
       fetchImpl: mediaFetchImpl,
       secrets: config.skillSecrets,
+      log: app.log,
+      errors,
       ...(opts.media?.sleep ? { sleep: opts.media.sleep } : {}),
     });
     app.decorate("media", {

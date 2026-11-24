@@ -285,8 +285,10 @@ export class MediaAdminService {
         if (!newModel && !turnedOn) continue;
         // Only whether the model is listed: the per-model price reads are not needed for that.
         const catalog = await this.catalog(kind, true, undefined, false);
-        if (!catalog.models.some((m) => m.id === n.model))
-          throw new MediaError(409, "media_model_unknown", kind);
+        const listed = catalog.models.find((m) => m.id === n.model);
+        if (!listed) throw new MediaError(409, "media_model_unknown", kind);
+        // A vector-only image model (SVG) is paid for on every call and never stored (#238 review r1).
+        if (kind === "image" && listed.vectorOnly) throw new MediaError(409, "media_model_unsupported", kind);
       }
       if (!authorize()) throw new MediaError(403, "forbidden");
       this.o.transaction(() => {

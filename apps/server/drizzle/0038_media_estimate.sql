@@ -1,0 +1,1 @@
+ALTER TABLE `usage_records` ADD `estimated_cost_micros` integer;

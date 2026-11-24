@@ -101,6 +101,16 @@ const CATALOGS: Record<string, unknown> = {
     ],
     endpoints: [],
   },
+  // The speech model's endpoints in the general Models API: its prices for a call's upper bound.
+  [`${OPENROUTER_API}/models/fixture/voice-one/endpoints`]: {
+    data: {
+      id: "fixture/voice-one",
+      name: "Fixture Voice",
+      endpoints: [
+        { provider_name: "Fixture", tag: "fixture", pricing: { prompt: "0.000015", completion: "0" } },
+      ],
+    },
+  },
   [SPEECH_PRICING_URL]: {
     data: [
       {

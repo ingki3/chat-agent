@@ -108,6 +108,8 @@ export const LOG_EVENTS = [
   // image_generate / speech_generate (#238): fixed outcome code, the media kind, duration and IDs — never the
   // prompt, the text, the model's answer or the file.
   "media.finished",
+  // A media generation's usage row could not be written (twice): the operator checks the billing (#238).
+  "media.usage_failed",
   // python_run working folders left from the last process could not all be removed at start (#47; nothing else).
   "python.sweep_failed",
   // python_run account self-check (#47 round 2): the outcome only, no detail.
@@ -315,6 +317,8 @@ const FIELDS = new Map<string, Check>([
   ["youtubeCode", isYoutubeCode],
   /** `image_generate` / `speech_generate` (#238): `media_ok` or one of the fixed `media_*` codes. */
   ["mediaCode", isMediaToolCode],
+  /** Which usage write of a media generation failed (#238). */
+  ["mediaStep", (v: unknown) => v === "reserve" || v === "settle" || v === "release"],
   /** A `cite` call (#25): the citation status or why it registered nothing. */
   ["citeCode", isCiteCode],
   /** PNG/PDF export (#51): the format and one of the fixed `export_*` codes. */
@@ -619,6 +623,7 @@ export type LogFields = {
   audioDiarization?: string;
   youtubeCode?: string;
   mediaCode?: string;
+  mediaStep?: "reserve" | "settle" | "release";
   citeCode?: string;
   exportFormat?: string;
   exportCode?: string;

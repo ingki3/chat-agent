@@ -210,8 +210,8 @@ describe("media: the OpenRouter reads (#238)", () => {
     const speech = await get("speech");
     expect(speech.models[0]).toMatchObject({
       id: "fixture/voice-one",
-      // Not in the speech list: from the general Models API (`output_modalities=speech`), per character.
-      price: "$0.000015/character",
+      // Not in the speech list: from the general Models API (`output_modalities=speech`); its unit unconfirmed.
+      price: "$0.000015/입력 단위 (단위 미확정: 글자·토큰·초 중 모델마다 다름)",
       options: ["voice: alloy·nova", "response_format: mp3·pcm", "speed: 0.7–1.2"],
     });
     // Music: the general list filtered by audio output — a text-only model there is left out.
@@ -517,7 +517,13 @@ describe("media: usage rows and the daily budget (#238)", () => {
   it("remaining = the daily limit minus today's media cost of that user only", async () => {
     const { t, store, at, owner, shared } = await family();
     const budget = t.app.media!.budget;
-    expect(budget.remaining(owner)).toEqual({ limitUsd: 50, spentUsd: 0, remainingUsd: 50, uncosted: 0 });
+    expect(budget.remaining(owner)).toEqual({
+      limitUsd: 50,
+      spentUsd: 0,
+      remainingUsd: 50,
+      uncosted: 0,
+      pendingUsd: 0,
+    });
     store.recordMedia({
       userId: owner,
       conversationId: null,
@@ -556,6 +562,7 @@ describe("media: usage rows and the daily budget (#238)", () => {
       spentUsd: 4.04,
       remainingUsd: 45.96,
       uncosted: 1,
+      pendingUsd: 0,
     });
     expect(budget.remaining(shared).remainingUsd).toBe(20);
     // The same call reported again replaces its row (latest cost wins), never adds.
@@ -572,7 +579,13 @@ describe("media: usage rows and the daily budget (#238)", () => {
     expect(budget.allows(owner, 44.97)).toBe(false);
     // Yesterday's cost does not count; the next day starts fresh (midnight in Seoul).
     at(Date.UTC(2026, 10, 24, 15, 0, 1)); // 2026-11-25 00:00:01 KST
-    expect(budget.remaining(owner)).toEqual({ limitUsd: 50, spentUsd: 0, remainingUsd: 50, uncosted: 0 });
+    expect(budget.remaining(owner)).toEqual({
+      limitUsd: 50,
+      spentUsd: 0,
+      remainingUsd: 50,
+      uncosted: 0,
+      pendingUsd: 0,
+    });
   });
 
   it("follows the admin's limit and never goes below 0", async () => {
@@ -594,6 +607,7 @@ describe("media: usage rows and the daily budget (#238)", () => {
       spentUsd: 2.5,
       remainingUsd: 0,
       uncosted: 0,
+      pendingUsd: 0,
     });
     expect(t.app.media!.budget.allows(owner)).toBe(false);
   });
@@ -925,18 +939,21 @@ describe("media: review round 1 regressions (#244)", () => {
       spentUsd: 40,
       remainingUsd: 10,
       uncosted: 0,
+      pendingUsd: 0,
     });
     rec(null);
     expect(t.app.media!.budget.remaining(owner)).toMatchObject({
       spentUsd: 40,
       remainingUsd: 10,
       uncosted: 0,
+      pendingUsd: 0,
     });
     rec(0);
     expect(t.app.media!.budget.remaining(owner)).toMatchObject({
       spentUsd: 0,
       remainingUsd: 50,
       uncosted: 0,
+      pendingUsd: 0,
     });
     // A first report without a cost, then one with it.
     store.recordMedia({
@@ -956,7 +973,7 @@ describe("media: review round 1 regressions (#244)", () => {
       model: "m/x",
       costUsd: 2,
     });
-    expect(t.app.media!.budget.remaining(owner)).toMatchObject({ spentUsd: 2, uncosted: 0 });
+    expect(t.app.media!.budget.remaining(owner)).toMatchObject({ spentUsd: 2, uncosted: 0, pendingUsd: 0 });
   });
 
   it("allows(): only an omitted or explicit 0 estimate is 'unknown'; negative and non-finite are refused", async () => {

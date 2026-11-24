@@ -151,6 +151,8 @@ export const MediaModel = z.object({
   maxDurationSec: z.number().nullable().optional(),
   /** Music only: a voice-chat model (it lists voices — GPT Audio and the like), not a music model. */
   voiceChat: z.boolean().optional(),
+  /** Image only: it lists only vector output formats (SVG) — this server cannot store its images. */
+  vectorOnly: z.boolean().optional(),
 });
 export type MediaModel = z.infer<typeof MediaModel>;
 
@@ -176,6 +178,8 @@ export const MEDIA_ERRORS: Record<string, string> = {
   media_key_changed: "그사이 OpenRouter 키가 바뀌었어요. 목록을 다시 불러오세요.",
   media_settings_changed: "다른 곳에서 설정이 바뀌었어요. 최신 값을 불러왔어요 — 다시 확인 후 저장하세요.",
   media_model_unknown: "고른 모델이 OpenRouter 목록에 없어요. 목록을 새로 불러와 다시 고르세요.",
+  media_model_unsupported:
+    "이 이미지 모델은 벡터(SVG)만 만들어 이 서버에 저장할 수 없어요. png·jpeg·webp를 내는 모델을 고르세요.",
 };
 
 // ---------------------------------------------------------------- stage 2: the tools
@@ -217,6 +221,11 @@ export const MEDIA_TOOL_CODES = [
   "media_file_limit",
   "media_cancelled",
   "media_busy",
+  "media_lookup_failed",
+  "media_no_price",
+  "media_changed",
+  /** A usage row of a generation could not be written (operator's log and error list only). */
+  "media_usage_failed",
 ] as const;
 export type MediaToolCode = (typeof MEDIA_TOOL_CODES)[number];
 
@@ -226,7 +235,7 @@ export const MEDIA_TOOL_HINTS: Partial<Record<MediaToolCode, string>> = {
   media_no_key: "OpenRouter 키가 없어 만들 수 없어요. 관리자에게 키 등록을 부탁하세요.",
   media_quota: "이번 답변에서 만들 수 있는 횟수를 다 썼어요. 다음 메시지에서 다시 요청해 주세요.",
   media_budget:
-    "오늘 쓸 수 있는 미디어 생성 비용 한도에 닿았어요. 내일 다시 하거나 관리자에게 한도를 물어보세요.",
+    "오늘 남은 미디어 생성 예산이 이번 호출의 최대 비용(예약해 두는 상한)보다 적어요. 내일 다시 하거나 관리자에게 한도를 물어보세요.",
   media_bad_option: "이 모델이 받지 않는 옵션이에요. hint의 값 중에서 고르거나 옵션을 빼고 다시 해 보세요.",
   media_unsupported_model:
     "관리자가 고른 모델이 이 서버가 저장할 수 있는 형식(이미지 png·jpg·webp, 음성 mp3)을 내놓지 않아요. 관리자에게 다른 모델을 부탁하세요.",
@@ -239,4 +248,9 @@ export const MEDIA_TOOL_HINTS: Partial<Record<MediaToolCode, string>> = {
   media_failed: "생성하지 못했어요. 잠시 뒤에 다시 해 보거나 사용자에게 알리세요.",
   media_file_limit: "이 대화의 파일이 너무 많아(20개) 저장할 수 없어요. 새 대화에서 해 주세요.",
   media_busy: "다른 생성이 진행 중이에요. 끝난 뒤에 다시 해 주세요.",
+  media_lookup_failed:
+    "OpenRouter에서 모델 정보(옵션·가격)를 확인하지 못해 보내지 않았어요. 잠시 뒤에 다시 해 보세요.",
+  media_no_price:
+    "이 모델의 비용 상한을 정할 수 없어 보내지 않았어요(가격 단위를 알 수 없음). 관리자에게 다른 모델을 부탁하세요.",
+  media_changed: "그사이 관리자가 생성 설정이나 키를 바꿨어요. 다시 요청해 주세요.",
 };

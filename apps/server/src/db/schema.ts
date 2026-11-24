@@ -574,6 +574,11 @@ export const usageRecords = sqliteTable(
      * price ("미제공").
      */
     pricedCostMicros: integer("priced_cost_micros"),
+    /**
+     * 미디어 생성 (#238): the call's reserved upper bound (integer micro-USD), written before the paid request. While
+     * `priced_cost_micros` is NULL (no cost reported yet, or never) the daily media budget counts this instead.
+     */
+    estimatedCostMicros: integer("estimated_cost_micros"),
   },
   (t) => [
     uniqueIndex("usage_records_run_attempt_idx").on(t.runId, t.attempt),
