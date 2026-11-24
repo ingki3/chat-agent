@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -16,12 +17,17 @@ import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
 import { settings as settingsTable, users } from "../src/db/schema.js";
 import { MediaBudget } from "../src/media/budget.js";
+import { SettingsStore } from "../src/db/settings-store.js";
+import { MediaAdminService } from "../src/media/service.js";
+import { MediaSettingsStore } from "../src/media/settings.js";
+import { OPENROUTER_KEY_STATUS_SETTING } from "../src/media/keys.js";
 import { OpenRouterKeys, OPENROUTER_KEY_SETTING } from "../src/media/keys.js";
 import {
   checkKey,
   fetchCatalog,
   MEDIA_CATALOG_URLS,
   OPENROUTER_KEY_URL,
+  OPENROUTER_MAX_BYTES,
   OpenRouterError,
   openRouterGet,
 } from "../src/media/openrouter.js";
@@ -65,7 +71,13 @@ function recordingFetch(inner: typeof fetch = fixtureOpenRouterFetch()) {
   return { fetchImpl, requests };
 }
 
-async function start(o: { envKey?: string; fetchImpl?: typeof fetch; now?: () => number } = {}) {
+async function start(
+  o: {
+    envKey?: string;
+    fetchImpl?: typeof fetch;
+    now?: () => number;
+  } = {},
+) {
   const dir = tmp();
   const rec = recordingFetch(o.fetchImpl);
   const db = createTestDb();
@@ -123,8 +135,18 @@ describe("media: the OpenRouter reads (#238)", () => {
     const answer = (body: unknown, status = 200) =>
       (async () => Response.json(body, { status })) as unknown as typeof fetch;
     expect(
-      await checkKey(GOOD_KEY, answer({ data: { limit: null, limit_remaining: null, usage: "3.5" } })),
+      await checkKey(GOOD_KEY, answer({ data: { limit: null, limit_remaining: null, usage: 3.5 } })),
     ).toEqual({ limitUsd: null, limitRemainingUsd: null, usageUsd: 3.5 });
+    // Review r1: only an explicit null is "unlimited" — a missing or malformed figure is no passed check.
+    for (const data of [
+      {},
+      { limit: null },
+      { limit_remaining: 5 },
+      { limit: "100", limit_remaining: 5 },
+      { limit: 100, limit_remaining: "abc" },
+      { limit: 100, limit_remaining: 5, usage: "x" },
+    ])
+      await expect(checkKey(GOOD_KEY, answer({ data }))).rejects.toMatchObject({ code: "failed" });
     await expect(checkKey(GOOD_KEY, answer({ nope: 1 }))).rejects.toMatchObject({ code: "failed" });
     await expect(checkKey(GOOD_KEY, answer({}, 503))).rejects.toMatchObject({ code: "failed" });
     const down = (async () => {
@@ -628,5 +650,282 @@ describe("media: request policy for stages 2–3 (#238)", () => {
     expect(moderationFor({ youth: true }, ["low", "high", "medium"])).toBe("high");
     expect(moderationFor({ youth: true }, undefined)).toBeNull();
     expect(moderationFor({ youth: false }, ["low", "auto"])).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------- review round 1 (#244)
+
+describe("media: review round 1 regressions (#244)", () => {
+  /** A JSON-ish body streamed in `chunks` pieces of `piece`, with no Content-Length; counts reads and cancel. */
+  function streamed(piece: string, chunks: number) {
+    const bytes = new TextEncoder().encode(piece);
+    const seen = { pulls: 0, cancelled: false };
+    const body = new ReadableStream<Uint8Array>({
+      pull(c) {
+        seen.pulls += 1;
+        if (seen.pulls > chunks) c.close();
+        else c.enqueue(bytes);
+      },
+      cancel() {
+        seen.cancelled = true;
+      },
+    });
+    const fetchImpl = (async () =>
+      new Response(body, { headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
+    return { fetchImpl, seen };
+  }
+
+  it("8 MiB is counted in bytes while streaming (no Content-Length, multibyte): cancelled on the way", async () => {
+    // 1 MiB of "가" (3 bytes each) per chunk: 12 chunks are ~2.9 M characters but 12 MiB of bytes.
+    const piece = "가".repeat(Math.ceil((1024 * 1024) / 3));
+    expect(piece.length * 12).toBeLessThan(OPENROUTER_MAX_BYTES);
+    const big = streamed(piece, 12);
+    await expect(openRouterGet(OPENROUTER_KEY_URL, { fetchImpl: big.fetchImpl })).rejects.toMatchObject({
+      code: "failed",
+    });
+    expect(big.seen.cancelled).toBe(true);
+    expect(big.seen.pulls).toBeLessThanOrEqual(10);
+    // A declared length over the cap is refused before reading.
+    const declared = (async () =>
+      new Response("{}", {
+        headers: { "content-length": String(OPENROUTER_MAX_BYTES + 1) },
+      })) as unknown as typeof fetch;
+    await expect(openRouterGet(OPENROUTER_KEY_URL, { fetchImpl: declared })).rejects.toMatchObject({
+      code: "failed",
+    });
+    // Under the cap, multibyte text across chunk boundaries comes back whole.
+    const json = JSON.stringify({
+      data: { limit: null, limit_remaining: null, note: "가나다".repeat(1000) },
+    });
+    const bytes = new TextEncoder().encode(json);
+    const split = (async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            for (let i = 0; i < bytes.length; i += 7) c.enqueue(bytes.slice(i, i + 7));
+            c.close();
+          },
+        }),
+      )) as unknown as typeof fetch;
+    expect(await openRouterGet(OPENROUTER_KEY_URL, { fetchImpl: split })).toEqual(JSON.parse(json));
+  });
+
+  /** The service on a real database, with a settings store whose status write can be made to fail. */
+  function service(o: { fetchImpl?: typeof fetch } = {}) {
+    const db = createTestDb();
+    const real = new SettingsStore(db, crypto.randomBytes(32));
+    let failStatus = false;
+    const removes: string[][] = [];
+    const settings = {
+      get: (k: string) => real.get(k),
+      setSecret: (k: string, v: string) => real.setSecret(k, v),
+      set: (k: string, v: string) => {
+        if (failStatus && k === OPENROUTER_KEY_STATUS_SETTING) throw new Error("disk full");
+        real.set(k, v);
+      },
+    };
+    const keys = new OpenRouterKeys(real, undefined);
+    const svc = new MediaAdminService({
+      settings,
+      transaction: (fn) => db.transaction(() => fn()),
+      remove: (k) => {
+        removes.push(k);
+        db.$client.prepare(`DELETE FROM settings WHERE key IN (${k.map(() => "?").join(", ")})`).run(...k);
+      },
+      keys,
+      store: new MediaSettingsStore(real),
+      fetchImpl: o.fetchImpl ?? fixtureOpenRouterFetch(),
+    });
+    return { db, svc, keys, removes, fail: (on: boolean) => (failStatus = on) };
+  }
+  const yes = () => true;
+  const KEY_B = `${FIXTURE_OPENROUTER_KEY_PREFIX}-second-00000000000000000000bbbb`;
+
+  it("key and check are saved in one transaction: a failed second write keeps the old key and its check", async () => {
+    const t = service();
+    await t.svc.registerKey(GOOD_KEY, yes);
+    const before = t.svc.view().key;
+    expect(before).toMatchObject({ source: "admin", last4: "abcd", limitRemainingUsd: 87.5 });
+    t.fail(true);
+    await expect(t.svc.registerKey(KEY_B, yes)).rejects.toThrow("disk full");
+    expect(t.keys.resolve()).toEqual({ key: GOOD_KEY, source: "admin" });
+    expect(t.svc.view().key).toEqual(before);
+    t.fail(false);
+    // Delete is one statement for both rows.
+    await t.svc.deleteKey(yes);
+    expect(t.removes).toEqual([[OPENROUTER_KEY_SETTING, OPENROUTER_KEY_STATUS_SETTING]]);
+    expect(
+      t.db
+        .select()
+        .from(settingsTable)
+        .all()
+        .filter((r) => r.key.startsWith("media.openrouter")),
+    ).toEqual([]);
+  });
+
+  it("a malformed /key answer is media_key_check_failed and keeps the old key and check", async () => {
+    let broken = false;
+    const inner = fixtureOpenRouterFetch();
+    const fetchImpl = (async (u: string | URL | Request, init?: RequestInit) =>
+      broken && String(u) === OPENROUTER_KEY_URL
+        ? Response.json({ data: {} })
+        : inner(u, init)) as typeof fetch;
+    const t = await start({ fetchImpl });
+    await t.api(t.f.cookies.admin, "PUT", "/api/admin/media/key", { key: GOOD_KEY });
+    broken = true;
+    const r = await t.api(t.f.cookies.admin, "PUT", "/api/admin/media/key", { key: KEY_B });
+    expect(r.statusCode).toBe(502);
+    expect(r.json()).toEqual({ error: "media_key_check_failed" });
+    const check = await t.api(t.f.cookies.admin, "POST", "/api/admin/media/key/check", {});
+    expect(check.json()).toEqual({ error: "media_key_check_failed" });
+    const m = MediaAdmin.parse((await t.api(t.f.cookies.admin, "GET", "/api/admin/media")).json());
+    expect(m.key).toMatchObject({ source: "admin", last4: "abcd", limitUsd: 100, limitRemainingUsd: 87.5 });
+  });
+
+  it("a catalog read that started before the key changed is neither cached nor returned", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    const inner = fixtureOpenRouterFetch();
+    let hold = false;
+    const fetchImpl = (async (u: string | URL | Request, init?: RequestInit) => {
+      if (hold && String(u) === MEDIA_CATALOG_URLS.image) await gate;
+      return inner(u, init);
+    }) as typeof fetch;
+    const t = service({ fetchImpl });
+    await t.svc.registerKey(GOOD_KEY, yes);
+    hold = true;
+    const pending = t.svc.catalog("image");
+    await t.svc.deleteKey(yes);
+    release();
+    await expect(pending).rejects.toMatchObject({ code: "media_key_changed", status: 409 });
+    hold = false;
+    await expect(t.svc.catalog("image")).rejects.toMatchObject({ code: "media_no_key" });
+    // A new key reads its own list (the old one's cache, if any, is not used).
+    await t.svc.registerKey(KEY_B, yes);
+    expect((await t.svc.catalog("image")).models.length).toBe(2);
+  });
+
+  it("a cached catalog is used only with the key it was read with", async () => {
+    const rec = recordingFetch();
+    const t = service({ fetchImpl: rec.fetchImpl });
+    await t.svc.registerKey(GOOD_KEY, yes);
+    await t.svc.catalog("speech");
+    const n = rec.requests.length;
+    await t.svc.catalog("speech");
+    expect(rec.requests.length).toBe(n);
+    await t.svc.registerKey(KEY_B, yes);
+    await t.svc.catalog("speech");
+    const last = rec.requests.at(-1)!;
+    expect(last.url).toBe(MEDIA_CATALOG_URLS.speech);
+    expect(new Headers(last.init.headers).get("authorization")).toBe(`Bearer ${KEY_B}`);
+  });
+
+  it("a switched-off kind given a new model is still checked; keeping, clearing or limits stay offline", async () => {
+    const t = await start();
+    await t.api(t.f.cookies.admin, "PUT", "/api/admin/media/key", { key: GOOD_KEY });
+    const put = (b: unknown) => t.api(t.f.cookies.admin, "PUT", "/api/admin/media/settings", b);
+    const off = await put(withKind("image", "fixture/not-there", false));
+    expect(off.statusCode).toBe(409);
+    expect(off.json()).toEqual({ error: "media_model_unknown", kind: "image" });
+    expect((await put(withKind("image", "fixture/image-one", false))).statusCode).toBe(200);
+    const n = t.requests.length;
+    // Same model, still off; then on → checked; then off with the model kept → offline; then cleared → offline.
+    expect(
+      (await put({ ...withKind("image", "fixture/image-one", false), dailyCostLimitUsd: 9 })).statusCode,
+    ).toBe(200);
+    expect(t.requests.length).toBe(n);
+    expect((await put(withKind("image", "fixture/image-one", true))).statusCode).toBe(200);
+    expect(t.requests.length).toBe(n + 1);
+    expect((await put(withKind("image", "fixture/image-one", false))).statusCode).toBe(200);
+    expect((await put(withKind("image", null, false))).statusCode).toBe(200);
+    expect(t.requests.length).toBe(n + 1);
+  });
+
+  it(".env's key check is kept in memory, bound to that key: a rotated .env key shows no old balance", async () => {
+    const envA = `${FIXTURE_OPENROUTER_KEY_PREFIX}-envA-000000000000000000000aaa`;
+    const t = await start({ envKey: envA });
+    const r = await t.api(t.f.cookies.admin, "POST", "/api/admin/media/key/check", {});
+    expect(MediaAdmin.parse(r.json()).key).toMatchObject({ source: "env", limitRemainingUsd: 87.5 });
+    // Nothing of it is stored: a restart with another .env key starts with no check.
+    expect(
+      t.db
+        .select()
+        .from(settingsTable)
+        .all()
+        .some((x) => x.key === OPENROUTER_KEY_STATUS_SETTING),
+    ).toBe(false);
+    const envB = `${FIXTURE_OPENROUTER_KEY_PREFIX}-envB-000000000000000000000bbb`;
+    const svc = new MediaAdminService({
+      settings: { get: () => undefined, set: () => {}, setSecret: () => {} },
+      transaction: (fn) => fn(),
+      remove: () => {},
+      keys: new OpenRouterKeys(undefined, envB),
+      store: new MediaSettingsStore(undefined),
+      fetchImpl: fixtureOpenRouterFetch(),
+    });
+    expect(svc.view().key).toMatchObject({ source: "env", checkedAt: null, limitRemainingUsd: null });
+  });
+
+  it("a re-report without a cost never erases a known cost; a $0 correction does replace it", async () => {
+    const t = await start();
+    const store = new UsageStore(t.db);
+    const owner = t.f.users.owner.id;
+    const rec = (costUsd: number | null) =>
+      store.recordMedia({
+        userId: owner,
+        conversationId: null,
+        runId: "r",
+        callId: "c",
+        model: "m/x",
+        costUsd,
+      });
+    rec(40);
+    expect(t.app.media!.budget.remaining(owner)).toMatchObject({
+      spentUsd: 40,
+      remainingUsd: 10,
+      uncosted: 0,
+    });
+    rec(null);
+    expect(t.app.media!.budget.remaining(owner)).toMatchObject({
+      spentUsd: 40,
+      remainingUsd: 10,
+      uncosted: 0,
+    });
+    rec(0);
+    expect(t.app.media!.budget.remaining(owner)).toMatchObject({
+      spentUsd: 0,
+      remainingUsd: 50,
+      uncosted: 0,
+    });
+    // A first report without a cost, then one with it.
+    store.recordMedia({
+      userId: owner,
+      conversationId: null,
+      runId: "r",
+      callId: "d",
+      model: "m/x",
+      costUsd: null,
+    });
+    expect(t.app.media!.budget.remaining(owner).uncosted).toBe(1);
+    store.recordMedia({
+      userId: owner,
+      conversationId: null,
+      runId: "r",
+      callId: "d",
+      model: "m/x",
+      costUsd: 2,
+    });
+    expect(t.app.media!.budget.remaining(owner)).toMatchObject({ spentUsd: 2, uncosted: 0 });
+  });
+
+  it("allows(): only an omitted or explicit 0 estimate is 'unknown'; negative and non-finite are refused", async () => {
+    const t = await start();
+    const b = t.app.media!.budget;
+    const u = t.f.users.owner.id;
+    expect(b.allows(u)).toBe(true);
+    expect(b.allows(u, 0)).toBe(true);
+    expect(b.allows(u, 49.99)).toBe(true);
+    for (const bad of [-1, -0.000001, NaN, Infinity, -Infinity])
+      expect(b.allows(u, bad), String(bad)).toBe(false);
   });
 });

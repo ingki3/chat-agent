@@ -618,10 +618,12 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const mediaFetch = mediaFetchImpl ? { fetchImpl: mediaFetchImpl } : {};
     const mediaAdmin = new MediaAdminService({
       settings: settingsStore,
-      remove: (keys) => {
-        const del = opts.db!.$client.prepare("DELETE FROM settings WHERE key = ?");
-        for (const k of keys) del.run(k);
-      },
+      transaction: (fn) => opts.db!.transaction(() => fn()),
+      // One statement: the key and its check go together, or neither does.
+      remove: (keys) =>
+        void opts
+          .db!.$client.prepare(`DELETE FROM settings WHERE key IN (${keys.map(() => "?").join(", ")})`)
+          .run(...keys),
       keys: openRouterKeys,
       store: mediaSettings,
       ...mediaFetch,

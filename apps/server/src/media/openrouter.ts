@@ -55,24 +55,58 @@ export async function openRouterGet(
   }
   if (res.status === 401 || res.status === 403) throw new OpenRouterError("unauthorized");
   if (!res.ok) throw new OpenRouterError("failed");
-  const declared = Number(res.headers.get("content-length") ?? "0");
-  if (declared > OPENROUTER_MAX_BYTES) throw new OpenRouterError("failed");
+  const text = await readLimited(res);
   try {
-    const text = await res.text();
-    if (text.length > OPENROUTER_MAX_BYTES) throw new OpenRouterError("failed");
     return JSON.parse(text) as unknown;
   } catch {
     throw new OpenRouterError("failed");
   }
 }
 
-const num = z.union([z.number(), z.string()]).transform((v) => (v === "" ? NaN : Number(v)));
+/**
+ * The answer's body as UTF-8 text, at most `OPENROUTER_MAX_BYTES` **bytes**: a declared length over it is refused
+ * before reading, and the bytes are counted while they stream — the stream is cancelled as soon as they go over (an
+ * answer without `Content-Length`, or a compressed one, is never read to its end). Same as the Cloudflare client.
+ */
+export async function readLimited(res: Response, max: number = OPENROUTER_MAX_BYTES): Promise<string> {
+  if (!res.body) return "";
+  const declared = Number(res.headers.get("content-length") ?? NaN);
+  if (Number.isFinite(declared) && declared > max) {
+    await res.body.cancel().catch(() => {});
+    throw new OpenRouterError("failed");
+  }
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > max) {
+        await reader.cancel().catch(() => {});
+        throw new OpenRouterError("failed");
+      }
+      chunks.push(value);
+    }
+  } catch {
+    throw new OpenRouterError("failed");
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/**
+ * `GET /api/v1/key` (OpenRouter docs): `limit` and `limit_remaining` are numbers, or `null` for an unlimited key —
+ * both must be there. A missing field, a string or any other shape is not a check that passed
+ * (`failed`, nothing saved): it would otherwise show as "제한 없음".
+ */
+const Usd = z.number().finite();
 const KeyAnswer = z.object({
   data: z
     .object({
-      limit: num.nullable().optional(),
-      limit_remaining: num.nullable().optional(),
-      usage: num.nullable().optional(),
+      limit: Usd.nullable(),
+      limit_remaining: Usd.nullable(),
+      usage: Usd.nullable().optional(),
     })
     .passthrough(),
 });
@@ -83,8 +117,6 @@ export type KeyStatus = {
   usageUsd: number | null;
 };
 
-const finite = (n: number | null | undefined) => (typeof n === "number" && Number.isFinite(n) ? n : null);
-
 /** `GET /api/v1/key` with this key: its limit and what is left (`unauthorized` = OpenRouter refused the key). */
 export async function checkKey(apiKey: string, fetchImpl?: typeof fetch): Promise<KeyStatus> {
   const answer = KeyAnswer.safeParse(
@@ -92,11 +124,7 @@ export async function checkKey(apiKey: string, fetchImpl?: typeof fetch): Promis
   );
   if (!answer.success) throw new OpenRouterError("failed");
   const d = answer.data.data;
-  return {
-    limitUsd: finite(d.limit),
-    limitRemainingUsd: finite(d.limit_remaining),
-    usageUsd: finite(d.usage),
-  };
+  return { limitUsd: d.limit, limitRemainingUsd: d.limit_remaining, usageUsd: d.usage ?? null };
 }
 
 // ---------------------------------------------------------------- catalogs

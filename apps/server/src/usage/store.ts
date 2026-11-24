@@ -134,7 +134,8 @@ export class UsageStore {
    * One media generation (#238): OpenRouter's own reported cost, as is — no price table, no tokens. The row is an
    * API key row (the OpenRouter key), so its cost counts in every total, today's cost check and the forecast; a
    * generation OpenRouter reported no cost for is "미제공" (`costMissing`). `callId` is unique per generation (one
-   * row each; a repeat with the same id replaces it — the latest reported cost wins).
+   * row each). A repeat with the same id replaces the cost only when it carries one (a correction, `0` included); a
+   * repeat with `null` never erases a cost already known.
    */
   recordMedia(m: {
     userId: string;
@@ -172,7 +173,9 @@ export class UsageStore {
       })
       .onConflictDoUpdate({
         target: [usageRecords.runId, usageRecords.attempt],
-        set: { costUsd: usd, pricedCostMicros: micros, updatedAt: at },
+        // A re-report without a cost keeps the cost already known; a cost (a first one, or a correction — $0
+        // included) replaces it.
+        set: usd === null ? { updatedAt: at } : { costUsd: usd, pricedCostMicros: micros, updatedAt: at },
       })
       .run();
     this.onRecorded?.(at);

@@ -177,7 +177,12 @@ function KindRow({
           </option>
         ))}
       </select>{" "}
-      <button type="button" disabled={!hasKey || reload.isPending} onClick={() => reload.mutate()}>
+      <button
+        type="button"
+        aria-label={`${label} 목록 새로 고침`}
+        disabled={!hasKey || reload.isPending}
+        onClick={() => reload.mutate()}
+      >
         목록 새로 고침
       </button>
       {catalog.data && (
@@ -187,7 +192,9 @@ function KindRow({
         </span>
       )}
       {(catalog.isError || reload.isError) && (
-        <p className="error small">{errorText(catalog.error ?? reload.error)}</p>
+        <p className="error small" role="alert" data-testid={`media-catalog-error-${kind}`}>
+          {label} 목록: {errorText(catalog.error ?? reload.error)}
+        </p>
       )}
       {chosen && (
         <p className="muted small" data-testid={`media-model-${kind}`}>

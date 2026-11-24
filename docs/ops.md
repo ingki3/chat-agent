@@ -2417,14 +2417,15 @@ Gemini Deep Research·OpenAI deep research 같은 외부 백엔드는 다음 단
 OpenRouter 모델로 이미지·음성(TTS)·음악·영상을 만드는 기능의 **관리자 설정과 공통 기반**이다. 도구(`image_generate`·`speech_generate`는 2단계, `video_generate`·음악은 3단계)는 아직 없다 — 이 단계에서는 설정·키·사용량 기록 틀·예산·요청 정책만 생긴다. 코드: `apps/server/src/media/`(`openrouter.ts` 고정 URL 읽기, `keys.ts` 키 결정, `service.ts` 관리자 동작, `settings.ts`, `budget.ts`, `policy.ts`, `fixture.ts` e2e용 가짜 OpenRouter), 화면 `apps/web/src/admin/MediaAdmin.tsx`, 형식 `packages/shared/src/media.ts`. 근거는 `docs/decisions/media-generation.md`.
 
 ### 51.1 키 (관리자 → 미디어 생성 → OpenRouter 키)
-- **등록:** 키를 넣고 "확인하고 저장". 저장 **전에** `GET https://openrouter.ai/api/v1/key`로 확인한다 — 401/403이면 `media_key_invalid`(저장 안 함), 연결 실패·5xx면 `media_key_check_failed`(저장 안 함). 맞으면 `settings.media.openrouter_key`에 AES-256-GCM으로 암호화해 저장하고(`settings.setSecret` — 알려진 비밀로 등록돼 모든 출력에서 가려지고 egress 검사에 걸린다), 화면에는 **끝 4자리와 남은 한도**(`limit_remaining`, 제한 없는 키면 "제한 없음")만 보인다. 확인 결과(한도·사용액·시각, 끝 4자리)는 평문 `media.openrouter_key_status`에 둔다 — 키의 다른 부분은 없다.
+- **등록:** 키를 넣고 "확인하고 저장". 저장 **전에** `GET https://openrouter.ai/api/v1/key`로 확인한다 — 401/403이면 `media_key_invalid`(저장 안 함), 연결 실패·5xx면 `media_key_check_failed`(저장 안 함). 맞으면 `settings.media.openrouter_key`에 AES-256-GCM으로 암호화해 저장하고(`settings.setSecret` — 알려진 비밀로 등록돼 모든 출력에서 가려지고 egress 검사에 걸린다), 화면에는 **끝 4자리와 남은 한도**(`limit_remaining`, 제한 없는 키면 "제한 없음")만 보인다. 확인 결과(한도·사용액·시각, 끝 4자리)는 평문 `media.openrouter_key_status`에 둔다 — 키의 다른 부분은 없다. 키와 확인 결과는 **한 트랜잭션**으로 쓴다(둘째 쓰기가 실패하면 이전 키·결과가 그대로). `/key` 응답에 `limit`·`limit_remaining`이 숫자나 명시적 `null`(제한 없음)로 있어야 확인 성공이다 — 빠지거나 형식이 다르면 `media_key_check_failed`이고 아무것도 바꾸지 않는다.
 - **우선순위:** 관리자가 저장한 키 → 없으면 `.env`의 `OPENROUTER_API_KEY` → 없으면 키 없음. 요청할 때마다 다시 정하므로 저장·삭제가 재시작 없이 다음 요청부터 적용된다. **음성 전사 외부 대체(§46.2)도 같은 키를 쓴다**(관리자 → 스킬 → 음성 전사 외부 대체의 "키 설정됨"도 이 기준).
-- **삭제:** "키 지우기" — 관리자 키와 그 확인 결과를 지운다(`.env` 키가 있으면 그것을 쓴다). **"남은 한도 다시 확인"**은 지금 쓰는 키(관리자 또는 `.env`)로 다시 `/key`를 부른다.
-- 요청 규칙(`audio/openrouter.ts`와 같음): URL은 코드의 상수뿐, 리다이렉트 거부, 키는 `Authorization: Bearer` 헤더에만, URL은 보내기 전 `carriesSecret` 검사, 15초 시간 한도, 응답 8MB까지, 요청·응답 내용은 로그에 남기지 않는다.
+- **삭제:** "키 지우기" — 관리자 키와 그 확인 결과를 한 문장(`DELETE … IN`)으로 지운다(`.env` 키가 있으면 그것을 쓴다). **"남은 한도 다시 확인"**은 지금 쓰는 키(관리자 또는 `.env`)로 다시 `/key`를 부른다. `.env` 키의 확인 결과는 **메모리에만**, 그 키의 지문에 묶어 둔다 — `.env` 키를 바꾸고 재시작하면 이전 잔액이 보이지 않는다.
+- 음성 전사 외부 대체는 **조각마다** 키를 다시 정한다: 전사 중 관리자 키를 지우면 남은 조각은 `.env` 키로 가고, 남은 키가 없으면 더 보내지 않는다(`audio_fallback_failed`).
+- 요청 규칙(`audio/openrouter.ts`와 같음): URL은 코드의 상수뿐, 리다이렉트 거부, 키는 `Authorization: Bearer` 헤더에만, URL은 보내기 전 `carriesSecret` 검사, 15초 시간 한도, 응답 8MiB까지(받는 동안 **바이트**를 세어 넘는 즉시 끊는다 — 길이 헤더가 없거나 압축된 응답도), 요청·응답 내용은 로그에 남기지 않는다.
 
 ### 51.2 종류별 켜기와 모델
 - 이미지·음성·음악·영상마다 켜기와 대상 모델. **기본은 모두 꺼짐·모델 없음**(호출마다 돈이 든다). 켜려면 모델이 있어야 한다.
-- 모델 목록(키가 있어야 불러온다, 10분 재사용, "목록 새로 고침"은 다시 받음):
+- 모델 목록(키가 있어야 불러온다, 같은 키로 받은 것만 10분 재사용, "목록 새로 고침"은 다시 받음 — 키를 바꾸거나 지우기 전에 시작한 조회의 결과는 버리고 `media_key_changed`):
 
   | 종류 | 목록 | 화면에 보이는 것 |
   |---|---|---|
@@ -2432,10 +2433,10 @@ OpenRouter 모델로 이미지·음성(TTS)·음악·영상을 만드는 기능�
   | 음성 | `GET /api/v1/audio/speech/models` | voice·response_format·speed 등, 가격은 엔드포인트에 있으면 |
   | 음악 | `GET /api/v1/models?output_modalities=audio` (전용 목록 없음 — 출력에 `audio`가 있는 모델만) | `pricing`(요청당 등) |
   | 영상 | `GET /api/v1/videos/models` | 길이·해상도·비율, `pricing_skus`(초당), 최대 길이 |
-- **저장 전 재확인:** 새로 켰거나 모델을 바꾼 종류는 그 종류의 목록을 **그 자리에서 다시 받아** 모델이 있는지 본다(없으면 409 `media_model_unknown`, 저장 안 함). 끄기·한도만 바꾸기는 OpenRouter를 부르지 않는다.
+- **저장 전 재확인:** 새로 켰거나, 켜짐·꺼짐과 상관없이 새 모델(비어 있지 않은 값)을 고른 종류는 그 종류의 목록을 **그 자리에서 다시 받아** 모델이 있는지 본다(없으면 409 `media_model_unknown`, 저장 안 함). 모델을 그대로 두고 끄기, 모델 선택 해제, 한도만 바꾸기는 OpenRouter를 부르지 않는다.
 
 ### 51.3 비용·횟수 한도
-- **1인당 하루 비용 한도**(USD, 기본 **$50**, 소수 둘째 자리까지, 최대 10,000): 서비스 시간대(Asia/Seoul)의 하루 동안 그 사람의 `media` 사용량 행 비용 합. 2·3단계 도구는 호출 전에 `app.media.budget.remaining(userId)`/`allows(userId, 예상 비용)`로 확인한다. OpenRouter가 비용을 알려 주지 않은 생성은 합에 들어가지 않고 `uncosted`로 센다.
+- **1인당 하루 비용 한도**(USD, 기본 **$50**, 소수 둘째 자리까지, 최대 10,000): 서비스 시간대(Asia/Seoul)의 하루 동안 그 사람의 `media` 사용량 행 비용 합. 2·3단계 도구는 호출 전에 `app.media.budget.remaining(userId)`/`allows(userId, 예상 비용)`로 확인한다. OpenRouter가 비용을 알려 주지 않은 생성은 합에 들어가지 않고 `uncosted`로 센다. `allows`의 예상 비용은 생략하거나 `0`일 때만 "모름"이고, 음수·NaN·무한대는 거부한다. 같은 생성을 비용 없이 다시 기록해도 이미 알려진 비용은 지워지지 않는다(비용이 있는 재기록 — `$0` 포함 — 은 정정으로 덮어쓴다).
 - **한 번 실행당 최대 횟수**: 이미지 4·음성 3·음악 1·영상 1(기본, 0–50).
 - **영상 기본 길이 8초**(저장만 — 사용자가 더 길게 요청하면 모델 최대 길이까지, 3단계 확인 카드에서 적용).
 - 사용량: `usage_records`에 purpose `media`, runtime `openrouter`, 모델 id, **OpenRouter가 알려 준 실제 비용**(가격표 없이 그대로 — `UsageStore.recordMedia`)을 API 키 행으로 쓴다. 사용량 화면의 목적 "미디어 생성", 연결 "OpenRouter 키"로 보이고, 오늘 비용 알림(§사용량)·월 예상에도 들어간다. 토큰은 없다("—").

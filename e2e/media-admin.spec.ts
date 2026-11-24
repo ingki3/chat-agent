@@ -35,6 +35,9 @@ test("the admin registers an OpenRouter key, picks a model per kind and sets the
 
   // Per kind: the catalog's models, with price and options.
   const form = tab.getByRole("form", { name: "미디어 생성 설정" });
+  // Each kind's refresh button says which list it reloads.
+  for (const label of ["이미지", "음성", "음악", "영상"])
+    await expect(form.getByRole("button", { name: `${label} 목록 새로 고침` })).toBeEnabled();
   const image = form.getByLabel("이미지 모델");
   await expect(image.locator("option")).toHaveCount(3);
   await image.selectOption("fixture/image-one");

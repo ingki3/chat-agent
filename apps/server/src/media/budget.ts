@@ -38,11 +38,15 @@ export class MediaBudget {
     };
   }
 
-  /** Whether a call estimated at `estimateUsd` (0 when unknown) still fits today's budget. */
-  allows(userId: string, estimateUsd = 0, at: number = this.now()): boolean {
+  /**
+   * Whether a call estimated at `estimateUsd` still fits today's budget. Only an omitted estimate or an explicit `0`
+   * means "not known" (then: something must be left); a negative or non-finite estimate (a broken price
+   * computation) is refused, never treated as free.
+   */
+  allows(userId: string, estimateUsd: number = 0, at: number = this.now()): boolean {
+    if (typeof estimateUsd !== "number" || !Number.isFinite(estimateUsd) || estimateUsd < 0) return false;
     const { left } = this.micros(userId, at);
-    const estimate =
-      Number.isFinite(estimateUsd) && estimateUsd > 0 ? Math.round(estimateUsd * 1_000_000) : 0;
+    const estimate = Math.round(estimateUsd * 1_000_000);
     return left > 0 && estimate <= left;
   }
 

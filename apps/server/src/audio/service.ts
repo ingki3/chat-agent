@@ -386,7 +386,7 @@ export class AudioTranscriber {
       if (!client || !sw.enabled()) throw new AudioError(local.code);
       // From here on the switch is watched too: turned off, the request in flight is aborted.
       ctx.fallbackPhase(() => sw.enabled() && (this.opts.fallback.allowed?.(scope) ?? true));
-      words = await this.viaOpenRouter(client, job, ctx);
+      words = await this.viaOpenRouter(job, ctx);
       // Every piece is back: the switch no longer matters for storing what was already received.
       ctx.fallbackPhase(() => true);
       stt = "openrouter";
@@ -443,11 +443,11 @@ export class AudioTranscriber {
 
   /**
    * The words through OpenRouter: the WAV in MP3 pieces, one request each, times shifted to the whole recording.
-   * Before every piece: the run still open, the user still allowed, the switch still on (`ctx.check`); a change while
+   * Before every piece: the run still open, the user still allowed, the switch still on (`ctx.check`), and the key
+   * resolved again (#238); a change while
    * a piece is in flight aborts that request (the watch).
    */
   private async viaOpenRouter(
-    client: FallbackClient,
     job: {
       env: Extract<AudioState, { state: "available" }>["env"];
       workdir: string;
@@ -473,6 +473,10 @@ export class AudioTranscriber {
         throw new AudioError("audio_fallback_failed");
       }
       ctx.check();
+      // The key is resolved again for every piece (#238): a key deleted or replaced meanwhile is not used for the
+      // rest — the next key in line is (the admin's, else `.env`'s), and with none left nothing more is sent.
+      const client = this.fallbackClient();
+      if (!client) throw new AudioError("audio_fallback_failed");
       const r = await client({ data, index: i }, { language: job.language, signal: ctx.signal });
       ctx.check();
       if (!r.ok) throw new AudioError("audio_fallback_failed");
