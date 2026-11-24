@@ -16,6 +16,8 @@ export const USAGE_PURPOSES = [
   "dreaming",
   /** 깊이 조사 (#211): every step of a job (plan, sub-researchers, reflection, writer), on the owner's connection. */
   "research",
+  /** 미디어 생성 (#238): one OpenRouter generation, with the cost OpenRouter reported (no tokens). */
+  "media",
 ] as const;
 export const UsagePurpose = z.enum(USAGE_PURPOSES);
 export type UsagePurpose = z.infer<typeof UsagePurpose>;

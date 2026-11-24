@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import type { FastifyInstance } from "fastify";
-import { CSRF_HEADER } from "@agentlee/shared";
+import { CSRF_HEADER, DEFAULT_MEDIA_SETTINGS } from "@agentlee/shared";
 import { hashPassword } from "../../src/auth/passwords.js";
 import type { UserRow } from "../../src/auth/users.js";
 
@@ -596,6 +596,8 @@ export const ADMIN_MATRIX_PREFIXES = [
   "/api/admin/audio",
   // #204: public links — counts, expiry, turn off (no title, no content).
   "/api/admin/public-links",
+  // #238: 미디어 생성 — the OpenRouter key, per-kind models and limits.
+  "/api/admin/media",
 ];
 /** A route the admin reaches with the matrix's placeholder id: the handler answers 404 (not 403). */
 const ADMIN_BY_ID: Record<Who, number> = { ...ADMIN_ONLY, admin: 404 };
@@ -623,6 +625,31 @@ export const ADMIN_MATRIX: AdminRow[] = [
   // #173
   { route: "GET /api/admin/audio", expect: ADMIN_ONLY },
   { route: "PUT /api/admin/audio", expect: ADMIN_ONLY, body: { fallback: false } },
+  // #238: the matrix app has no OpenRouter key and never reaches OpenRouter — a key that is no key (400
+  // `invalid_request`), key writes naming a generation that is not the server's (409 `media_key_changed`), the
+  // catalog without a key (400 `media_no_key`), settings with every kind off made from version 0.
+  { route: "GET /api/admin/media", expect: ADMIN_ONLY },
+  {
+    route: "PUT /api/admin/media/key",
+    expect: { ...ADMIN_ONLY, admin: 400 },
+    body: { key: "x", expectedGeneration: "x:0" },
+  },
+  {
+    route: "DELETE /api/admin/media/key",
+    expect: { ...ADMIN_ONLY, admin: 409 },
+    body: { expectedGeneration: "x:0" },
+  },
+  {
+    route: "POST /api/admin/media/key/check",
+    expect: { ...ADMIN_ONLY, admin: 409 },
+    body: { expectedGeneration: "x:0" },
+  },
+  { route: "GET /api/admin/media/catalog/:kind", expect: { ...ADMIN_ONLY, admin: 400 } },
+  {
+    route: "PUT /api/admin/media/settings",
+    expect: ADMIN_ONLY,
+    body: { settings: DEFAULT_MEDIA_SETTINGS, expectedRevision: "initial" },
+  },
   { route: "GET /api/admin/errors", expect: ADMIN_ONLY },
   { route: "GET /api/admin/connections", expect: ADMIN_ONLY },
   {

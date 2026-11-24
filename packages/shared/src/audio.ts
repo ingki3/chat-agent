@@ -92,7 +92,10 @@ export const AUDIO_FALLBACK_MODEL = "openai/whisper-large-v3";
 export const AudioAdmin = z.object({
   /** The admin turned the fallback on. It is used only when `keyConfigured` too. */
   fallback: z.boolean(),
-  /** `OPENROUTER_API_KEY` is set in `.env` (the value never leaves the server). */
+  /**
+   * An OpenRouter key is there: the admin's (관리자 → 미디어 생성, #238) or `OPENROUTER_API_KEY` in `.env` (the value
+   * never leaves the server).
+   */
   keyConfigured: z.boolean(),
 });
 export type AudioAdmin = z.infer<typeof AudioAdmin>;

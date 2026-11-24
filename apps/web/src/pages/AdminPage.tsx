@@ -11,6 +11,7 @@ import { DreamingAdmin } from "../admin/DreamingAdmin.js";
 import { UsageAdmin } from "./Usage.js";
 import { AccessAdmin } from "../admin/AccessAdmin.js";
 import { PublicLinksAdmin } from "../admin/PublicLinksAdmin.js";
+import { MediaAdmin } from "../admin/MediaAdmin.js";
 
 const TABS = [
   ["users", "사용자"],
@@ -18,6 +19,7 @@ const TABS = [
   ["permissions", "권한"],
   ["runtimes", "런타임"],
   ["skills", "스킬"],
+  ["media", "미디어 생성"],
   ["instructions", "지침"],
   ["dreaming", "기억 정리"],
   ["system", "시스템 상태"],
@@ -29,7 +31,7 @@ type Tab = (typeof TABS)[number][0];
 
 /**
  * Admin screen (#35, PRD FR-10): users (#41 + edit), Cloudflare Access (#36), per-user permissions, runtimes and connections, skills, 지침 (#144),
- * 기억 정리 (#146 — since #188 only the server-wide switch, token cap, allowed connections, youth settings and status), system status, backups (#37) and usage (#32). The tab is in the address (`?tab=`), so a notification can open the right one.
+ * 기억 정리 (#146 — since #188 only the server-wide switch, token cap, allowed connections, youth settings and status), system status, backups (#37), usage (#32) and 미디어 생성 (#238). The tab is in the address (`?tab=`), so a notification can open the right one.
  */
 export function AdminPage({ selfId }: { selfId: string }) {
   const [params, setParams] = useSearchParams();
@@ -60,6 +62,7 @@ export function AdminPage({ selfId }: { selfId: string }) {
           {tab === "permissions" && <PermissionsAdmin />}
           {tab === "runtimes" && <RuntimesAdmin />}
           {tab === "skills" && <SkillsAdmin />}
+          {tab === "media" && <MediaAdmin />}
           {tab === "instructions" && <InstructionsAdmin />}
           {tab === "dreaming" && <DreamingAdmin />}
           {tab === "system" && <SystemAdmin />}
