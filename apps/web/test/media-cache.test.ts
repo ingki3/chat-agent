@@ -3,7 +3,7 @@ import { DEFAULT_MEDIA_SETTINGS, MEDIA_KINDS, type MediaAdmin, type MediaCatalog
 import {
   catalogView,
   draftBase,
-  expectedVersion,
+  expectedRevision,
   formState,
   MediaScreenStore,
   inputAfterSave,
@@ -41,7 +41,7 @@ const status = (
     ...extra,
   },
   settings,
-  settingsVersion: 0,
+  settingsRevision: "initial",
   youthStrictModeration: true,
 });
 const catalog = (generation: string, id = "d/model"): MediaCatalog => ({
@@ -183,120 +183,10 @@ describe("media admin screen rules (#238)", () => {
     expect(r.isLatest(b)).toBe(true);
   });
 
-  // ---- round 5 ----------------------------------------------------------------------------------------------
+  // ---- round 5+ (revisions, read order) ------------------------------------------------------------------
 
   const fifty = DEFAULT_MEDIA_SETTINGS;
   const twenty = { ...fifty, dailyCostLimitUsd: 20 };
-
-  it("r5: $20 saved, then only the image count edited — the form never builds the next save on the old $50", () => {
-    // Sent: the submitted $20 is shown and the form is locked.
-    let st = formState({
-      edit: null,
-      save: { phase: "sending", values: twenty, base: 0 },
-      server: fifty,
-      serverVersion: 0,
-    });
-    expect(st).toMatchObject({ values: twenty, locked: true });
-    // Saved as v1, but the status read still shows v0 ($50): still $20, still locked.
-    const confirming = { phase: "confirming" as const, values: twenty, base: 0, version: 1 };
-    st = formState({ edit: null, save: confirming, server: fifty, serverVersion: 0 });
-    expect(st).toMatchObject({ values: twenty, locked: true });
-    // The read shows v1: unlocked, following it; an edit now starts from $20.
-    st = formState({ edit: null, save: confirming, server: twenty, serverVersion: 1 });
-    expect(st).toMatchObject({ values: twenty, locked: false });
-    const next = { ...st.values, perRunLimits: { ...st.values.perRunLimits, image: 2 } };
-    expect(next).toMatchObject({ dailyCostLimitUsd: 20, perRunLimits: { image: 2 } });
-    expect(expectedVersion(1, 1)).toBe(1);
-  });
-
-  it("r5: an edit typed while a save is in flight is impossible (locked), never dropped silently", () => {
-    const st = formState({
-      edit: null,
-      save: { phase: "sending", values: twenty, base: 0 },
-      server: fifty,
-      serverVersion: 0,
-    });
-    expect(st.locked).toBe(true);
-  });
-
-  it("r5: an edit begun before another tab saved names its own base version (the server refuses it)", () => {
-    // Edit started at v1; meanwhile the status read shows v2: the save still says v1 → media_settings_changed.
-    expect(expectedVersion(1, 2)).toBe(1);
-    // No edit: the version shown.
-    expect(expectedVersion(null, 2)).toBe(2);
-  });
-
-  it("r5: a failed save (or re-read) keeps the admin's values as their edit", () => {
-    // After an error the component puts the submitted values back as the edit: they win over any read.
-    expect(formState({ edit: twenty, save: null, server: fifty, serverVersion: 3 })).toMatchObject({
-      values: twenty,
-      locked: false,
-    });
-  });
-
-  it("r5: the rejected generations and read tickets live with the QueryClient — a re-entered menu still hides lists", () => {
-    const qc = {};
-    const first = mediaScreenStore(qc);
-    first.rejected.reject("p:7");
-    const t = first.reads.start();
-    // The menu is left and entered again: a new component, the same QueryClient.
-    const again = mediaScreenStore(qc);
-    expect(again).toBe(first);
-    expect(catalogView(status("p:7"), catalog("p:7"), again.rejected)).toBeUndefined();
-    expect(again.reads.isLatest(t)).toBe(true);
-    // Another QueryClient (another app instance) has its own.
-    expect(mediaScreenStore({}).rejected.has("p:7")).toBe(false);
-  });
-
-  it("r5: a deletion finished while away — the read started before it is never the one shown", () => {
-    const s = screen(status("p:3", "admin", { last4: "aaaa" }));
-    const before = s.begin(); // a re-check's read, still in flight when the admin leaves
-    const afterDelete = s.writeSettled(); // the delete finished: it starts (and cancels for) a new read
-    s.answer(before, status("p:3", "admin", { last4: "aaaa" }));
-    expect(s.shown!.key.last4).toBe("aaaa"); // unchanged so far: the old read was not taken
-    s.answer(afterDelete, status("p:4", "none"));
-    expect(s.shown!.key.source).toBe("none");
-  });
-
-  // ---- round 6 ----------------------------------------------------------------------------------------------
-
-  it("r6: a write's inputs are fixed at the click — what is on screen later does not change them", () => {
-    let input = "sk-or-v1-e2e-key-bbbb";
-    let generation = "p:3";
-    const save = keySaveArgs(input, generation);
-    const del = keyWriteArgs(generation);
-    // Held back offline: meanwhile the input becomes CCCC and the status read shows another key (p:4).
-    input = "sk-or-v1-e2e-key-cccc";
-    generation = "p:4";
-    expect(save).toEqual({ key: "sk-or-v1-e2e-key-bbbb", expectedGeneration: "p:3" });
-    expect(del).toEqual({ expectedGeneration: "p:3" });
-    // Once it succeeds, the newer input is kept; the saved one is cleared.
-    expect(inputAfterSave(input, save.key)).toBe(input);
-    expect(inputAfterSave("  sk-or-v1-e2e-key-bbbb ", save.key)).toBe("");
-    expect(generation).toBe("p:4");
-  });
-
-  it("r6: a save waiting for its confirming read stays with the QueryClient — a re-entered form is still locked", () => {
-    const qc = {};
-    const first = mediaScreenStore(qc);
-    first.settleSave(first.beginSave(twenty, 4)!, { ok: true, version: 5 });
-    // The menu is left and entered again (a new form): the same store, the same lock.
-    const again = mediaScreenStore(qc);
-    expect(formState({ edit: null, save: again.save, server: fifty, serverVersion: 4 })).toMatchObject({
-      values: twenty,
-      locked: true,
-    });
-    expect(formState({ edit: null, save: again.save, server: twenty, serverVersion: 5 }).locked).toBe(false);
-  });
-
-  it("r6: a key write refused for its generation rejects that generation (lists hidden, one read)", () => {
-    const s = screen(status("p:3"));
-    expect(s.catalogError({ code: "media_key_changed" }, keyWriteArgs("p:3").expectedGeneration)).toBe(false);
-    expect(s.list(catalog("p:3"))).toBeUndefined();
-    expect(s.refreshes).toBe(1);
-  });
-
-  // ---- round 7 ----------------------------------------------------------------------------------------------
 
   /** A store whose coalesced refresh runs when `flush` is called (a turn of the event loop). */
   function store() {
@@ -313,110 +203,161 @@ describe("media admin screen rules (#238)", () => {
       renders: () => renders,
     };
   }
+  /** The form state with the status read `ticket` shown. */
+  const shown = (
+    st: MediaScreenStore,
+    server: typeof fifty,
+    ticket: number,
+    edit: typeof fifty | null = null,
+  ) => formState({ edit, save: st.save, server, shownTicket: ticket, busy: st.op !== null });
 
-  it("r7: a save sent from one form and answered after re-entry settles in the form mounted now (success)", () => {
+  it("r5/r9: $20 saved, then only the count edited — locked on $20 until a read started after the answer", () => {
     const t = store();
-    const id = t.st.beginSave(twenty, 0)!;
-    // The menu is left and entered again: the new form reads the same store (and is subscribed to it).
-    const renders = t.renders();
-    // The PUT answers (mutation callback, whatever form is mounted): v1 to wait for.
-    expect(t.st.settleSave(id, { ok: true, version: 1 })).toBe(true);
-    expect(t.renders()).toBeGreaterThan(renders);
-    expect(formState({ edit: null, save: t.st.save, server: fifty, serverVersion: 0 })).toMatchObject({
-      values: twenty,
-      locked: true,
+    const before = t.st.reads.start(); // the read shown (ticket 1), still the old $50
+    const id = t.st.beginSave(twenty, "R0")!;
+    expect(shown(t.st, fifty, before)).toMatchObject({ values: twenty, locked: true, saved: false });
+    // A read started while the PUT was out (ticket 2) does not confirm it.
+    const during = t.st.reads.start();
+    t.st.settleSave(id, { ok: true });
+    expect(shown(t.st, fifty, during)).toMatchObject({ values: twenty, locked: true, saved: true });
+    // The read started after the answer (ticket 3) ends it, whatever it shows.
+    const after = t.st.reads.start();
+    expect(shown(t.st, twenty, after)).toMatchObject({ values: twenty, locked: false, saved: true });
+    // An edit now starts from $20.
+    const next = { ...twenty, perRunLimits: { ...twenty.perRunLimits, image: 2 } };
+    expect(next).toMatchObject({ dailyCostLimitUsd: 20, perRunLimits: { image: 2 } });
+  });
+
+  it("r9: a restore brings back an older revision — the read after the answer still ends the lock", () => {
+    const t = store();
+    const id = t.st.beginSave(twenty, "R2")!;
+    t.st.settleSave(id, { ok: true });
+    const after = t.st.reads.start();
+    // The read shows restored values (an old revision): the lock ends anyway — by read order, not by revision.
+    expect(shown(t.st, { ...fifty, dailyCostLimitUsd: 10 }, after)).toMatchObject({
+      values: { dailyCostLimitUsd: 10 },
+      locked: false,
     });
-    expect(formState({ edit: null, save: t.st.save, server: twenty, serverVersion: 1 })).toMatchObject({
+  });
+
+  it("r5: an edit begun before another tab saved names its own base revision (the server refuses it)", () => {
+    expect(expectedRevision("R1", "R2")).toBe("R1");
+    expect(expectedRevision(null, "R2")).toBe("R2");
+  });
+
+  it("r5: the rejected generations and read tickets live with the QueryClient — a re-entered menu still hides lists", () => {
+    const qc = {};
+    const first = mediaScreenStore(qc);
+    first.rejected.reject("p:7");
+    const t = first.reads.start();
+    const again = mediaScreenStore(qc);
+    expect(again).toBe(first);
+    expect(catalogView(status("p:7"), catalog("p:7"), again.rejected)).toBeUndefined();
+    expect(again.reads.isLatest(t)).toBe(true);
+    expect(mediaScreenStore({}).rejected.has("p:7")).toBe(false);
+  });
+
+  it("r5: a deletion finished while away — the read started before it is never the one shown", () => {
+    const s = screen(status("p:3", "admin", { last4: "aaaa" }));
+    const before = s.begin();
+    const afterDelete = s.writeSettled();
+    s.answer(before, status("p:3", "admin", { last4: "aaaa" }));
+    expect(s.shown!.key.last4).toBe("aaaa");
+    s.answer(afterDelete, status("p:4", "none"));
+    expect(s.shown!.key.source).toBe("none");
+  });
+
+  it("r6: a write's inputs are fixed at the click — what is on screen later does not change them", () => {
+    let input = "sk-or-v1-e2e-key-bbbb";
+    let generation = "p:3";
+    const save = keySaveArgs(input, generation);
+    const del = keyWriteArgs(generation);
+    input = "sk-or-v1-e2e-key-cccc";
+    generation = "p:4";
+    expect(save).toEqual({ key: "sk-or-v1-e2e-key-bbbb", expectedGeneration: "p:3" });
+    expect(del).toEqual({ expectedGeneration: "p:3" });
+    expect(inputAfterSave(input, save.key)).toBe(input);
+    expect(inputAfterSave("  sk-or-v1-e2e-key-bbbb ", save.key)).toBe("");
+    expect(generation).toBe("p:4");
+  });
+
+  it("r6/r7: a save answered after re-entry settles in the form mounted now — success and refusal", () => {
+    const qc = {};
+    const first = mediaScreenStore(qc);
+    const ok = first.beginSave(twenty, "R4")!;
+    // The menu is left and entered again; the answer arrives (mutation callback): the new form sees it.
+    const again = mediaScreenStore(qc);
+    const renders = { n: 0 };
+    again.subscribe(() => void renders.n++);
+    expect(again.settleSave(ok, { ok: true })).toBe(true);
+    expect(renders.n).toBeGreaterThan(0);
+    expect(shown(again, fifty, again.reads.current()).locked).toBe(true);
+    expect(shown(again, twenty, again.reads.start()).locked).toBe(false);
+    // Refused: the form mounted now shows the error, the values stay as the draft with their own base.
+    const no = again.beginSave(twenty, "R5")!;
+    again.settleSave(no, { ok: false, code: "media_settings_changed" });
+    expect(shown(again, fifty, again.reads.current())).toEqual({
       values: twenty,
       locked: false,
-      saved: true,
+      saved: false,
+      failed: "media_settings_changed",
     });
+    expect(draftBase(null, again.save)).toBe("R5");
+    expect(expectedRevision(draftBase(null, again.save), "R6")).toBe("R5");
   });
 
-  it("r7: the status read already showed the new version before the PUT answered — unlocked at once", () => {
-    const save = { phase: "confirming" as const, values: twenty, base: 0, version: 1 };
-    expect(formState({ edit: null, save, server: twenty, serverVersion: 1 }).locked).toBe(false);
-    expect(formState({ edit: null, save, server: twenty, serverVersion: 2 }).locked).toBe(false);
-  });
-
-  it("r7: a save refused after re-entry — the form mounted now shows the error and keeps the values as the draft", () => {
-    const t = store();
-    const id = t.st.beginSave(twenty, 3)!;
-    t.st.settleSave(id, { ok: false, code: "media_settings_changed" });
-    const st = formState({ edit: null, save: t.st.save, server: fifty, serverVersion: 4 });
-    expect(st).toEqual({ values: twenty, locked: false, saved: false, failed: "media_settings_changed" });
-    // The draft keeps its own base (a plain save again would be refused too; "이 값으로 다시 저장" uses v4).
-    expect(draftBase(null, t.st.save)).toBe(3);
-    expect(expectedVersion(draftBase(null, t.st.save), 4)).toBe(3);
-  });
-
-  it("r7: while '최신 값 불러오기' reads, the form is locked; nothing arrived (offline) keeps the draft", () => {
-    const failed = { phase: "failed" as const, values: twenty, base: 3, code: "media_settings_changed" };
-    expect(formState({ edit: null, save: failed, server: fifty, serverVersion: 4, busy: true }).locked).toBe(
-      true,
-    );
-    // The read resolved without new data: the component keeps `failed` (draft) — the same state as before.
-    expect(formState({ edit: null, save: failed, server: fifty, serverVersion: 4 }).values).toBe(twenty);
+  it("r6: a key write refused for its generation rejects that generation (lists hidden, one read)", () => {
+    const s = screen(status("p:3"));
+    expect(s.catalogError({ code: "media_key_changed" }, keyWriteArgs("p:3").expectedGeneration)).toBe(false);
+    expect(s.list(catalog("p:3"))).toBeUndefined();
+    expect(s.refreshes).toBe(1);
   });
 
   it("r7: a key write's 409 and its settle in the same turn start one status read", () => {
     const t = store();
-    expect(t.st.stale({ code: "media_key_changed" }, "p:3")).toBe(false); // onError
-    t.st.requestRefresh(); // onSettled
+    expect(t.st.stale({ code: "media_key_changed" }, "p:3")).toBe(false);
+    t.st.requestRefresh();
     t.flush();
     expect(t.reads()).toBe(1);
-    expect(t.st.rejected.has("p:3")).toBe(true);
-    // A later write asks again in its own turn.
     t.st.requestRefresh();
     t.flush();
     expect(t.reads()).toBe(2);
-    // Errors that are not stale are shown and start nothing by themselves.
     expect(t.st.stale({ code: "media_key_invalid" }, "p:3")).toBe(true);
     t.flush();
     expect(t.reads()).toBe(2);
   });
 
-  // ---- round 8 ----------------------------------------------------------------------------------------------
-
   it("r8: one settings-operation slot — a reload in flight, the menu re-entered, a save cannot start", () => {
     const t = store();
     const reload = t.st.beginReload()!;
-    expect(t.st.op).toBe("reload");
-    // A newly mounted form sees the slot taken: locked, and a save attempt starts nothing.
-    expect(
-      formState({ edit: null, save: t.st.save, server: fifty, serverVersion: 1, busy: t.st.op !== null })
-        .locked,
-    ).toBe(true);
-    expect(t.st.beginSave(twenty, 1)).toBeNull();
+    expect(shown(t.st, fifty, 1).locked).toBe(true);
+    expect(t.st.beginSave(twenty, "R1")).toBeNull();
     expect(t.st.beginReload()).toBeNull();
     expect(t.st.save).toBeNull();
-    // The read answers: the slot is free again.
     expect(t.st.settleReload(reload, true)).toBe(true);
     expect(t.st.op).toBeNull();
-    expect(t.st.beginSave(twenty, 1)).not.toBeNull();
+    expect(t.st.beginSave(twenty, "R1")).not.toBeNull();
   });
 
   it("r8: a late answer of an older operation is ignored — reload then save", () => {
     const t = store();
     const reload = t.st.beginReload()!;
-    t.st.settleReload(reload, false); // gave up (nothing arrived): the draft stays, retry offered
+    t.st.settleReload(reload, false);
     expect(t.st.reloadFailed).toBe(true);
-    const save = t.st.beginSave(twenty, 2)!;
-    // The old read's answer comes again (late): it neither frees the slot nor drops the save.
+    const save = t.st.beginSave(twenty, "R2")!;
     expect(t.st.settleReload(reload, true)).toBe(false);
     expect(t.st.op).toBe("save");
     expect(t.st.save).toMatchObject({ phase: "sending", values: twenty });
-    expect(t.st.settleSave(save, { ok: true, version: 3 })).toBe(true);
-    expect(t.st.save).toMatchObject({ phase: "confirming", version: 3 });
+    expect(t.st.settleSave(save, { ok: true })).toBe(true);
+    expect(t.st.save).toMatchObject({ phase: "confirming" });
   });
 
   it("r8: a late answer of an older operation is ignored — save then reload", () => {
     const t = store();
-    const save = t.st.beginSave(twenty, 2)!;
+    const save = t.st.beginSave(twenty, "R2")!;
     t.st.settleSave(save, { ok: false, code: "media_settings_changed" });
     const reload = t.st.beginReload()!;
-    // The save's answer arrives again (a retry of the same mutation): ignored, the read keeps the slot.
-    expect(t.st.settleSave(save, { ok: true, version: 9 })).toBe(false);
+    expect(t.st.settleSave(save, { ok: true })).toBe(false);
     expect(t.st.op).toBe("reload");
     expect(t.st.save).toMatchObject({ phase: "failed" });
     expect(t.st.settleReload(reload, true)).toBe(true);
@@ -427,15 +368,24 @@ describe("media admin screen rules (#238)", () => {
     const t = store();
     expect(t.st.stale({ code: "media_key_changed" }, "p:5")).toBe(false);
     t.flush();
-    // More refusals of p:5 in later turns (other kinds, a key write).
     for (let i = 0; i < 3; i++) {
       expect(t.st.stale({ code: "media_key_changed" }, "p:5")).toBe(false);
       t.flush();
     }
     expect(t.reads()).toBe(1);
-    // Another generation: its own one.
     t.st.stale({ code: "media_no_key" }, "p:6");
     t.flush();
     expect(t.reads()).toBe(2);
+  });
+
+  it("r9: a new edit replacing a failed draft also clears the reload-failure note", () => {
+    const t = store();
+    const save = t.st.beginSave(twenty, "R1")!;
+    t.st.settleSave(save, { ok: false, code: "media_settings_changed" });
+    t.st.settleReload(t.st.beginReload()!, false);
+    expect(t.st.reloadFailed).toBe(true);
+    t.st.clearSave(); // the admin edits
+    expect(t.st.reloadFailed).toBe(false);
+    expect(t.st.save).toBeNull();
   });
 });

@@ -648,7 +648,7 @@ export const ADMIN_MATRIX: AdminRow[] = [
   {
     route: "PUT /api/admin/media/settings",
     expect: ADMIN_ONLY,
-    body: { settings: DEFAULT_MEDIA_SETTINGS, expectedVersion: 0 },
+    body: { settings: DEFAULT_MEDIA_SETTINGS, expectedRevision: "initial" },
   },
   { route: "GET /api/admin/errors", expect: ADMIN_ONLY },
   { route: "GET /api/admin/connections", expect: ADMIN_ONLY },

@@ -26,6 +26,10 @@ export class StatusReads {
   isLatest(ticket: number): boolean {
     return ticket === this.started;
   }
+  /** The ticket of the latest read started so far (0 before any). */
+  current(): number {
+    return this.started;
+  }
 }
 
 /** Key generations a catalog call said are out of date. `reject` is true only the first time (start one read). */
@@ -107,10 +111,11 @@ export class MediaScreenStore {
   get save(): SettingsSave | null {
     return this.pending;
   }
-  /** Drops a finished or failed save (an edit takes over). A save still being sent stays. */
+  /** Drops a finished or failed save (an edit takes over) and its reload failure note. A save being sent stays. */
   clearSave(): void {
     if (this.pending?.phase === "sending") return;
     this.pending = null;
+    this.failedReload = false;
     this.emit();
   }
 
@@ -137,8 +142,8 @@ export class MediaScreenStore {
     return this.slot?.id === id;
   }
 
-  /** A save of `values` made from version `base`; null (nothing starts) while another operation runs. */
-  beginSave(values: MediaSettings, base: number): number | null {
+  /** A save of `values` made from revision `base`; null (nothing starts) while another operation runs. */
+  beginSave(values: MediaSettings, base: string): number | null {
     const id = this.take("save");
     if (id === null) return null;
     this.failedReload = false;
@@ -146,15 +151,15 @@ export class MediaScreenStore {
     this.emit();
     return id;
   }
-  /** The save's answer: the version to wait for, or the server's code. Ignored unless it is the current one. */
-  settleSave(
-    id: number,
-    r: { ok: true; version: number } | { ok: false; code: string; kind?: string | undefined },
-  ): boolean {
+  /**
+   * The save's answer. Success: confirmed by the first status read **started after** this moment (read order, not
+   * a revision compare — a restore may bring back any revision). Ignored unless it is the current operation.
+   */
+  settleSave(id: number, r: { ok: true } | { ok: false; code: string; kind?: string | undefined }): boolean {
     if (!this.owns(id) || this.pending?.phase !== "sending") return false;
     const { values, base } = this.pending;
     this.pending = r.ok
-      ? { phase: "confirming", values, base, version: r.version }
+      ? { phase: "confirming", values, base, afterTicket: this.reads.current() }
       : { phase: "failed", values, base, code: r.code, kind: r.kind };
     this.slot = null;
     this.emit();
@@ -223,7 +228,7 @@ export function mediaScreenStore(queryClient: object): MediaScreenStore {
  */
 export type KeyWrite = { expectedGeneration: string };
 export type KeySave = KeyWrite & { key: string };
-export type SettingsWrite = { settings: MediaSettings; expectedVersion: number };
+export type SettingsWrite = { settings: MediaSettings; expectedRevision: string };
 
 export const keySaveArgs = (input: string, generation: string): KeySave => ({
   key: input.trim(),
@@ -235,20 +240,21 @@ export const keyWriteArgs = (generation: string): KeyWrite => ({ expectedGenerat
 export const inputAfterSave = (input: string, saved: string): string => (input.trim() === saved ? "" : input);
 
 /**
- * A settings save (review r5–r7), held in the screen store so whichever form is mounted shows it: `sending` until
- * the server answers; `confirming` until a status read shows the saved version (or a later one — also when that read
- * came before the answer); `failed` with the server's code (the admin's values stay as their draft). Throughout
- * `sending`/`confirming` the form shows the submitted values and is locked.
+ * A settings save (review r5–r9), held in the screen store so whichever form is mounted shows it: `sending` until
+ * the server answers; `confirming` until a status read that **started after** the answer is shown (`afterTicket` —
+ * read order, whatever revision it shows: a restore may bring back an old one); `failed` with the server's code (the
+ * admin's values stay as their draft). Throughout `sending`/`confirming` the form shows the submitted values and is
+ * locked. `base` is the revision the save was made from.
  */
 export type SettingsSave =
-  | { phase: "sending"; values: MediaSettings; base: number }
-  | { phase: "confirming"; values: MediaSettings; base: number; version: number }
-  | { phase: "failed"; values: MediaSettings; base: number; code: string; kind?: string | undefined };
+  | { phase: "sending"; values: MediaSettings; base: string }
+  | { phase: "confirming"; values: MediaSettings; base: string; afterTicket: number }
+  | { phase: "failed"; values: MediaSettings; base: string; code: string; kind?: string | undefined };
 
 export type FormState = {
   values: MediaSettings;
   locked: boolean;
-  /** The save went through and a status read shows it. */
+  /** The save went through (shown from the answer on — apart from the lock). */
   saved: boolean;
   /** The failed save's code, when its values are still the draft shown. */
   failed: string | null;
@@ -258,14 +264,16 @@ export function formState(o: {
   edit: MediaSettings | null;
   save: SettingsSave | null;
   server: MediaSettings;
-  serverVersion: number;
-  /** Another read the form waits for ("최신 값 불러오기"). */
+  /** The ticket of the status read shown. */
+  shownTicket: number;
+  /** Another settings operation holds the slot. */
   busy?: boolean;
 }): FormState {
   const { save } = o;
   const busy = o.busy ?? false;
-  if (save?.phase === "sending" || (save?.phase === "confirming" && o.serverVersion < save.version))
-    return { values: save.values, locked: true, saved: false, failed: null };
+  if (save?.phase === "sending") return { values: save.values, locked: true, saved: false, failed: null };
+  if (save?.phase === "confirming" && o.shownTicket <= save.afterTicket)
+    return { values: save.values, locked: true, saved: true, failed: null };
   if (save?.phase === "failed" && o.edit === null)
     return { values: save.values, locked: busy, saved: false, failed: save.code };
   return {
@@ -277,12 +285,12 @@ export function formState(o: {
 }
 
 /**
- * The version a save is made from: the version the admin's edit started from (an edit started before another save
- * elsewhere must not overwrite it — the server answers `media_settings_changed`), else the version shown.
+ * The revision a save is made from: the one the admin's edit started from (an edit started before another save
+ * elsewhere must not overwrite it — the server answers `media_settings_changed`), else the revision shown.
  */
-export const expectedVersion = (editBase: number | null, serverVersion: number): number =>
-  editBase ?? serverVersion;
+export const expectedRevision = (editBase: string | null, serverRevision: string): string =>
+  editBase ?? serverRevision;
 
 /** The base of the draft shown: the edit's, else a failed save's (its values are the draft), else none. */
-export const draftBase = (editBase: number | null, save: SettingsSave | null): number | null =>
+export const draftBase = (editBase: string | null, save: SettingsSave | null): string | null =>
   editBase ?? (save?.phase === "failed" ? save.base : null);

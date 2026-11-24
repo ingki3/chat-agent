@@ -88,14 +88,14 @@ test("the admin registers an OpenRouter key, picks a model per kind and sets the
   await expect(form.getByLabel("1인당 하루 비용 한도 (USD)")).toHaveValue("15");
   await expect(form.getByLabel("한 번 실행에서 이미지 최대 횟수")).toHaveValue("3");
 
-  // A save made from an older version (another tab saved meanwhile) is refused; the admin's value stays.
+  // A save made from an older revision (another tab saved meanwhile) is refused; the admin's value stays.
   const version = (await (await page.request.get("/api/admin/media")).json()) as {
-    settingsVersion: number;
+    settingsRevision: string;
     settings: unknown;
   };
   const otherSave = await page.request.put("/api/admin/media/settings", {
     headers: csrf(baseURL!),
-    data: { settings: version.settings, expectedVersion: version.settingsVersion },
+    data: { settings: version.settings, expectedRevision: version.settingsRevision },
   });
   expect(otherSave.status()).toBe(200);
   await form.getByLabel("1인당 하루 비용 한도 (USD)").fill("12");

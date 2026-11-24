@@ -19,7 +19,12 @@ import { settings as settingsTable, users } from "../src/db/schema.js";
 import { MediaBudget } from "../src/media/budget.js";
 import { SettingsStore } from "../src/db/settings-store.js";
 import { MediaAdminService } from "../src/media/service.js";
-import { MEDIA_SETTINGS_VERSION_KEY, MediaSettingsStore } from "../src/media/settings.js";
+import {
+  INITIAL_REVISION,
+  MEDIA_SETTINGS_KEY,
+  MEDIA_SETTINGS_REVISION_KEY,
+  MediaSettingsStore,
+} from "../src/media/settings.js";
 import { OPENROUTER_KEY_STATUS_SETTING } from "../src/media/keys.js";
 import { OpenRouterKeys, OPENROUTER_KEY_SETTING } from "../src/media/keys.js";
 import {
@@ -112,9 +117,9 @@ async function start(
     }
     if (url === "/api/admin/media/settings" && method === "PUT") {
       const body = payload as Record<string, unknown>;
-      return body && "settings" in body && "expectedVersion" in body
+      return body && "settings" in body && "expectedRevision" in body
         ? body
-        : { settings: body, expectedVersion: app.media!.settings.version() };
+        : { settings: body, expectedRevision: app.media!.settings.revision() };
     }
     return payload;
   };
@@ -1066,34 +1071,64 @@ describe("media: review round 1 regressions (#244)", () => {
     expect(bad.statusCode).toBe(400);
   });
 
-  it("round 5: settings saves name their version — a stale one is media_settings_changed and saves nothing", async () => {
+  it("round 5/9: settings saves name their revision — a stale one is media_settings_changed and saves nothing", async () => {
     const t = await start();
-    const put = (settings: unknown, expectedVersion: number) =>
-      t.api(t.f.cookies.admin, "PUT", "/api/admin/media/settings", { settings, expectedVersion });
+    const put = (settings: unknown, expectedRevision: string) =>
+      t.api(t.f.cookies.admin, "PUT", "/api/admin/media/settings", { settings, expectedRevision });
     const view = () => MediaAdmin.parse(t.app.media!.admin.view());
-    expect(view().settingsVersion).toBe(0);
-    // $20 saved from v0 → v1; then only the image count changed, made from v1 → v2: both kept.
+    const r0 = view().settingsRevision;
+    expect(r0).toBe(INITIAL_REVISION);
+    // $20 saved from r0 → r1; then only the image count changed, made from r1 → r2: both kept.
     const twenty = { ...DEFAULT_MEDIA_SETTINGS, dailyCostLimitUsd: 20 };
-    expect((await put(twenty, 0)).statusCode).toBe(200);
-    expect(view().settingsVersion).toBe(1);
+    expect((await put(twenty, r0)).statusCode).toBe(200);
+    const r1 = view().settingsRevision;
+    expect(r1).not.toBe(r0);
     const count = { ...twenty, perRunLimits: { ...twenty.perRunLimits, image: 2 } };
-    expect((await put(count, 1)).statusCode).toBe(200);
-    expect(view()).toMatchObject({
-      settingsVersion: 2,
-      settings: { dailyCostLimitUsd: 20, perRunLimits: { image: 2 } },
-    });
-    // A form still showing the old $50 (made from v1) cannot put it back.
-    const stale = await put({ ...DEFAULT_MEDIA_SETTINGS, perRunLimits: { ...count.perRunLimits } }, 1);
+    expect((await put(count, r1)).statusCode).toBe(200);
+    const r2 = view().settingsRevision;
+    expect(new Set([r0, r1, r2]).size).toBe(3);
+    expect(view()).toMatchObject({ settings: { dailyCostLimitUsd: 20, perRunLimits: { image: 2 } } });
+    // A form still showing the old $50 (made from r1) cannot put it back.
+    const stale = await put({ ...DEFAULT_MEDIA_SETTINGS, perRunLimits: { ...count.perRunLimits } }, r1);
     expect(stale.statusCode).toBe(409);
     expect(stale.json()).toEqual({ error: "media_settings_changed" });
-    expect(view()).toMatchObject({ settingsVersion: 2, settings: { dailyCostLimitUsd: 20 } });
-    // The body must name a version.
+    expect(view()).toMatchObject({ settingsRevision: r2, settings: { dailyCostLimitUsd: 20 } });
+    // The body must name a revision.
     expect(
       (await t.api(t.f.cookies.admin, "PUT", "/api/admin/media/settings", { settings: twenty })).statusCode,
     ).toBe(400);
   });
 
-  it("round 5: the version is checked again inside the write's transaction", async () => {
+  it("round 9: a restored backup never lets an open draft's base match by accident", async () => {
+    const t = await start();
+    const put = (settings: unknown, expectedRevision: string) =>
+      t.api(t.f.cookies.admin, "PUT", "/api/admin/media/settings", { settings, expectedRevision });
+    const rev = () => t.app.media!.settings.revision();
+    const row = (k: string) =>
+      t.db
+        .select()
+        .from(settingsTable)
+        .all()
+        .find((x) => x.key === k)?.value;
+    // R1 saved (the backup is taken here), then R2 saved; a draft is open on R2.
+    expect((await put({ ...DEFAULT_MEDIA_SETTINGS, dailyCostLimitUsd: 10 }, rev())).statusCode).toBe(200);
+    const r1 = rev();
+    const backup = { settings: row(MEDIA_SETTINGS_KEY)!, revision: row(MEDIA_SETTINGS_REVISION_KEY)! };
+    expect((await put({ ...DEFAULT_MEDIA_SETTINGS, dailyCostLimitUsd: 20 }, r1)).statusCode).toBe(200);
+    const r2 = rev();
+    // The backup is restored (the rows go back to R1), and someone saves from it → R3.
+    t.app.media!.settings.set(JSON.parse(backup.settings), backup.revision);
+    expect(rev()).toBe(r1);
+    expect((await put({ ...DEFAULT_MEDIA_SETTINGS, dailyCostLimitUsd: 30 }, r1)).statusCode).toBe(200);
+    const r3 = rev();
+    expect(r3).not.toBe(r2);
+    // The draft based on R2 is refused (a counter would have matched: v1 → v2 → restore v1 → v2).
+    const draft = await put({ ...DEFAULT_MEDIA_SETTINGS, dailyCostLimitUsd: 99 }, r2);
+    expect(draft.statusCode).toBe(409);
+    expect(t.app.media!.settings.get().dailyCostLimitUsd).toBe(30);
+  });
+
+  it("round 5: the revision is checked again inside the write's transaction", async () => {
     let release: () => void = () => {};
     const gate = new Promise<void>((r) => (release = r));
     const inner = fixtureOpenRouterFetch();
@@ -1105,10 +1140,10 @@ describe("media: review round 1 regressions (#244)", () => {
     const t = service({ fetchImpl });
     await t.svc.registerKey(GOOD_KEY, t.svc.generation(), yes);
     hold = true;
-    const pending = t.svc.saveSettings(withKind("image", "fixture/image-one"), 0, yes);
+    const pending = t.svc.saveSettings(withKind("image", "fixture/image-one"), INITIAL_REVISION, yes);
     await new Promise((r) => setTimeout(r, 10));
-    // Another writer bumps the version while the catalog is read (not through this queue).
-    t.real.set(MEDIA_SETTINGS_VERSION_KEY, "1");
+    // Another writer saves while the catalog is read (not through this queue).
+    t.real.set(MEDIA_SETTINGS_REVISION_KEY, "someone-else");
     release();
     await expect(pending).rejects.toMatchObject({ code: "media_settings_changed", status: 409 });
     expect(t.svc.view().settings).toEqual(DEFAULT_MEDIA_SETTINGS);

@@ -13,7 +13,7 @@ import { usd } from "../usage-format.js";
 import {
   catalogView,
   draftBase,
-  expectedVersion,
+  expectedRevision,
   formState,
   inputAfterSave,
   isStaleKeyError,
@@ -27,6 +27,8 @@ import {
 } from "./media-cache.js";
 
 export const MEDIA_KEY = ["admin", "media"] as const;
+/** The status shown, with the ticket of the read it came from. */
+type Shown = { status: MediaAdminView; ticket: number };
 /** "최신 값 불러오기" gives up after this (the draft stays, a retry is offered). */
 const RELOAD_TIMEOUT_MS = 20_000;
 /** Every catalog query; each one is keyed by the server's key generation too (a list of another key never shows). */
@@ -280,11 +282,20 @@ function KindRow({
   );
 }
 
-function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
+function SettingsForm({
+  m,
+  screen,
+  shownTicket,
+}: {
+  m: MediaAdminView;
+  screen: Screen;
+  /** The ticket of the status read shown (`m`). */
+  shownTicket: number;
+}) {
   // The admin's unsaved edit and the version it started from; null = the form follows the latest status read (or a
   // failed save's values, kept in the store).
   const [edit, setEdit] = useState<MediaSettings | null>(null);
-  const [editBase, setEditBase] = useState<number | null>(null);
+  const [editBase, setEditBase] = useState<string | null>(null);
   // The save itself lives in the screen store: whichever form is mounted when it settles shows its outcome.
   const { store } = screen;
   const pending = store.save;
@@ -300,17 +311,17 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
     edit,
     save: pending,
     server: m.settings,
-    serverVersion: m.settingsVersion,
+    shownTicket,
     busy: store.op !== null,
   });
   const base = draftBase(editBase, pending);
   const conflict = failed === "media_settings_changed";
   const save = useMutation({
     // Only the values and version fixed at the click are sent.
-    mutationFn: (o: { id: number; values: MediaSettings; version: number }) =>
-      admin.saveMediaSettings(o.values, o.version),
+    mutationFn: (o: { id: number; values: MediaSettings; revision: string }) =>
+      admin.saveMediaSettings(o.values, o.revision),
     // These run on the mutation, mounted form or not: the outcome goes to the store — for this operation's id only.
-    onSuccess: (r, o) => void store.settleSave(o.id, { ok: true, version: r.settingsVersion }),
+    onSuccess: (_r, o) => void store.settleSave(o.id, { ok: true }),
     // An error keeps the admin's values as the draft (never silently replaced).
     onError: (e, o) =>
       void store.settleSave(o.id, {
@@ -320,18 +331,18 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
       }),
     onSettled: screen.refresh,
   });
-  const submit = (version: number) => {
+  const submit = (revision: string) => {
     // Nothing starts while another settings operation holds the slot (the form is locked then anyway).
-    const id = store.beginSave(draft, version);
+    const id = store.beginSave(draft, revision);
     if (id === null) return;
     setEdit(null);
     setEditBase(null);
-    save.mutate({ id, values: draft, version });
+    save.mutate({ id, values: draft, revision });
   };
   const hasKey = m.key.source !== "none";
   const set = (patch: Partial<MediaSettings>) => {
     if (locked) return;
-    setEditBase(base ?? m.settingsVersion);
+    setEditBase(base ?? m.settingsRevision);
     setEdit({ ...draft, ...patch });
     // An edit takes over from a finished or failed save.
     if (pending) store.clearSave();
@@ -346,7 +357,7 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
       : undefined;
   const onSubmit = (e: FormEvent) => {
     e.preventDefault();
-    if (!conflict && !locked) submit(expectedVersion(base, m.settingsVersion));
+    if (!conflict && !locked) submit(expectedRevision(base, m.settingsRevision));
   };
   const num = (v: string) => (v === "" ? NaN : Number(v));
   return (
@@ -430,12 +441,12 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
             {errorText(new ApiError(0, failed))}
           </p>
         )}
-        {saved && !locked && (
+        {saved && (
           <p className="small" role="status">
-            저장했어요.
+            {locked ? "저장했어요. 최신 상태를 확인하는 중…" : "저장했어요."}
           </p>
         )}
-        {locked && !reloading && (
+        {locked && !reloading && !saved && (
           <p className="muted small" role="status">
             저장하는 중…
           </p>
@@ -452,7 +463,7 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
         )}
         {conflict ? (
           <span className="actions">
-            <button type="button" onClick={() => submit(m.settingsVersion)} disabled={invalid || locked}>
+            <button type="button" onClick={() => submit(m.settingsRevision)} disabled={invalid || locked}>
               이 값으로 다시 저장
             </button>
             <button
@@ -497,11 +508,12 @@ export function MediaAdmin() {
   // Only the latest started status read is shown: an older one that answers later keeps what is shown.
   const q = useQuery({
     queryKey: MEDIA_KEY,
-    queryFn: async () => {
+    // The answer carries the ticket of the read it came from (a save is confirmed by a read started after it).
+    queryFn: async (): Promise<Shown> => {
       const ticket = reads.start();
-      const r = await admin.media();
-      const shown = qc.getQueryData<MediaAdminView>(MEDIA_KEY);
-      return reads.isLatest(ticket) || !shown ? r : shown;
+      const status = await admin.media();
+      const shown = qc.getQueryData<Shown>(MEDIA_KEY);
+      return reads.isLatest(ticket) || !shown ? { status, ticket } : shown;
     },
   });
   // After a write (or a refused catalog): any status read in flight is cancelled — watched or not — and the status
@@ -537,7 +549,8 @@ export function MediaAdmin() {
     },
     onReject: (e, generation) => store.stale(e, generation),
   };
-  const m = q.data;
+  const m = q.data?.status;
+  const shownTicket = q.data?.ticket ?? 0;
   // Only a first load that failed shows the empty error; with a status shown, a failed re-read keeps the screen.
   if (!m)
     return q.isError ? (
@@ -566,7 +579,7 @@ export function MediaAdmin() {
         </p>
       )}
       <KeySection m={m} screen={screen} />
-      <SettingsForm m={m} screen={screen} />
+      <SettingsForm m={m} screen={screen} shownTicket={shownTicket} />
     </section>
   );
 }

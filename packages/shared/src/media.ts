@@ -111,8 +111,11 @@ export type MediaKeyView = z.infer<typeof MediaKeyView>;
 export const MediaAdmin = z.object({
   key: MediaKeyView,
   settings: MediaSettings,
-  /** Bumped by every settings save: a save names the version it was made from (`MediaSettingsRequest`). */
-  settingsVersion: z.number().int().min(0),
+  /**
+   * A fresh random token per settings save (never reused, also not by a backup restore): a save names the revision
+   * it was made from (`MediaSettingsRequest`).
+   */
+  settingsRevision: z.string().min(1).max(64),
   /**
    * Youth accounts see media generation (user decision 2026-11-24); their requests ask the provider for its
    * strictest moderation where it has one. Fixed policy, shown so the admin knows.
@@ -129,9 +132,9 @@ export const MediaKeyRequest = z
   .strict();
 /** `DELETE /api/admin/media/key`, `POST /api/admin/media/key/check`: the generation the screen showed. */
 export const MediaKeyWriteRequest = z.object({ expectedGeneration: Generation }).strict();
-/** `PUT /api/admin/media/settings`: the new settings and the version they were made from. */
+/** `PUT /api/admin/media/settings`: the new settings and the revision they were made from. */
 export const MediaSettingsRequest = z
-  .object({ settings: MediaSettings, expectedVersion: z.number().int().min(0) })
+  .object({ settings: MediaSettings, expectedRevision: z.string().min(1).max(64) })
   .strict();
 export type MediaSettingsRequest = z.infer<typeof MediaSettingsRequest>;
 export type MediaKeyRequest = z.infer<typeof MediaKeyRequest>;

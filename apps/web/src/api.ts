@@ -376,8 +376,8 @@ export const admin = {
       await call("GET", `/api/admin/media/catalog/${enc(kind)}${qs ? `?${qs}` : ""}`),
     );
   },
-  saveMediaSettings: async (settings: MediaSettings, expectedVersion: number) =>
-    MediaAdmin.parse(await call("PUT", "/api/admin/media/settings", { settings, expectedVersion })),
+  saveMediaSettings: async (settings: MediaSettings, expectedRevision: string) =>
+    MediaAdmin.parse(await call("PUT", "/api/admin/media/settings", { settings, expectedRevision })),
   runtimes: async () => AdminRuntimesResponse.parse(await call("GET", "/api/admin/runtimes")).items,
   system: async () => SystemStatus.parse(await call("GET", "/api/admin/system")),
   /** Backups (#37): list and "지금 백업". Restore is the CLI only. */

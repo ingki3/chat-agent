@@ -78,7 +78,7 @@ export function registerMediaRoutes(
     const r = MediaSettingsRequest.safeParse(req.body);
     if (!r.success) return bad(reply);
     try {
-      return send(reply, await media.saveSettings(r.data.settings, r.data.expectedVersion, stillAdmin(req)));
+      return send(reply, await media.saveSettings(r.data.settings, r.data.expectedRevision, stillAdmin(req)));
     } catch (e) {
       return refuse(reply, e);
     }

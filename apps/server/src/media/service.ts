@@ -132,7 +132,7 @@ export class MediaAdminService {
     return {
       key: this.keyView(),
       settings: this.o.store.get(),
-      settingsVersion: this.o.store.version(),
+      settingsRevision: this.o.store.revision(),
       youthStrictModeration: YOUTH_STRICT_MODERATION,
     };
   }
@@ -266,10 +266,10 @@ export class MediaAdminService {
    * catalog fetched again right now (`media_model_unknown` when the model is not in it). Turning a kind off with its
    * model kept, clearing a model, or changing only the limits needs no OpenRouter call.
    */
-  saveSettings(next: MediaSettings, expectedVersion: number, authorize: () => boolean): Promise<MediaAdmin> {
-    // Made from another version than the stored one (saved elsewhere meanwhile): nothing is saved.
+  saveSettings(next: MediaSettings, expectedRevision: string, authorize: () => boolean): Promise<MediaAdmin> {
+    // Made from another revision than the stored one (saved elsewhere meanwhile, or restored): nothing is saved.
     const expectVersion = () => {
-      if (this.o.store.version() !== expectedVersion) throw new MediaError(409, "media_settings_changed");
+      if (this.o.store.revision() !== expectedRevision) throw new MediaError(409, "media_settings_changed");
     };
     return this.exclusive(async () => {
       if (!authorize()) throw new MediaError(403, "forbidden");
@@ -289,7 +289,7 @@ export class MediaAdminService {
       if (!authorize()) throw new MediaError(403, "forbidden");
       this.o.transaction(() => {
         expectVersion();
-        this.o.store.set(next, expectedVersion + 1);
+        this.o.store.set(next);
       });
       return this.view();
     });
