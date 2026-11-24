@@ -219,11 +219,11 @@ export class MediaAdminService {
 
   /**
    * A kind's catalog, read with the key in use (reused for a while unless `fresh` — only while that same key is in
-   * use), answered with the generation it was read with. A read that started before the key changed is neither kept
+   * use; `prices: false` reads the list alone and is not kept), answered with the generation it was read with. A read that started before the key changed is neither kept
    * nor returned (`media_key_changed`); so is one asked for under another generation than the current one
    * (`expected` — the screen's).
    */
-  async catalog(kind: MediaKind, fresh = false, expected?: string): Promise<MediaCatalog> {
+  async catalog(kind: MediaKind, fresh = false, expected?: string, prices = true): Promise<MediaCatalog> {
     if (expected !== undefined && expected !== this.generation())
       throw new MediaError(409, "media_key_changed");
     const resolved = this.o.keys.resolve();
@@ -242,7 +242,7 @@ export class MediaAdminService {
     let catalog: Omit<MediaCatalog, "generation"> | undefined;
     let failure: unknown;
     try {
-      catalog = await fetchCatalog(kind, { apiKey: resolved.key, ...this.fetchOpts() });
+      catalog = await fetchCatalog(kind, { apiKey: resolved.key, prices, ...this.fetchOpts() });
     } catch (e) {
       failure = e;
     }
@@ -257,7 +257,8 @@ export class MediaAdminService {
       throw new MediaError(502, "media_catalog_failed", kind);
     }
     const answer: MediaCatalog = { ...catalog, generation: `${this.boot}:${gen}` };
-    this.cache.set(kind, { at: this.now(), fp, gen, catalog: answer });
+    // A list read without its prices (a save's model check) is not what the screen should reuse.
+    if (prices) this.cache.set(kind, { at: this.now(), fp, gen, catalog: answer });
     return answer;
   }
 
@@ -282,9 +283,12 @@ export class MediaAdminService {
         const newModel = n.model !== c.model;
         const turnedOn = n.enabled && !c.enabled;
         if (!newModel && !turnedOn) continue;
-        const catalog = await this.catalog(kind, true);
-        if (!catalog.models.some((m) => m.id === n.model))
-          throw new MediaError(409, "media_model_unknown", kind);
+        // Only whether the model is listed: the per-model price reads are not needed for that.
+        const catalog = await this.catalog(kind, true, undefined, false);
+        const listed = catalog.models.find((m) => m.id === n.model);
+        if (!listed) throw new MediaError(409, "media_model_unknown", kind);
+        // A vector-only image model (SVG) is paid for on every call and never stored (#238 review r1).
+        if (kind === "image" && listed.vectorOnly) throw new MediaError(409, "media_model_unsupported", kind);
       }
       if (!authorize()) throw new MediaError(403, "forbidden");
       this.o.transaction(() => {

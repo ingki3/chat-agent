@@ -9,6 +9,7 @@ import {
   AUDIO_CODES,
   AUDIO_STT_ENGINES,
   YOUTUBE_CODES,
+  MEDIA_TOOL_CODES,
   NotificationKind,
   RuntimeId,
   SCHEDULE_PROPOSAL_CODES,
@@ -248,6 +249,9 @@ export const isAudioDiarization = member(set(["local", "off", "failed"]));
 /** Outcome codes of `youtube_audio_fetch` (#191, shared `YOUTUBE_CODES` plus a finished call's `youtube_ok`). */
 export const YOUTUBE_CODE_VALUES = set(["youtube_ok", ...YOUTUBE_CODES]);
 export const isYoutubeCode = member(YOUTUBE_CODE_VALUES);
+/** Outcome codes of `image_generate` / `speech_generate` (#238 stage 2, shared `MEDIA_TOOL_CODES`). */
+export const MEDIA_TOOL_CODE_VALUES = set(MEDIA_TOOL_CODES);
+export const isMediaToolCode = member(MEDIA_TOOL_CODE_VALUES);
 
 /** Outcome codes of the finance tools (#30, finance/service.ts `FINANCE_CODES` — a test keeps the two equal). */
 export const FINANCE_CODES = set([

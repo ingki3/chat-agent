@@ -13,6 +13,7 @@ const totals = (o: Partial<UsageTotals>): UsageTotals => ({
   costMicroUsd: 0,
   costUsd: 0,
   costMissing: 0,
+  costPending: 0,
   apiKeyRequests: 0,
   subscriptionRequests: 0,
   unknownRequests: 0,
@@ -32,6 +33,11 @@ describe("usage formatting (#32): 미제공 is never shown as $0.00 or 0 토큰"
     expect(costText(totals({ requests: 1, apiKeyRequests: 1, costUsd: 0.3 }))).toBe("$0.30");
     // Unknown (connection not found) rows count as costable but unpriced.
     expect(costText(totals({ requests: 1, unknownRequests: 1, costMissing: 1 }))).toBe("미제공");
+    // Media generations still going or waiting for their cost (#238): "진행 중", apart from 미제공.
+    expect(costText(totals({ requests: 1, apiKeyRequests: 1, costPending: 1 }))).toBe("진행 중 1건");
+    expect(
+      costText(totals({ requests: 3, apiKeyRequests: 3, costPending: 1, costMissing: 1, costUsd: 1.2 })),
+    ).toBe("$1.20 + 미제공 1건 · 진행 중 1건");
   });
 
   it("tokens: rows that did not report them are 미제공, not 0", () => {

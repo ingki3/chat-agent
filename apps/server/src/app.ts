@@ -104,6 +104,8 @@ import { MediaBudget } from "./media/budget.js";
 import { MediaAdminService } from "./media/service.js";
 import { registerMediaRoutes } from "./media/routes.js";
 import { fixtureOpenRouterFetch } from "./media/fixture.js";
+import { MediaGenerator } from "./media/generate.js";
+import { MediaRecovery, MediaSettler } from "./media/settle.js";
 import { youtubeState, type YoutubeState } from "./youtube/packages.js";
 import { sandboxedYoutubeRunner, type YoutubeRunner } from "./youtube/runner.js";
 import { YoutubeAudioFetcher } from "./youtube/service.js";
@@ -212,7 +214,15 @@ declare module "fastify" {
      * tools read these); undefined without a database.
      */
     media:
-      | { keys: OpenRouterKeys; settings: MediaSettingsStore; budget: MediaBudget; admin: MediaAdminService }
+      | {
+          keys: OpenRouterKeys;
+          settings: MediaSettingsStore;
+          budget: MediaBudget;
+          admin: MediaAdminService;
+          tools: MediaGenerator;
+          settler: MediaSettler;
+          recovery: MediaRecovery;
+        }
       | undefined;
     /**
      * The data folder's file-write lock (#37): every writer of files under `files/`, `artifacts/` or `sources/`
@@ -356,7 +366,15 @@ export type BuildOptions = {
    * 미디어 생성 (#238): OpenRouter's answers (tests mock it; the FAKE_RUNTIME e2e run uses a scripted one — no
    * real call either way) and the budget's clock.
    */
-  media?: { fetchImpl?: typeof fetch; now?: () => number };
+  media?: {
+    fetchImpl?: typeof fetch;
+    now?: () => number;
+    sleep?: (ms: number) => Promise<void>;
+    /** Tests: run the start-up recovery as the lock-holding start does (`dataLock`). */
+    recoverAtStart?: boolean;
+    /** Tests: whether the recovery retries in the background. */
+    recovery?: { background?: boolean };
+  };
   python?: {
     runner?: PythonRunner;
     state?: () => ScratchpadState;
@@ -598,9 +616,15 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const usageService = new UsageService(
       opts.db!,
       settingsStore,
-      (amountUsd, thresholdUsd) => {
+      (amountUsd, thresholdUsd, pastDay) => {
         for (const admin of connectionStore.admins())
-          notifications.publish(admin, { kind: "daily_cost", amountUsd, thresholdUsd, url: "/admin" });
+          notifications.publish(admin, {
+            kind: "daily_cost",
+            amountUsd,
+            thresholdUsd,
+            url: "/admin",
+            ...(pastDay ? { pastDay } : {}),
+          });
       },
       app.log,
       { timeZone: DEFAULT_TIME_ZONE, ...opts.usage },
@@ -628,16 +652,60 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       store: mediaSettings,
       ...mediaFetch,
     });
+    const mediaBudget = new MediaBudget(
+      opts.db!,
+      () => mediaSettings.get(),
+      usageService.timeZone,
+      opts.media?.now ?? opts.usage?.now ?? Date.now,
+    );
+    // The previous process's media reservations (#238 review r4–r5): only on the lock-holding server start
+    // (`dataLock` — no other server uses this database), while the app is built, before any request: all `reserved`
+    // rows are taken up in one transaction. If that fails the server still starts (chat wins over media
+    // bookkeeping); new paid media calls are refused (`media_recovering`) while it is retried in the background.
+    const mediaRecovery = new MediaRecovery({
+      usage,
+      log: app.log,
+      ...(opts.dataLock ? { held: opts.dataLock.held } : {}),
+      ...(opts.media?.recovery ?? {}),
+    });
+    if (opts.dataLock || opts.media?.recoverAtStart) mediaRecovery.runAtStart();
+    app.addHook("preClose", async () => mediaRecovery.stop());
+    // image_generate / speech_generate (#238 stage 2): offered while the kind is on (관리자 → 미디어 생성).
+    const mediaTools = new MediaGenerator({
+      db: opts.db!,
+      files: () => app.files,
+      keys: openRouterKeys,
+      settings: mediaSettings,
+      budget: mediaBudget,
+      usage,
+      users,
+      fetchImpl: mediaFetchImpl,
+      secrets: config.skillSecrets,
+      log: app.log,
+      errors,
+      keyGeneration: () => mediaAdmin.generation(),
+      recovering: () => mediaRecovery.recovering(),
+      ...(opts.media?.sleep ? { sleep: opts.media.sleep } : {}),
+    });
+    // Late cost settlement (#238 review r2): generations still waiting for their cost are looked up again with a
+    // backoff, also after a restart. Not in tests (they drive `runOnce`).
+    const mediaSettler = new MediaSettler({
+      usage,
+      keys: openRouterKeys,
+      fetchImpl: mediaFetchImpl,
+      ...(opts.media?.now ? { now: opts.media.now } : {}),
+      log: app.log,
+    });
+    if (config.env !== "test") app.addHook("onReady", async () => mediaSettler.start());
+    app.addHook("preClose", async () => mediaSettler.stop());
     app.decorate("media", {
       keys: openRouterKeys,
       settings: mediaSettings,
-      budget: new MediaBudget(
-        opts.db!,
-        () => mediaSettings.get(),
-        usageService.timeZone,
-        opts.media?.now ?? opts.usage?.now ?? Date.now,
-      ),
+      budget: mediaBudget,
       admin: mediaAdmin,
+      tools: mediaTools,
+      settler: mediaSettler,
+      recovery: mediaRecovery,
     });
     registerMediaRoutes(app, { users, media: mediaAdmin });
     // Web search and fetch (#50): results are stored as sources of the run's conversation.
@@ -933,6 +1001,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       ...(config.pythonRun || opts.python?.runner ? { scratchpad } : {}),
       audio,
       youtube,
+      media: mediaTools,
       // Finance tools (#30): the OpenDART key and the SEC contact come from `.env` (SKILL_SECRET_NAMES).
       finance: {
         secrets: config.skillSecrets,

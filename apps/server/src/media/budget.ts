@@ -7,12 +7,14 @@ import { toMicros, toUsd } from "../usage/prices.js";
 
 export type MediaBudgetState = {
   limitUsd: number;
-  /** Media cost of this user today (service-zone day) as OpenRouter reported it. */
+  /** Media cost of this user today (service-zone day) as OpenRouter reported it (reserved bounds: `pendingUsd`). */
   spentUsd: number;
   /** What is left today, never below 0. */
   remainingUsd: number;
-  /** Generations today OpenRouter reported no cost for (not in `spentUsd`). */
+  /** Generations today OpenRouter reported no cost for and that hold no reserved bound (not in `spentUsd`). */
   uncosted: number;
+  /** Reserved upper bounds of today's generations without a reported cost yet (or ever): counted as spent. */
+  pendingUsd: number;
 };
 
 /**
@@ -35,6 +37,7 @@ export class MediaBudget {
       spentUsd: toUsd(r.spent),
       remainingUsd: toUsd(r.left),
       uncosted: r.uncosted,
+      pendingUsd: toUsd(r.pending),
     };
   }
 
@@ -46,14 +49,14 @@ export class MediaBudget {
   allows(userId: string, estimateUsd: number = 0, at: number = this.now()): boolean {
     if (typeof estimateUsd !== "number" || !Number.isFinite(estimateUsd) || estimateUsd < 0) return false;
     const { left } = this.micros(userId, at);
-    const estimate = Math.round(estimateUsd * 1_000_000);
+    const estimate = Math.ceil(estimateUsd * 1_000_000);
     return left > 0 && estimate <= left;
   }
 
   private micros(userId: string, at: number) {
     const day = monthInfo(at, this.timeZone);
     const rows = this.db
-      .select({ micros: usageRecords.pricedCostMicros })
+      .select({ micros: usageRecords.pricedCostMicros, estimate: usageRecords.estimatedCostMicros })
       .from(usageRecords)
       .where(
         and(
@@ -66,11 +69,14 @@ export class MediaBudget {
       .all();
     let spent = 0;
     let uncosted = 0;
+    let pending = 0;
     for (const r of rows) {
-      if (r.micros === null) uncosted += 1;
-      else spent += r.micros;
+      if (r.micros !== null) spent += r.micros;
+      // No cost reported (yet): the call's reserved bound holds the budget (#238 stage 2 review r1).
+      else if (r.estimate !== null) pending += r.estimate;
+      else uncosted += 1;
     }
     const limitUsd = this.settings().dailyCostLimitUsd;
-    return { limitUsd, spent, uncosted, left: Math.max(0, toMicros(limitUsd) - spent) };
+    return { limitUsd, spent, uncosted, pending, left: Math.max(0, toMicros(limitUsd) - spent - pending) };
   }
 }

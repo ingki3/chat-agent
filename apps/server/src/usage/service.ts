@@ -42,6 +42,12 @@ const RECENT = 50;
 
 type Row = UsageRow & { userName: string | null; connectionLabel: string | null };
 
+/** A media generation still going, or waiting for its cost (#238): "진행 중" in totals and in the record list alike. */
+export const isPending = (r: Pick<UsageRow, "purpose" | "pricedCostMicros" | "mediaSettlement">): boolean =>
+  r.purpose === "media" &&
+  r.pricedCostMicros === null &&
+  (r.mediaSettlement === "reserved" || r.mediaSettlement === "awaiting_cost");
+
 export function emptyTotals(): UsageTotals {
   return {
     requests: 0,
@@ -54,6 +60,7 @@ export function emptyTotals(): UsageTotals {
     costMicroUsd: 0,
     costUsd: 0,
     costMissing: 0,
+    costPending: 0,
     apiKeyRequests: 0,
     subscriptionRequests: 0,
     unknownRequests: 0,
@@ -77,8 +84,10 @@ export function addRow(t: UsageTotals, r: UsageRow): void {
   else t.totalTokens += r.inputTokens + r.outputTokens;
   if (r.authType === "api_key") {
     t.apiKeyRequests += r.requestCount;
-    if (r.pricedCostMicros === null) t.costMissing += 1;
-    else t.costMicroUsd += r.pricedCostMicros;
+    if (r.pricedCostMicros !== null) t.costMicroUsd += r.pricedCostMicros;
+    // A media generation still going, or waiting for its cost (#238): "진행 중", not "미제공".
+    else if (isPending(r)) t.costPending += 1;
+    else t.costMissing += 1;
   } else if (r.authType === "subscription") t.subscriptionRequests += r.requestCount;
   else if (r.authType === "unknown") {
     t.unknownRequests += r.requestCount;
@@ -139,7 +148,8 @@ export class UsageService {
   constructor(
     private readonly db: Db,
     private readonly settings: SettingsLike,
-    private readonly notifyAdmins: (amountUsd: number, thresholdUsd: number) => void,
+    /** `pastDay`: the day the cost belongs to when it is not today (a late media settlement, #238). */
+    private readonly notifyAdmins: (amountUsd: number, thresholdUsd: number, pastDay?: string) => void,
     private readonly log: EventLogger | undefined,
     opts: UsageServiceOptions = {},
   ) {
@@ -209,6 +219,7 @@ export class UsageService {
       totalTokens: r.inputTokens === null || r.outputTokens === null ? null : r.inputTokens + r.outputTokens,
       costUsd: r.authType === "api_key" && r.pricedCostMicros !== null ? toUsd(r.pricedCostMicros) : null,
       priceVersion: r.priceVersion,
+      ...(isPending(r) ? { costPending: true } : {}),
     }));
     return {
       month: m.month,
@@ -253,24 +264,42 @@ export class UsageService {
    * send one notification. Never throws: a failure is logged with a fixed code and the run carries on. Only
    * notifies; never blocks anything.
    */
+  /** The days already alerted (the setting is a JSON list; an older single day string is read as one). */
+  private alertedDays(): string[] {
+    const raw = this.settings.get(ALERTED_KEY);
+    if (!raw) return [];
+    try {
+      const v = JSON.parse(raw) as unknown;
+      if (Array.isArray(v)) return v.filter((d): d is string => typeof d === "string");
+    } catch {
+      // a plain day string (before #238)
+    }
+    return [raw];
+  }
+
   checkDailyCost(at: number): void {
     try {
       const { dailyCostThresholdUsd: threshold } = this.getSettings();
       if (threshold === null) return;
       const day = monthInfo(at, this.timeZone).today;
-      if (this.settings.get(ALERTED_KEY) === day) return;
+      if (this.alertedDays().includes(day)) return;
       // Integers on both sides: a cost of exactly the threshold is not above it.
       const micros = this.todayCostMicros(at);
       if (!(micros > toMicros(threshold))) return;
       const amount = toUsd(micros);
+      // Per day (#238 review r2): a cost settled late for an earlier day checks that day — and alerting it must not
+      // let today alert again, so the recent alerted days are kept, not only the last one.
       const claimed = this.db.transaction(() => {
-        if (this.settings.get(ALERTED_KEY) === day) return false;
-        this.settings.set(ALERTED_KEY, day);
+        const days = this.alertedDays();
+        if (days.includes(day)) return false;
+        this.settings.set(ALERTED_KEY, JSON.stringify([...days, day].sort().slice(-14)));
         return true;
       });
       if (!claimed) return;
       logEvent(this.log, "info", "usage.daily_cost_alert", { costUsd: amount });
-      this.notifyAdmins(amount, threshold);
+      const today = monthInfo(this.now(), this.timeZone).today;
+      if (day === today) this.notifyAdmins(amount, threshold);
+      else this.notifyAdmins(amount, threshold, day);
     } catch (e) {
       logEvent(this.log, "warn", "usage.alert_failed", { err: e });
     }

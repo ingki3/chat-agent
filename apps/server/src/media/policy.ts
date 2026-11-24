@@ -35,7 +35,7 @@ export function mediaRequestCarriesSecret(texts: readonly string[]): boolean {
  * Moderation values from strictest to loosest, as providers name them (OpenAI's image `moderation`: `auto` is the
  * stricter of `auto`/`low`).
  */
-const STRICTNESS = ["strict", "high", "auto", "medium", "default", "low", "off", "none"];
+export const STRICTNESS = ["strict", "high", "auto", "medium", "default", "low", "off", "none"];
 
 /**
  * The moderation value to send: for a youth account, the strictest one the model lists (null when it lists none —

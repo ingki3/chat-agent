@@ -38,6 +38,7 @@ const FTYP = ascii("ftyp");
 const QT_BOXES = ["moov", "mdat", "wide", "free"].map(ascii);
 const RIFF = ascii("RIFF");
 const WAVE = ascii("WAVE");
+const WEBP = ascii("WEBP");
 const ID3 = ascii("ID3");
 /** An MPEG audio frame header: 11 sync bits, a version that is not "reserved" and a layer that is not "reserved". */
 const isMpegFrame = (b: Buffer) =>
@@ -226,6 +227,8 @@ export function contentMatches(file: string, claimed: FileKind): boolean {
         return startsWith(head, PNG);
       case "jpg":
         return startsWith(head, JPG);
+      case "webp":
+        return startsWith(head, RIFF) && startsWith(head, WEBP, 8);
       case "hwp":
         return startsWith(head, OLE) && isHwp(fd, size);
       case "docx":

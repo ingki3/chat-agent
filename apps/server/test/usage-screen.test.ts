@@ -699,7 +699,8 @@ describe("daily cost notification (#32, FR-9.5)", () => {
         ),
       ).not.toThrow();
     expect(calls).toBe(1);
-    expect(kv.get("usage.daily_cost_alerted_day")).toBe("2026-11-11");
+    // The alerted days (#238 review r2: per day, so a late settlement for an earlier day alerts that day once).
+    expect(kv.get("usage.daily_cost_alerted_day")).toBe(JSON.stringify(["2026-11-11"]));
   });
 });
 

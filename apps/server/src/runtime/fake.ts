@@ -70,6 +70,8 @@ import {
  *   /audio <fileId> [nodiarize]   a real call of our `audio_transcribe` (#173) on that audio file, and a short answer
  *   /youtube <url> [<start> <end>] [transcribe]   a real call of our `youtube_audio_fetch` (#191); with `transcribe`,
  *                     then `audio_transcribe` on the saved file (its fileId from the first call), and a short answer
+ *   /image <prompt>   a real call of our `image_generate` (#238) with that prompt, and a short answer
+ *   /speech <text>    a real call of our `speech_generate` (#238) with that text, and a short answer
  *   /file-<scenario>   real calls of our file tools on the conversation's first upload (`fake-files.ts`: page12,
  *                     missing) and the scenario's answer with `[n]` markers (#48)
  *   /file-cite <fileId> <snippet>   one real `file_cite` of that id (e.g. another user's file) and a cited sentence
@@ -481,6 +483,20 @@ export const defaultScript: FakeScript = (input, memory) => {
       },
       ...(yt[4] ? [{ call: "audio_transcribe", input: { fileId: "$0.fileId" } }] : []),
       { text: yt[4] ? "화자별 대본을 만들었어요." : "음성 파일을 저장했어요." },
+    ];
+  const image = /^\/image\s+([\s\S]+)$/.exec(t);
+  if (image)
+    return [
+      { text: "그림을 만들게요. " },
+      { call: "image_generate", input: { prompt: image[1]!.trim() } },
+      { text: "그림을 만들었어요." },
+    ];
+  const speech = /^\/speech\s+([\s\S]+)$/.exec(t);
+  if (speech)
+    return [
+      { text: "읽어 드릴게요. " },
+      { call: "speech_generate", input: { text: speech[1]!.trim() } },
+      { text: "음성을 만들었어요." },
     ];
   const chart = financeChartSteps(t);
   if (chart) return chart;

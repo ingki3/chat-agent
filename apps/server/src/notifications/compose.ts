@@ -49,7 +49,17 @@ export type PublishInput =
   /** Admin only (#35). `message` is a short fixed text written by the server, never user content. */
   | { kind: "system_warning"; message: string; url?: string }
   /** Admin only (#32, FR-9.5): today's cost passed the admin's threshold. */
-  | { kind: "daily_cost"; amountUsd: number; thresholdUsd: number; url?: string }
+  | {
+      kind: "daily_cost";
+      amountUsd: number;
+      thresholdUsd: number;
+      url?: string;
+      /**
+       * The day the cost belongs to (`YYYY-MM-DD`, service zone) when it is not today — a media generation settled
+       * after midnight (#238). Absent: today.
+       */
+      pastDay?: string;
+    }
   /** "테스트 알림" button in settings. */
   | { kind: "test" }
   /** 기억 정리 (#146, spec §8): N proposals wait for the user's review. A count only — never an item's text. */
@@ -219,8 +229,8 @@ export function compose(input: PublishInput): Composed {
     case "daily_cost":
       return {
         kind: input.kind,
-        title: "오늘 비용이 기준을 넘었어요",
-        body: `오늘 ${won(input.amountUsd)} · 기준 ${won(input.thresholdUsd)} (막지는 않아요)`,
+        title: `${dayLabel(input.pastDay)} 비용이 기준을 넘었어요`,
+        body: `${dayLabel(input.pastDay)} ${won(input.amountUsd)} · 기준 ${won(input.thresholdUsd)} (막지는 않아요)`,
         url: safePath(input.url ?? "/admin"),
       };
     case "test":
@@ -298,4 +308,10 @@ export function bundle(titles: string[]): { title: string; body: string; url: st
     body: twoLines(titles.slice(0, BODY_LINES).join("\n")),
     url: "/notifications",
   };
+}
+
+/** "오늘", or a past day as "11월 22일" (a well-formed `YYYY-MM-DD` only). */
+function dayLabel(day: string | undefined): string {
+  const m = day ? /^\d{4}-(\d{2})-(\d{2})$/.exec(day) : null;
+  return m ? `${Number(m[1])}월 ${Number(m[2])}일` : "오늘";
 }
