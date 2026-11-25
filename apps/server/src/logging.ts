@@ -114,6 +114,8 @@ export const LOG_EVENTS = [
   "media.recovery_failed",
   // The background retry took up the previous process's media reservations: new media calls are allowed again.
   "media.recovered",
+  // speech_generate working folders (#248, `speech-scratch/`) left from the last process could not all be removed.
+  "media.sweep_failed",
   // python_run working folders left from the last process could not all be removed at start (#47; nothing else).
   "python.sweep_failed",
   // python_run account self-check (#47 round 2): the outcome only, no detail.

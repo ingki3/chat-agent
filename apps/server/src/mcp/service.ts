@@ -1610,7 +1610,20 @@ export class McpService {
     if (!media || !this.users.byId(scope.userId)?.active || scope.skills)
       return { ok: false, code: "media_not_allowed" };
     // Switched off or without a key since the tool list: the generator answers media_disabled / media_no_key.
-    return media.run(tool.kind, scope, input, { alive: () => this.tokens.hasRun(scope.runId) });
+    // A stopped run (its token revoked) also aborts the call's ffprobe/ffmpeg at once (#248), not only the next piece.
+    const stop = new AbortController();
+    // (Its tokens are gone before the watchers run; a run revoked once and given a token again is not stopped.)
+    const unsubscribe = this.tokens.onRevoke(scope.runId, () => {
+      if (!this.tokens.hasRun(scope.runId)) stop.abort();
+    });
+    try {
+      return await media.run(tool.kind, scope, input, {
+        alive: () => this.tokens.hasRun(scope.runId),
+        signal: stop.signal,
+      });
+    } finally {
+      unsubscribe();
+    }
   }
 
   /**

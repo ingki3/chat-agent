@@ -103,9 +103,11 @@ import { MediaSettingsStore } from "./media/settings.js";
 import { MediaBudget } from "./media/budget.js";
 import { MediaAdminService } from "./media/service.js";
 import { registerMediaRoutes } from "./media/routes.js";
-import { fixtureOpenRouterFetch } from "./media/fixture.js";
+import { fixtureOpenRouterFetch, fixtureSpeechAudio } from "./media/fixture.js";
 import { MediaGenerator } from "./media/generate.js";
 import { MediaRecovery, MediaSettler } from "./media/settle.js";
+import { sandboxedSpeechAudio, sweepSpeechScratch, type SpeechAudio } from "./media/speech-audio.js";
+import type { SpeechSplitLimits } from "./media/speech-split.js";
 import { youtubeState, type YoutubeState } from "./youtube/packages.js";
 import { sandboxedYoutubeRunner, type YoutubeRunner } from "./youtube/runner.js";
 import { YoutubeAudioFetcher } from "./youtube/service.js";
@@ -374,6 +376,12 @@ export type BuildOptions = {
     recoverAtStart?: boolean;
     /** Tests: whether the recovery retries in the background. */
     recovery?: { background?: boolean };
+    /**
+     * Long speech (#248): the ffmpeg that measures (decodes) and joins the pieces (default: the sandboxed ones beside
+     * AUDIO_FFMPEG; in tests none, unless given) and the piece sizing (tests: short pieces).
+     */
+    speechAudio?: () => SpeechAudio | undefined;
+    split?: SpeechSplitLimits;
   };
   python?: {
     runner?: PythonRunner;
@@ -629,8 +637,12 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       app.log,
       { timeZone: DEFAULT_TIME_ZONE, ...opts.usage },
     );
+    // One media clock (#251 r3): the media rows (reserve, update, recovery), the budget, the generator and the
+    // late-cost settler all read it — whichever of `media.now` / `usage.now` a test gives.
+    const mediaNow = opts.media?.now ?? opts.usage?.now ?? Date.now;
     const usage = new UsageStore(opts.db!, opts.usage?.now ?? Date.now, {
       onRecorded: (at) => usageService.checkDailyCost(at),
+      mediaNow,
     });
     app.decorate("usageStore", usage);
     // 미디어 생성 (#238 stage 1): the admin's OpenRouter key (else .env's), models, limits and the daily budget.
@@ -652,12 +664,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       store: mediaSettings,
       ...mediaFetch,
     });
-    const mediaBudget = new MediaBudget(
-      opts.db!,
-      () => mediaSettings.get(),
-      usageService.timeZone,
-      opts.media?.now ?? opts.usage?.now ?? Date.now,
-    );
+    const mediaBudget = new MediaBudget(opts.db!, () => mediaSettings.get(), usageService.timeZone, mediaNow);
     // The previous process's media reservations (#238 review r4–r5): only on the lock-holding server start
     // (`dataLock` — no other server uses this database), while the app is built, before any request: all `reserved`
     // rows are taken up in one transaction. If that fails the server still starts (chat wins over media
@@ -686,6 +693,17 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       keyGeneration: () => mediaAdmin.generation(),
       recovering: () => mediaRecovery.recovering(),
       ...(opts.media?.sleep ? { sleep: opts.media.sleep } : {}),
+      // #248: resolved per call (ffmpeg may be installed or removed while the server runs).
+      speechAudio:
+        opts.media?.speechAudio ??
+        (config.env === "test"
+          ? () => undefined
+          : config.fakeRuntime
+            ? // The e2e server: a scripted ffmpeg (measure, join) beside its scripted OpenRouter (no program runs).
+              () => fixtureSpeechAudio(config.dataDir)
+            : () => sandboxedSpeechAudio({ dataDir: config.dataDir, ffmpegPath: config.audioFfmpeg })),
+      ...(opts.media?.split ? { split: opts.media.split } : {}),
+      now: mediaNow,
     });
     // Late cost settlement (#238 review r2): generations still waiting for their cost are looked up again with a
     // backoff, also after a restart. Not in tests (they drive `runOnce`).
@@ -693,7 +711,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       usage,
       keys: openRouterKeys,
       fetchImpl: mediaFetchImpl,
-      ...(opts.media?.now ? { now: opts.media.now } : {}),
+      now: mediaNow,
       log: app.log,
     });
     if (config.env !== "test") app.addHook("onReady", async () => mediaSettler.start());
@@ -1134,6 +1152,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         if (!scratchpad.sweep(pythonAccount)) logEvent(app.log, "warn", "python.sweep_failed");
         if (!audio.sweep()) logEvent(app.log, "warn", "audio.sweep_failed");
         if (!youtube.sweep()) logEvent(app.log, "warn", "youtube.sweep_failed");
+        if (!sweepSpeechScratch(config.dataDir)) logEvent(app.log, "warn", "media.sweep_failed");
         startSelfCheck();
         // Worker job folders of the last process (#122), then the worker account's checks.
         if (!sweepWorkerScratch(config.dataDir, workerAccount))

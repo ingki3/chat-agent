@@ -180,6 +180,10 @@ export const MEDIA_ERRORS: Record<string, string> = {
   media_model_unknown: "고른 모델이 OpenRouter 목록에 없어요. 목록을 새로 불러와 다시 고르세요.",
   media_model_unsupported:
     "이 이미지 모델은 벡터(SVG)만 만들어 이 서버에 저장할 수 없어요. png·jpeg·webp를 내는 모델을 고르세요.",
+  media_model_no_price:
+    "이 음성 모델은 가격 정보가 없거나 읽을 수 없거나 변동 가격이라 한 번 호출의 최대 비용을 정할 수 없어요. 다른 모델을 고르세요.",
+  media_model_output_priced:
+    "이 음성 모델은 만든 음성의 양(오디오 토큰·초)으로 과금돼 한 번 호출의 최대 비용을 정할 수 없어요. 글자(입력) 기준으로 과금되는 모델을 고르세요.",
 };
 
 // ---------------------------------------------------------------- stage 2: the tools
@@ -187,7 +191,11 @@ export const MEDIA_ERRORS: Record<string, string> = {
 /** `image_generate` / `speech_generate` (#238 stage 2): input limits and the stored files. */
 export const MEDIA_TOOL_LIMITS = {
   promptChars: 4000,
-  speechChars: 4000,
+  /**
+   * The whole text of one speech call (#248: longer than one provider call can read — it is split into pieces,
+   * see apps/server/src/media/speech-split.ts; about 40 minutes of Korean at a slow reading rate).
+   */
+  speechChars: 12_000,
   instructionsChars: 500,
   voiceChars: 100,
   /** Conversation images an image call may take as references (png·jpg·webp of the same conversation). */
@@ -197,7 +205,20 @@ export const MEDIA_TOOL_LIMITS = {
   referenceTotalBytes: 20 * 1024 * 1024,
   /** How long one generation may take (the image providers can take a minute). */
   imageTimeoutMs: 180_000,
+  /** One TTS request (one piece of a long text). */
   speechTimeoutMs: 120_000,
+  /**
+   * A whole speech call (#248): no new piece starts after this; the one under way, the join and the cost lookups
+   * still finish (the runtimes' MCP tool timeout is set above all of it — runtime/lockdown.ts).
+   */
+  speechCallTimeoutMs: 30 * 60_000,
+  /**
+   * #251 re-plans 2–5: one run of a measurement — ffprobe's stream probe, or one strict PCM decode of the whole file
+   * (a piece of ~290 s, the stored result of up to an hour).
+   */
+  speechMeasureTimeoutMs: 60_000,
+  /** #248: one ffmpeg join (it may run twice: once more at a lower rate when over 50MB). */
+  speechJoinTimeoutMs: 180_000,
   /** Tries of `GET /generation?id=` after a speech call (its record can lag a little), and the wait between. */
   costTries: 3,
   costWaitMs: 1500,
@@ -229,6 +250,21 @@ export const MEDIA_TOOL_CODES = [
   /** A usage row of a generation could not be written (operator's log and error list only). */
   "media_usage_failed",
   "media_recovering",
+  /** #248: the text needs more pieces than one call may make. */
+  "media_too_long",
+  /** #248: this server has no ffmpeg/ffprobe to measure (decode) and join the speech — nothing is made (#251 r3). */
+  "media_audio_unavailable",
+  /** #248: a piece came back cut by the provider, and again after it was split smaller. */
+  "media_truncated",
+  /** #251 re-plan 2: a piece's audio did not decode cleanly (corrupt) — no file, no retry, its cost recorded. */
+  "media_audio_corrupt",
+  /**
+   * #251 re-plan 3: a piece's audio is not of the one form taken (MPEG Layer III, one rate and channel count, the
+   * same for every piece), or abnormally long — no file, no retry, its cost recorded.
+   */
+  "media_audio_unsupported",
+  /** #251 re-plan 3: a piece could not be measured (the sandbox, a limit) — no file, no retry, its cost recorded. */
+  "media_measure_failed",
 ] as const;
 export type MediaToolCode = (typeof MEDIA_TOOL_CODES)[number];
 
@@ -258,4 +294,16 @@ export const MEDIA_TOOL_HINTS: Partial<Record<MediaToolCode, string>> = {
   media_recovering:
     "서버가 지난번 미디어 생성 비용 기록을 정리하는 중이라 지금은 만들 수 없어요. 잠시 뒤에 다시 해 주세요.",
   media_changed: "그사이 관리자가 생성 설정이나 키를 바꿨어요. 다시 요청해 주세요.",
+  media_too_long:
+    "글이 너무 길어 한 번에 읽을 수 없어요. 몇 부분으로 나눠 따로 요청해 주세요(이미 나간 비용은 없어요).",
+  media_audio_unavailable:
+    "이 서버에 ffmpeg·ffprobe가 없어 만든 음성의 실제 길이를 확인할 수 없어서(중간에 끊긴 음성을 저장하지 않으려고) 음성을 만들지 않았어요. 관리자에게 ffmpeg(ffprobe 포함) 설치를 부탁하세요(비용은 나가지 않았어요).",
+  media_audio_corrupt:
+    "제공자가 보낸 음성이 손상돼(디코딩 오류) 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 잠시 뒤 다시 요청해 주세요.",
+  media_audio_unsupported:
+    "제공자가 보낸 음성의 형식이 이 서버가 받는 형식(MP3 오디오 스트림 하나뿐인 MP3 파일)이 아니어서 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 관리자에게 알려 주세요.",
+  media_measure_failed:
+    "만든 음성의 길이를 이 서버에서 확인하지 못해 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 잠시 뒤 다시 해 보거나 관리자에게 알려 주세요.",
+  media_truncated:
+    "음성이 제공자 쪽에서 중간에 끊겨 와서(더 잘게 나눠 다시 해도 끊김) 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 글을 더 짧게 나눠 요청해 주세요.",
 };

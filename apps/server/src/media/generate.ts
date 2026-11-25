@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
 import type { SkillResult, ToolScope } from "@agentlee/mcp-tools";
@@ -21,7 +22,7 @@ import { carriesSecret } from "../secrets/egress.js";
 import { MIN_KNOWN_LENGTH, scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 import type { UsageStore } from "../usage/store.js";
 import type { MediaBudget } from "./budget.js";
-import { imageCostBound, MAX_IMAGE_PIXELS, speechCostBound } from "./cost.js";
+import { boundMicros, imageCostBound, MAX_IMAGE_PIXELS, speechCostBound, speechPricing } from "./cost.js";
 import type { OpenRouterKeys } from "./keys.js";
 import {
   GENERATION_ID,
@@ -42,10 +43,20 @@ import { moderationFor, STRICTNESS, withMediaPolicy } from "./policy.js";
 import { mediaRunKey } from "../usage/store.js";
 import type { MediaSettingsStore } from "./settings.js";
 import { imageSize, stripImage, textRuns } from "./strip.js";
+import { removeSpeechWorkdir, type Measured, type SpeechAudio } from "./speech-audio.js";
+import {
+  looksCut,
+  resplitSpeech,
+  SPEECH_SPLIT,
+  speechSeconds,
+  splitSpeech,
+  type SpeechSplitLimits,
+} from "./speech-split.js";
 
 /**
- * `image_generate` and `speech_generate` (#238 stage 2): one synchronous OpenRouter generation per call, stored as
- * a file of the run's conversation linked to its reply (the reply then shows it: an inline image, an audio player).
+ * `image_generate` and `speech_generate` (#238 stage 2): one synchronous OpenRouter generation per call (a long speech
+ * text: one per piece, #248 — below), stored as a file of the run's conversation linked to its reply (the reply then
+ * shows it: an inline image, an audio player).
  *
  * Every call, in this order — nothing is paid for before all of it passed:
  * 1. strict input; the kind switched on with a model (관리자 → 미디어 생성) and an OpenRouter key (the admin's, else
@@ -74,13 +85,36 @@ import { imageSize, stripImage, textRuns } from "./strip.js";
  * (`X-Generation-Id`) — whatever happens to the file afterwards. A request whose outcome is unknown (network
  * error, timeout) keeps its bound. A usage write that fails is tried once more, then logged for the operator.
  * The tool's result passes the known-secret scrub. Nothing about the prompt, the text or the answer is logged.
+ *
+ * **Long speech (#248).** The production TTS model stops its audio at ~290 s without an error, so a speech text is
+ * split into pieces (`speech-split.ts`: paragraph and sentence boundaries, each estimated ≤ 240 s at a slow reading
+ * rate) — one piece for a text that fits, sent exactly as before. Every piece is its own generation with the same
+ * model, voice, instructions and moderation, and its **own usage row** (its own call id and generation id, reserved,
+ * settled and late-settled like any single call). Up front, in the one synchronous budget step: the sum of the
+ * pieces' bounds **plus the largest one re-split** (the headroom of one retry) must fit — all in integer micro-USD,
+ * the same integers the rows hold — and every piece's row is reserved as `pending_send` (never billed: the start-up
+ * recovery removes such rows). **Every cost of one call counts for the service day the call started** (its first
+ * reservation's moment, `ctx.startedAt` — #251 r3): every row, retry pieces included, is written with that moment and
+ * every budget check is for that day only; past midnight nothing moves (two days' limits may be used back to back
+ * across midnight). Pieces go one after another. Right before each request, synchronously: its fields pass the
+ * egress check again (a secret registered meanwhile) and the row becomes `reserved` (sent). Each answer is gated
+ * and decoded to its end into PCM at the call's rate (`speech-audio.ts`; a decoding error is `media_audio_corrupt`),
+ * and a piece that came back cut (at the provider's mark, or far shorter than its estimate) is split smaller and
+ * tried once more — within the call's cap on paid requests, its pieces reserved (budget check again) just before
+ * they are sent; cut again is `media_truncated`. Then the pieces' PCM is encoded once by ffmpeg into the MP3 that is
+ * stored — never the provider's bytes (#251 re-plan 5) — and that MP3's length is checked against the pieces'
+ * summed samples. Any stop on
+ * the way (a failed or refused piece, cancel, a settings change, the call's time budget) stores nothing: the pieces
+ * already sent keep their rows (their cost is recorded), the reserved rows of pieces never sent are removed. Every
+ * piece is measured (decoded; its length from the decoded samples): without ffmpeg no speech is made at all —
+ * `media_audio_unavailable` before anything is paid (#251 r3). One tool call is one use of the run's speech limit, one file place, one slot.
  */
 export type MediaGeneratorOptions = {
   db: Db;
   files: () => FileStore | undefined;
   keys: Pick<OpenRouterKeys, "resolve">;
   settings: Pick<MediaSettingsStore, "get" | "revision">;
-  budget: Pick<MediaBudget, "allows">;
+  budget: Pick<MediaBudget, "allows" | "allowsMicros">;
   usage:
     | Pick<
         UsageStore,
@@ -90,6 +124,7 @@ export type MediaGeneratorOptions = {
         | "answeredMedia"
         | "unconfirmMedia"
         | "generationMedia"
+        | "sendingMedia"
       >
     | undefined;
   /**
@@ -114,6 +149,13 @@ export type MediaGeneratorOptions = {
   /** Where a failed usage write is reported (the operator's log and the admin's error list). */
   log?: EventLogger | undefined;
   errors?: Pick<ErrorLog, "record"> | undefined;
+  /**
+   * #248: ffmpeg for measuring (decoding) and joining speech pieces, resolved per call; undefined = not on this server
+   * (then no speech is made: `media_audio_unavailable`).
+   */
+  speechAudio?: () => SpeechAudio | undefined;
+  /** #248: the piece sizing and cut detection (tests use short pieces). */
+  split?: SpeechSplitLimits;
 };
 
 export const MEDIA_SLOTS = { total: 4, perUser: 2 } as const;
@@ -125,8 +167,12 @@ export type MediaToolOutput = {
   file: MediaFileOut;
   model: string;
   voice?: string;
-  /** OpenRouter's reported cost (USD); null when it reported none. */
+  /** OpenRouter's reported cost (USD); null when it reported none (speech: of all its pieces, null if any is missing). */
   costUsd: number | null;
+  /** Speech (#248): the stored audio's length in seconds, counted from its audio frames (always measured). */
+  durationSeconds?: number;
+  /** Speech (#248): the pieces the stored audio was read in. */
+  chunks?: number;
   note: string;
 };
 
@@ -197,9 +243,11 @@ export class MediaGenerator {
   private running = 0;
   private readonly byUser = new Map<string, number>();
   private readonly now: () => number;
+  private readonly split: SpeechSplitLimits;
 
   constructor(private readonly o: MediaGeneratorOptions) {
     this.now = o.now ?? Date.now;
+    this.split = o.split ?? SPEECH_SPLIT;
   }
 
   /** Whether the kind is offered now: switched on, a model chosen, a key in place. */
@@ -309,6 +357,7 @@ export class MediaGenerator {
       apiKey: key.key,
       youth: user.youth === true,
       alive,
+      signal: o.signal,
     };
 
     const limits = this.o.slots ?? MEDIA_SLOTS;
@@ -331,16 +380,19 @@ export class MediaGenerator {
           ? await this.planImage(ctx, parsed.data as ImageInput)
           : await this.planSpeech(ctx, parsed.data as SpeechInput);
       // The admin may have switched the kind off, picked another model or changed the key meanwhile.
-      const nowKey = this.o.keys.resolve();
-      const nowKind = this.o.settings.get().kinds[kind];
-      if (
-        this.o.settings.revision() !== revision ||
-        nowKey?.key !== key.key ||
-        this.o.keyGeneration?.() !== generation ||
-        !nowKind.enabled ||
-        nowKind.model !== model
-      )
-        throw new MediaToolError("media_changed");
+      const changed = () => {
+        const nowKey = this.o.keys.resolve();
+        const nowKind = this.o.settings.get().kinds[kind];
+        return (
+          this.o.settings.revision() !== revision ||
+          nowKey?.key !== key.key ||
+          this.o.keyGeneration?.() !== generation ||
+          !nowKind.enabled ||
+          nowKind.model !== model
+        );
+      };
+      ctx.changed = changed;
+      if (changed()) throw new MediaToolError("media_changed");
       if (this.secret(plan.texts)) throw new MediaToolError("media_secret_blocked");
       if (plan.bound === null) throw new MediaToolError("media_no_price");
       // A place among the conversation's files, counting the calls in flight — before anything is paid for, and
@@ -353,18 +405,23 @@ export class MediaGenerator {
       if (!this.takeCall(scope.runId, kind, settings.perRunLimits[kind]))
         throw new MediaToolError("media_quota");
       if (!alive()) throw new MediaToolError("media_cancelled");
-      // The budget check and the reserving row in one synchronous step.
+      if (kind === "speech") {
+        // The budget check and every piece's reserving row in one synchronous step (#248).
+        const pieces = this.reserve(ctx, plan.pieces!, plan.checkMicros!);
+        return await this.speech(ctx, plan, pieces);
+      }
+      // The budget check and the reserving row in one synchronous step, at one moment (the row counts for the day
+      // that was checked — #251 r2).
       const callId = crypto.randomUUID();
-      if (!this.o.budget.allows(scope.userId, plan.bound)) throw new MediaToolError("media_budget");
+      const at = (ctx.startedAt ??= this.now());
+      if (!this.o.budget.allows(scope.userId, plan.bound, at)) throw new MediaToolError("media_budget");
       if (
         !this.write(ctx, "reserve", () =>
-          this.o.usage?.reserveMedia({ ...this.row(ctx, callId), estimateUsd: plan.bound! }),
+          this.o.usage?.reserveMedia({ ...this.row(ctx, callId), estimateUsd: plan.bound!, at }),
         )
       )
         throw new MediaToolError("media_failed");
-      return kind === "image"
-        ? await this.image(ctx, callId, plan.body)
-        : await this.speech(ctx, callId, plan.body, plan.voice);
+      return await this.image(ctx, callId, plan.body);
     } finally {
       releaseFile();
       this.running--;
@@ -372,6 +429,58 @@ export class MediaGenerator {
       if (left > 0) this.byUser.set(scope.userId, left);
       else this.byUser.delete(scope.userId);
     }
+  }
+
+  /**
+   * Speech pieces' reservations (#248), synchronous: the budget must allow `checkMicros` (the pieces' bounds, plus
+   * the headroom asked for — integer micro-USD, the same integers the rows get), then every piece gets its
+   * reserving row, `pending_send` until its request goes out. **One moment for the whole call** (#251 r3): the call's
+   * start (`ctx.startedAt`, set by its first reservation) — the budget is checked for that day and every row, a
+   * retry's too, is written with it, so all of the call's costs count for the day it started. A row that cannot be
+   * written undoes the ones written (nothing is sent).
+   */
+  private reserve(ctx: CallCtx, pieces: readonly PlannedPiece[], checkMicros: number): Piece[] {
+    const at = (ctx.startedAt ??= this.now());
+    if (!this.o.budget.allowsMicros(ctx.scope.userId, checkMicros, at))
+      throw new MediaToolError("media_budget");
+    const out: Piece[] = [];
+    for (const p of pieces) {
+      const callId = crypto.randomUUID();
+      if (
+        !this.write(ctx, "reserve", () =>
+          this.o.usage?.reserveMedia({
+            ...this.row(ctx, callId),
+            estimateMicros: p.micros,
+            state: "pending_send",
+            at,
+          }),
+        )
+      ) {
+        for (const r of out) this.release(ctx, r.callId);
+        throw new MediaToolError("media_failed");
+      }
+      out.push({ ...p, callId });
+    }
+    return out;
+  }
+
+  /**
+   * Right before a piece's request (#248), synchronous: its fields pass the egress check again (a secret may have
+   * been registered since the call started), then the row is `reserved` (sent). Its day stays the call's start day
+   * (#251 r3). Throws — the row still unsent, released by the caller — when either fails.
+   */
+  private sending(ctx: CallCtx, plan: Plan, p: Piece): void {
+    if (this.secret([p.text, ...(plan.sentTexts ?? [])])) throw new MediaToolError("media_secret_blocked");
+    let ok = true;
+    const wrote = this.write(ctx, "reserve", () => {
+      ok = this.o.usage?.sendingMedia(mediaRunKey(ctx.scope.runId, p.callId)) ?? true;
+    });
+    if (!wrote || !ok) throw new MediaToolError("media_failed");
+  }
+
+  /** A reserving row whose request was never sent goes (it never cost anything). */
+  private release(ctx: CallCtx, callId: string): void {
+    this.write(ctx, "release", () => this.o.usage?.releaseMedia(mediaRunKey(ctx.scope.runId, callId)));
   }
 
   private row(ctx: CallCtx, callId: string) {
@@ -575,23 +684,36 @@ export class MediaGenerator {
   }
 
   private async planSpeech(ctx: CallCtx, input: SpeechInput): Promise<Plan> {
+    // #248: the pieces first, and the means to measure them — every piece is measured (a cut one is never stored),
+    // so without ffmpeg nothing is made, not even a text of one piece (#251 r3; nothing is asked).
+    const texts = splitSpeech(input.text, this.split);
+    if (texts.length > this.split.maxPieces) throw new MediaToolError("media_too_long");
+    // A piece the split could not bring under the target (one grapheme cluster longer than it, #251 r3).
+    if (texts.some((t) => speechSeconds(t, this.split.slow) > this.split.targetSeconds))
+      throw new MediaToolError("media_too_long", UNSPLITTABLE);
+    ctx.audio = this.o.speechAudio?.();
+    if (!ctx.audio) throw new MediaToolError("media_audio_unavailable");
     const [answer, priced] = await Promise.all([
       this.lookup(speechModelUrl(ctx.model), ctx.apiKey),
       this.lookup(modelEndpointsUrl(ctx.model), ctx.apiKey),
     ]);
     // A 200 is not a record: the model itself, with its speech output's parameters; its endpoints' prices.
-    const data = isObj(priced.data) ? priced.data : {};
-    const endpoints = Array.isArray(data.endpoints) ? data.endpoints : [];
+    // The price record judged as when the model was chosen (`speechPricing`, #251 r10).
+    const pricing = speechPricing(priced, ctx.model);
     if (
       answer.id !== ctx.model ||
       !Array.isArray(answer.output_modalities) ||
       !answer.output_modalities.some(
         (m) => isObj(m) && m.type === "speech" && isObj(m.supported_parameters),
       ) ||
-      data.id !== ctx.model ||
-      !endpoints.length
+      (!pricing.ok && pricing.reason === "invalid")
     )
       throw new MediaToolError("media_lookup_failed");
+    // Priced on its output (audio tokens or seconds): its cost has no bound — refused before anything is sent.
+    if (!pricing.ok && pricing.reason === "output_priced")
+      throw new MediaToolError("media_no_price", OUTPUT_PRICED);
+    if (!pricing.ok) throw new MediaToolError("media_no_price");
+    const endpoints = pricing.endpoints;
     const maps: unknown[] = [];
     const outs = [
       ...(Array.isArray(answer.output_modalities) ? answer.output_modalities : []),
@@ -623,6 +745,7 @@ export class MediaGenerator {
     }
     voice ??= voices ? [...voices].find((v) => HINT_VALUE.test(v)) : undefined;
     const moderation = this.moderation(ctx, params);
+    // Every piece the same request but its `input` (set per piece).
     const body = withMediaPolicy({
       model: ctx.model,
       input: input.text,
@@ -631,6 +754,33 @@ export class MediaGenerator {
       ...(input.instructions ? { instructions: input.instructions } : {}),
       ...(moderation ? { moderation } : {}),
     });
+    // Every bound as the integer micro-USD its row will hold: the check sums exactly what is reserved (#248).
+    const microsOf = (text: string) => {
+      const b = speechCostBound(endpoints, { text, instructions: input.instructions });
+      return b === null ? null : boundMicros(b);
+    };
+    const pieces = texts.map((text) => ({ text, micros: microsOf(text) }));
+    // The headroom of one retry: the largest piece's bound when split smaller (its pieces' bounds summed).
+    let headroom = 0;
+    let total: number | null = 0;
+    for (const p of pieces) {
+      if (p.micros === null || total === null) {
+        total = null;
+        break;
+      }
+      total += p.micros;
+      if (!ctx.audio) continue;
+      const again = resplitSpeech(p.text, this.split).map(microsOf);
+      if (again.some((b) => b === null)) {
+        total = null;
+        break;
+      }
+      headroom = Math.max(
+        headroom,
+        (again as number[]).reduce((a, b) => a + b, 0),
+      );
+    }
+    const check = total === null ? null : total + headroom;
     return {
       body,
       voice,
@@ -642,7 +792,12 @@ export class MediaGenerator {
         input.instructions ?? "",
         moderation ?? "",
       ],
-      bound: speechCostBound(endpoints, { text: input.text, instructions: input.instructions }),
+      bound: check === null ? null : check / 1_000_000,
+      checkMicros: check ?? undefined,
+      pieces: check === null ? [] : (pieces as PlannedPiece[]),
+      microsOf,
+      // What each piece's request carries besides its text (checked again before every request).
+      sentTexts: [OPENROUTER_SPEECH_URL, ctx.model, voice ?? "", input.instructions ?? "", moderation ?? ""],
     };
   }
 
@@ -735,53 +890,225 @@ export class MediaGenerator {
     };
   }
 
-  private async speech(
+  /**
+   * One speech request — one piece of the text (#248; a text that fits is its only piece). Its answer's bytes (null
+   * when the body could not be read or passes `maxBytes`) and its cost lookup, which settles the piece's own row
+   * whatever happens to the bytes afterwards.
+   */
+  private async piece(
     ctx: CallCtx,
-    callId: string,
+    p: Piece,
     body: Record<string, unknown>,
-    voice: string | undefined,
-  ): Promise<MediaToolOutput> {
+    maxBytes: number,
+  ): Promise<{ bytes: Buffer | null; cost: Promise<number | null> }> {
     let res: Response;
     try {
-      res = await openRouterPost(OPENROUTER_SPEECH_URL, body, {
-        apiKey: ctx.apiKey,
-        fetchImpl: this.o.fetchImpl,
-        timeoutMs: MEDIA_TOOL_LIMITS.speechTimeoutMs,
-      });
+      res = await openRouterPost(
+        OPENROUTER_SPEECH_URL,
+        { ...body, input: p.text },
+        {
+          apiKey: ctx.apiKey,
+          fetchImpl: this.o.fetchImpl,
+          timeoutMs: MEDIA_TOOL_LIMITS.speechTimeoutMs,
+        },
+      );
     } catch (e) {
-      throw this.refused(ctx, callId, e);
+      throw this.refused(ctx, p.callId, e);
     }
     // 2xx: the reserving row stays, and the cost is looked up whatever happens to the body or the file.
-    const generation = this.headersCame(ctx, callId, res);
+    const generation = this.headersCame(ctx, p.callId, res);
     let bytes: Buffer | null = null;
     if (/json/i.test(res.headers.get("content-type") ?? "")) await res.body?.cancel().catch(() => {});
     else {
       try {
-        bytes = await readBytes(res, FILE_LIMITS.bytes);
+        bytes = await readBytes(res, maxBytes);
       } catch {
         bytes = null;
       }
     }
     const cost = this.cost(generation, ctx.apiKey).then((c) => {
-      this.settle(ctx, callId, c, generation);
+      this.settle(ctx, p.callId, c, generation);
       return c;
     });
+    return { bytes, cost };
+  }
+
+  /**
+   * The speech call (#248): its reserved pieces one after another, each measured and — cut by the provider — split
+   * smaller and tried once more, then joined and stored as one MP3. See the comment at the top of this file.
+   */
+  private async speech(ctx: CallCtx, plan: Plan, reserved: Piece[]): Promise<MediaToolOutput> {
+    const audio = ctx.audio;
+    const queue: Piece[] = [...reserved];
+    /** Reserved rows whose request has not been sent (removed when the call stops early). */
+    const unsent = new Set(reserved.map((p) => p.callId));
+    const costs: Promise<number | null>[] = [];
+    const made: Made[] = [];
+    /** The call's PCM rate: the first answer's own (#251 re-plan 5). */
+    let sampleRate: number | undefined;
+    let n = 0;
+    const started = this.now();
+    let workdir: string | undefined;
     try {
-      if (!bytes) throw new MediaToolError("media_failed");
-      if (!bytes.length || !isMp3(bytes)) throw new MediaToolError("media_unsupported_model");
-      const file = await this.store(ctx, bytes, "mp3", `speech-${stamp(this.now())}.mp3`);
+      // Checked at planning; every piece is measured (#251 r3).
+      if (!audio) throw new MediaToolError("media_audio_unavailable");
+      try {
+        workdir = audio.workdir();
+      } catch {
+        throw new MediaToolError("media_failed");
+      }
+      while (queue.length) {
+        const p = queue.shift()!;
+        // Every piece after the first: the run may have stopped, the admin changed something, the time run out.
+        if (costs.length) {
+          if (!ctx.alive()) throw new MediaToolError("media_cancelled");
+          if (ctx.changed?.()) throw new MediaToolError("media_changed");
+          if (this.now() - started > MEDIA_TOOL_LIMITS.speechCallTimeoutMs)
+            throw new MediaToolError(
+              "media_failed",
+              "글이 길어 정해진 시간 안에 다 읽지 못해 저장하지 않았어요. 더 짧게 나눠 요청해 주세요.",
+            );
+        }
+        // Synchronously from here to the request: egress check, the row marked sent (its day: the call's start day).
+        this.sending(ctx, plan, p);
+        unsent.delete(p.callId);
+        // Each answer read up to the file cap; the stored file's cap applies to this server's own encode (#251 r10).
+        const r = await this.piece(ctx, p, plan.body, FILE_LIMITS.bytes);
+        costs.push(r.cost);
+        if (!r.bytes) throw new MediaToolError("media_failed");
+        // Empty: nothing to judge. Otherwise the answer's form is the decoder's verdict below (#251 re-plan 4 — no
+        // byte sniffing of our own: a WAV or MP2 answer, or a leading tag, is for the decoder to report).
+        if (!r.bytes.length) throw new MediaToolError("media_audio_unsupported");
+        const file = path.join(workdir, "in", `piece-${String(n++).padStart(3, "0")}.mp3`);
+        try {
+          fs.writeFileSync(file, r.bytes, { flag: "wx", mode: 0o600 });
+        } catch {
+          // The working folder could not take it (full disk, a limit): not measured — no path in what is told.
+          throw new MediaToolError("media_measure_failed");
+        }
+        // Gated, then decoded to its end into PCM at the call's rate (#251 re-plan 5): a corrupt, unsupported or
+        // abnormally long answer, or one that could not be measured, ends the call — no file, no retry (the cost
+        // stays recorded); a clean but short one goes to the re-split below. The first answer decoded fixes the
+        // call's rate (also when it is cut and not kept); later ones are converted to it.
+        const m = await measureSafely(() =>
+          audio.measure(file, { maxSeconds: this.split.pieceMaxSeconds, sampleRate, signal: ctx.signal }),
+        );
+        if (!m.ok) throw this.stopped(ctx) ?? measuredError(m.reason);
+        sampleRate ??= m.sampleRate;
+        // The provider's bytes are done with: only the PCM goes on.
+        fs.rmSync(file, { force: true });
+        if (looksCut(p.text, m.seconds, this.split)) {
+          // Cut by the provider: smaller pieces, once (their rows reserved — and the budget checked — first).
+          fs.rmSync(m.pcm, { force: true });
+          const parts = p.retry ? [] : resplitSpeech(p.text, this.split);
+          if (!parts.length) throw new MediaToolError("media_truncated");
+          if (!ctx.alive()) throw new MediaToolError("media_cancelled");
+          // The call's cap on paid requests, the retry included (the ones made, the ones queued, these).
+          if (costs.length + queue.length + parts.length > this.split.maxRequests)
+            throw new MediaToolError("media_truncated", TOO_MANY_REQUESTS);
+          const micros = parts.map((t) => plan.microsOf!(t));
+          if (micros.some((b) => b === null)) throw new MediaToolError("media_no_price");
+          const again = this.reserve(
+            ctx,
+            parts.map((text, i) => ({ text, micros: micros[i]! })),
+            (micros as number[]).reduce((a, b) => a + b, 0),
+          );
+          for (const a of again) unsent.add(a.callId);
+          queue.unshift(...again.map((a) => ({ ...a, retry: true })));
+          continue;
+        }
+        made.push({ pcm: m.pcm, seconds: m.seconds, samples: m.samples, sampleRate: m.sampleRate });
+      }
+      const joined = await this.joined(ctx, made, workdir);
+      const file = await this.store(ctx, joined.bytes, "mp3", `speech-${stamp(this.now())}.mp3`);
+      const all = await Promise.all(costs);
       return {
         status: "ok",
         fileId: file.fileId,
         file,
         model: ctx.model,
-        ...(voice ? { voice } : {}),
-        costUsd: await cost,
+        ...(plan.voice ? { voice: plan.voice } : {}),
+        durationSeconds: joined.seconds,
+        chunks: made.length,
+        costUsd: all.some((c) => c === null)
+          ? null
+          : Number((all as number[]).reduce((a, b) => a + b, 0).toFixed(10)),
         note: "The audio is saved as an MP3 file of this conversation; the user can play it under your reply.",
       };
     } finally {
-      await cost.catch(() => null);
+      for (const id of unsent) this.release(ctx, id);
+      await Promise.all(costs.map((c) => c.catch(() => null)));
+      if (workdir) removeSpeechWorkdir(workdir);
     }
+  }
+
+  /** `media_cancelled` when the call was stopped (a measurement or join killed with it); else undefined. */
+  private stopped(ctx: CallCtx): MediaToolError | undefined {
+    return ctx.signal?.aborted || !ctx.alive() ? new MediaToolError("media_cancelled") : undefined;
+  }
+
+  /**
+   * The stored MP3 (#248, #251 re-plan 5): always this server's own encode — never the provider's bytes. The pieces'
+   * PCM (one piece, or several in order) encoded once (one piece 192 kbit/s, several 128; over 50MB once more at 64)
+   * and the result decoded and measured like an answer: the pieces' summed samples within 1 s + 0.25 s per piece (a
+   * gross loss only), or nothing is stored. A result that cannot be measured is `media_measure_failed`.
+   */
+  private async joined(
+    ctx: CallCtx,
+    made: Made[],
+    workdir: string | undefined,
+  ): Promise<{ bytes: Buffer; seconds: number }> {
+    const audio = ctx.audio;
+    const first = made[0];
+    if (!first) throw new MediaToolError("media_failed");
+    const round = (s: number) => Math.round(s * 100) / 100;
+    if (!audio || !workdir) throw new MediaToolError("media_failed");
+    if (!ctx.alive()) throw new MediaToolError("media_cancelled");
+    const pcms = made.map((m) => m.pcm);
+    const sampleRate = first.sampleRate;
+    const want = made.reduce((a, m) => a + m.samples, 0);
+    const size = (f: string) => {
+      try {
+        return fs.statSync(f).size;
+      } catch {
+        // The working folder failing under us: not measured (no path in what is told).
+        throw new MediaToolError("media_measure_failed");
+      }
+    };
+    // An encode whose own result checks fail under it (an I/O error, #251 r14): not measured — never the raw error.
+    const encode = async (bitrateK: number) => {
+      try {
+        return await audio.encode({ workdir, pcms, bitrateK, sampleRate }, ctx.signal);
+      } catch {
+        throw new MediaToolError("media_measure_failed");
+      }
+    };
+    let out = await encode(made.length === 1 ? 192 : 128);
+    if (out && size(out) > FILE_LIMITS.bytes) out = await encode(64);
+    if (!out || !size(out) || size(out) > FILE_LIMITS.bytes)
+      throw this.stopped(ctx) ?? new MediaToolError("media_failed");
+    // The pieces' PCM is done with.
+    for (const f of pcms) fs.rmSync(f, { force: true });
+    const m = await measureSafely(() =>
+      audio.measure(out, { maxSeconds: (want / sampleRate) * 2 + 60, sampleRate, signal: ctx.signal }),
+    );
+    // Not measured: the same outcome (and hint — the cost is recorded) as a piece's; anything else is ours.
+    if (!m.ok)
+      throw (
+        this.stopped(ctx) ??
+        new MediaToolError(m.reason === "failed" ? "media_measure_failed" : "media_failed")
+      );
+    fs.rmSync(m.pcm, { force: true });
+    // A gross loss only (the encoder's delay and padding are well inside this).
+    if (Math.abs(m.samples - want) > sampleRate * (1 + 0.25 * made.length))
+      throw new MediaToolError("media_failed");
+    let bytes: Buffer;
+    try {
+      bytes = fs.readFileSync(out);
+    } catch {
+      throw new MediaToolError("media_measure_failed");
+    }
+    return { bytes, seconds: round(m.seconds) };
   }
 
   /**
@@ -842,6 +1169,17 @@ type ImageInput = { prompt: string; aspectRatio?: string; referenceFileIds?: str
 type SpeechInput = { text: string; voice?: string; instructions?: string };
 type CallCtx = {
   scope: ToolScope;
+  /** The caller's stop (the MCP service aborts it when the run ends): its ffmpeg runs are killed with it. */
+  signal?: AbortSignal | undefined;
+  /** Whether the admin changed the settings or the key since the call started (#248: checked before every piece). */
+  changed?: () => boolean;
+  /** #248: ffmpeg (measure, join) of this call (undefined: not on this server). */
+  audio?: SpeechAudio | undefined;
+  /**
+   * #251 r3: the moment of the call's first reservation — every row of the call is written with it and every budget
+   * check is for its service day.
+   */
+  startedAt?: number;
   store: FileStore;
   messageId: string;
   model: string;
@@ -858,7 +1196,65 @@ type Plan = {
   /** The call's cost upper bound (USD); null = none can be given (the call is refused). */
   bound: number | null;
   voice?: string | undefined;
+  /** Speech (#248): the pieces of the text with their bounds. */
+  pieces?: PlannedPiece[];
+  /** Speech: what the budget must allow up front — the pieces' bounds plus one retry's headroom (micro-USD). */
+  checkMicros?: number | undefined;
+  /** Speech: a piece's bound in micro-USD (a retry's smaller pieces). */
+  microsOf?: (text: string) => number | null;
+  /** Speech: every text a piece's request carries besides its own text (the egress check before each request). */
+  sentTexts?: string[];
 };
+/** A piece of a speech text and its bound as the integer micro-USD its row holds. */
+type PlannedPiece = { text: string; micros: number };
+/**
+ * A reserved piece: its own call id (usage row). `retry`: already a smaller piece of one that came back cut.
+ */
+type Piece = PlannedPiece & { callId: string; retry?: boolean };
+
+/** #251 r9: a speech model priced on its output — no upper bound of a call's cost. */
+const OUTPUT_PRICED =
+  "이 음성 모델은 만든 음성의 양(오디오 토큰·초)으로 과금돼 한 번 호출의 최대 비용을 정할 수 없어 보내지 않았어요. 관리자에게 글자(입력) 기준으로 과금되는 모델을 부탁하세요.";
+
+/** #251 r3: a single character (grapheme cluster) too long to be read in one piece. */
+const UNSPLITTABLE =
+  "글 안에 나눌 수 없을 만큼 긴 한 글자(결합 문자열)가 있어 읽을 수 없어요. 그 부분을 고쳐 다시 요청해 주세요(비용은 나가지 않았어요).";
+
+/** #248: a retry that would pass the call's cap on paid requests. */
+const TOO_MANY_REQUESTS =
+  "음성 조각이 제공자 쪽에서 끊겨 다시 나누면 한 번의 호출에서 보낼 수 있는 요청 수를 넘어 멈췄어요. 파일은 저장하지 않았고, 이미 나간 비용은 기록됐어요. 글을 몇 부분으로 나눠 따로 요청해 주세요.";
+/** A piece's answer: its bytes, and (measured) its file in the working folder and its stream. */
+/** A piece kept: its decoded PCM (in `out/`) and its length at the call's rate. */
+type Made = { pcm: string; seconds: number; samples: number; sampleRate: number };
+
+/**
+ * A measurement whose own file reads fail under it (an I/O error, #251 r13): `media_measure_failed` — never the raw
+ * error, which would name the working folder.
+ */
+async function measureSafely(fn: () => Promise<Measured>): Promise<Measured> {
+  try {
+    return await fn();
+  } catch {
+    return { ok: false, reason: "failed" };
+  }
+}
+
+/** A measurement that did not succeed, as the tool's outcome (#251 re-plans 2–3). */
+function measuredError(reason: "corrupt" | "unsupported" | "too_long" | "failed" | "lost"): MediaToolError {
+  if (reason === "corrupt") return new MediaToolError("media_audio_corrupt");
+  if (reason === "unsupported") return new MediaToolError("media_audio_unsupported");
+  if (reason === "lost") return new MediaToolError("media_audio_unsupported", CONVERSION_LOST);
+  if (reason === "too_long") return new MediaToolError("media_audio_unsupported", ABNORMAL_LENGTH);
+  return new MediaToolError("media_measure_failed");
+}
+
+/** #251 r13: an answer whose audio was lost converting it to the call's rate (not its format). */
+const CONVERSION_LOST =
+  "제공자가 보낸 음성의 표본율이 중간에 바뀌어, 변환하는 동안 음성 일부가 사라져 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 관리자에게 알려 주세요.";
+
+/** #251 re-plan 3: an answer far longer than any piece can be. */
+const ABNORMAL_LENGTH =
+  "제공자가 보낸 음성이 비정상적으로 길어(조각 하나의 상한을 넘음) 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 관리자에게 알려 주세요.";
 
 /** `20261124-153012` (UTC) for a file name. */
 const stamp = (t: number) => new Date(t).toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);

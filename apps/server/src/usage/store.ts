@@ -49,6 +49,8 @@ export type UsageStoreOptions = {
    * change or stop the run that reported the usage.
    */
   onRecorded?: (at: number) => void;
+  /** The media rows' clock (#251 r3, default: `now`). */
+  mediaNow?: () => number;
 };
 
 /**
@@ -71,7 +73,14 @@ export class UsageStore {
   ) {
     this.prices = opts.prices ?? new PriceStore(db, now);
     this.onRecorded = opts.onRecorded;
+    this.mediaNow = opts.mediaNow ?? now;
   }
+
+  /**
+   * The media rows' clock (#251 r3): the same one the media budget, the generator, the recovery and the late-cost
+   * settler use, so a reservation, its updates and the settler's backoff are measured on one clock.
+   */
+  private readonly mediaNow: () => number;
 
   record(a: UsageAttempt, u: UsageReport): void {
     const at = this.now();
@@ -147,10 +156,10 @@ export class UsageStore {
     model: string;
     costUsd: number | null;
   }): void {
-    const at = this.now();
+    const at = this.mediaNow();
     const usd = cost(m.costUsd ?? undefined);
     const micros = usd === null ? null : Math.round(usd * 1_000_000);
-    this.db
+    const row = this.db
       .insert(usageRecords)
       .values({
         userId: m.userId,
@@ -183,8 +192,10 @@ export class UsageStore {
             ? { updatedAt: at }
             : { costUsd: usd, pricedCostMicros: micros, mediaSettlement: "settled", updatedAt: at },
       })
-      .run();
-    this.onRecorded?.(at);
+      .returning({ createdAt: usageRecords.createdAt })
+      .get();
+    // The day the row belongs to (a correction after midnight checks the day of the call — #251 r4).
+    this.onRecorded?.(row?.createdAt ?? at);
   }
 
   /**
@@ -200,9 +211,25 @@ export class UsageStore {
     runId: string;
     callId: string;
     model: string;
-    estimateUsd: number;
+    /** The bound in USD (rounded up to micro-USD here), or — #248 — already as integer micro-USD. */
+    estimateUsd?: number;
+    estimateMicros?: number;
+    /**
+     * #248: `pending_send` — a speech piece reserved ahead of its request (`sendingMedia` turns it `reserved` right
+     * before the request). Default `reserved` (the request follows at once).
+     */
+    state?: "pending_send" | "reserved";
+    /**
+     * The moment of the reservation — the one the caller checked the budget at (#251 r2: the row counts for the
+     * day that was checked, even when midnight passes before the insert). Default: now.
+     */
+    at?: number;
   }): void {
-    const at = this.now();
+    const micros =
+      m.estimateMicros !== undefined ? m.estimateMicros : Math.ceil((m.estimateUsd ?? NaN) * 1_000_000);
+    if (!Number.isSafeInteger(micros) || micros < 0) throw new Error("bad estimate");
+    const at = m.at ?? this.mediaNow();
+    const unsent = m.state === "pending_send";
     this.db
       .insert(usageRecords)
       .values({
@@ -218,18 +245,40 @@ export class UsageStore {
         authType: "api_key",
         priceVersion: null,
         pricedCostMicros: null,
-        estimatedCostMicros: Math.ceil(m.estimateUsd * 1_000_000),
-        mediaSettlement: "reserved",
+        estimatedCostMicros: micros,
+        mediaSettlement: m.state ?? "reserved",
         mediaSettleTries: 0,
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
         cacheWriteTokens: null,
         costUsd: null,
-        requestCount: 1,
+        // A piece not sent yet is no request (yet): counted when `sendingMedia` marks it sent (#251 r2).
+        requestCount: unsent ? 0 : 1,
         updatedAt: at,
       })
       .run();
+  }
+
+  /**
+   * #248: a reserved speech piece whose request goes out now (`pending_send` → `reserved`, and now one request).
+   * Its day does not change: a call's costs count for the day it started (#251 r3). False when there is no such
+   * unsent row (nothing may be sent then).
+   */
+  sendingMedia(runKey: string): boolean {
+    return (
+      this.db
+        .update(usageRecords)
+        .set({ mediaSettlement: "reserved", requestCount: 1, updatedAt: this.mediaNow() })
+        .where(
+          and(
+            eq(usageRecords.runId, runKey),
+            eq(usageRecords.purpose, "media"),
+            eq(usageRecords.mediaSettlement, "pending_send"),
+          ),
+        )
+        .run().changes === 1
+    );
   }
 
   /**
@@ -246,7 +295,7 @@ export class UsageStore {
         costUsd: usd,
         pricedCostMicros: Math.round(usd * 1_000_000),
         mediaSettlement: "settled",
-        updatedAt: this.now(),
+        updatedAt: this.mediaNow(),
       })
       .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
       .returning({ createdAt: usageRecords.createdAt })
@@ -264,7 +313,7 @@ export class UsageStore {
       .set({
         mediaGenerationId: generationId,
         mediaSettlement: generationId ? "awaiting_cost" : "unconfirmed",
-        updatedAt: this.now(),
+        updatedAt: this.mediaNow(),
       })
       .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
       .run();
@@ -274,7 +323,7 @@ export class UsageStore {
   unconfirmMedia(runKey: string): void {
     this.db
       .update(usageRecords)
-      .set({ mediaSettlement: "unconfirmed", updatedAt: this.now() })
+      .set({ mediaSettlement: "unconfirmed", updatedAt: this.mediaNow() })
       .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
       .run();
   }
@@ -283,7 +332,7 @@ export class UsageStore {
   triedMedia(runKey: string, tries: number): void {
     this.db
       .update(usageRecords)
-      .set({ mediaSettleTries: tries, updatedAt: this.now() })
+      .set({ mediaSettleTries: tries, updatedAt: this.mediaNow() })
       .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
       .run();
   }
@@ -295,7 +344,7 @@ export class UsageStore {
   generationMedia(runKey: string, generationId: string): void {
     this.db
       .update(usageRecords)
-      .set({ mediaGenerationId: generationId, updatedAt: this.now() })
+      .set({ mediaGenerationId: generationId, updatedAt: this.mediaNow() })
       .where(
         and(
           eq(usageRecords.runId, runKey),
@@ -310,10 +359,11 @@ export class UsageStore {
    * At start, before the server takes any request (#238 review r4): **every** `reserved` row is a previous
    * process's — one server holds the data folder's lock (storage/data-lock.ts), and no media call of this process
    * has started yet — so no clock is compared. With a generation id it waits for its cost (`awaiting_cost`), without
-   * one it is `unconfirmed` (its reserved amount stays). One transaction: both moves, or none. Returns the count.
+   * one it is `unconfirmed` (its reserved amount stays). A `pending_send` row (#248: a speech piece whose request
+   * was never sent) is removed — it cost nothing. One transaction: all of it, or none. Returns the count.
    */
   recoverReservedMedia(o: { noWait?: boolean } = {}): number {
-    const at = this.now();
+    const at = this.mediaNow();
     const reserved = and(eq(usageRecords.purpose, "media"), eq(usageRecords.mediaSettlement, "reserved"));
     const sqlite = this.db.$client;
     const move = sqlite.transaction(() => {
@@ -327,7 +377,11 @@ export class UsageStore {
         .set({ mediaSettlement: "unconfirmed", updatedAt: at })
         .where(and(reserved, isNull(usageRecords.mediaGenerationId)))
         .run().changes;
-      return a + b;
+      const c = this.db
+        .delete(usageRecords)
+        .where(and(eq(usageRecords.purpose, "media"), eq(usageRecords.mediaSettlement, "pending_send")))
+        .run().changes;
+      return a + b + c;
     });
     // BEGIN IMMEDIATE: the write lock is taken first. `noWait` (a background retry, review r6): with the busy
     // handler off for this one statement, a lock held elsewhere is SQLITE_BUSY at once — the event loop never
