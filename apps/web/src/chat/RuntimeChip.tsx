@@ -36,7 +36,10 @@ export function RuntimeChip(props: {
     const onKey = (e: globalThis.KeyboardEvent) => {
       if (e.key !== "Escape") return;
       setOpen(false);
-      document.getElementById("runtime-chip")?.focus();
+      // Back to the chip, in view: the form it sits in may have been scrolled away from it meanwhile (#247 review).
+      const chip = document.getElementById("runtime-chip");
+      chip?.focus();
+      chip?.scrollIntoView({ block: "nearest", inline: "nearest" });
     };
     document.addEventListener("pointerdown", onDown);
     document.addEventListener("keydown", onKey);
