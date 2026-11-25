@@ -35,10 +35,13 @@ import {
   resplitSpeech,
   SPEECH_SPLIT,
   speechSeconds,
+  splitSpans,
   splitSpeech,
   type SpeechSplitLimits,
 } from "../src/media/speech-split.js";
-import { codexRunConfig } from "../src/runtime/lockdown.js";
+import { codexRunConfig, speechCallBudgetMs } from "../src/runtime/lockdown.js";
+import { boundMicros, speechCostBound } from "../src/media/cost.js";
+import { knownSecrets } from "../src/secrets/known.js";
 import { RuntimeRegistry } from "../src/runtime/adapter.js";
 import { FakeRuntime } from "../src/runtime/fake.js";
 import { storagePaths } from "../src/storage/paths.js";
@@ -166,6 +169,8 @@ async function start(
     answer?: Parameters<typeof fakeOpenRouter>[0];
     audio?: "fake" | "none" | SpeechAudio;
     settings?: Partial<MediaSettings>;
+    split?: SpeechSplitLimits;
+    now?: () => number;
   } = {},
 ) {
   const dataDir = path.join(tmp(), "data");
@@ -186,7 +191,14 @@ async function start(
       db,
       runtimes: registry,
       runs: { flushMs: 0 },
-      media: { fetchImpl: or.fetchImpl, sleep: async () => {}, speechAudio: () => audio, split: LIMITS },
+      ...(o.now ? { usage: { now: o.now } } : {}),
+      media: {
+        fetchImpl: or.fetchImpl,
+        sleep: async () => {},
+        speechAudio: () => audio,
+        split: o.split ?? LIMITS,
+        ...(o.now ? { now: o.now } : {}),
+      },
     },
   );
   closers.push(() => app.close());
@@ -214,9 +226,10 @@ async function start(
   const rows = () =>
     db.$client
       .prepare(
-        "SELECT run_id, cost_usd, estimated_cost_micros, media_generation_id, media_settlement FROM usage_records WHERE purpose = 'media' ORDER BY id",
+        "SELECT run_id, cost_usd, estimated_cost_micros, media_generation_id, media_settlement, created_at FROM usage_records WHERE purpose = 'media' ORDER BY id",
       )
       .all() as {
+      created_at: number;
       run_id: string;
       cost_usd: number | null;
       estimated_cost_micros: number | null;
@@ -224,7 +237,7 @@ async function start(
       media_settlement: string;
     }[];
   const files = () => app.files!.list(conv.id);
-  const speak = (input: Record<string, unknown>, opts?: { alive?: () => boolean }) =>
+  const speak = (input: Record<string, unknown>, opts?: { alive?: () => boolean; signal?: AbortSignal }) =>
     app.media!.tools.run("speech", scope, input, opts);
   const scratch = () => {
     try {
@@ -333,9 +346,13 @@ describe("speech_generate: long scripts through the tool (#248)", () => {
       mcp: { url: "http://127.0.0.1:4000/mcp", token: "t" },
     }).join("\n");
     const sec = Number(/tool_timeout_sec = (\d+)/.exec(toml)![1]);
-    expect(sec * 1000).toBeGreaterThan(
-      MEDIA_TOOL_LIMITS.speechCallTimeoutMs + MEDIA_TOOL_LIMITS.speechTimeoutMs,
+    // The whole call: its budget, the last piece and its measurement, two joins (the second re-encodes a result
+    // over 50MB), the final measurement, the cost lookups — all from the limits the server enforces.
+    const l = MEDIA_TOOL_LIMITS;
+    expect(speechCallBudgetMs()).toBeGreaterThanOrEqual(
+      l.speechCallTimeoutMs + l.speechTimeoutMs + 2 * l.speechJoinTimeoutMs + 2 * l.speechProbeTimeoutMs,
     );
+    expect(sec * 1000).toBeGreaterThanOrEqual(speechCallBudgetMs());
   });
 
   it("short text: one request with the text as is, measured, one row, one file", async () => {
@@ -488,11 +505,14 @@ describe("speech_generate: long scripts through the tool (#248)", () => {
     const pieces = splitSpeech(LONG, LIMITS);
     const call = t.speak({ text: LONG });
     await vi.waitFor(() => expect(t.posts).toHaveLength(1));
-    // Every piece's own row, reserved with its own bound, before the first answer came.
+    // Every piece's own row with its own bound, before the first answer came: the one sent `reserved`, the rest
+    // `pending_send` (never billed).
     expect(t.rows()).toHaveLength(pieces.length);
-    expect(t.rows().every((x) => x.media_settlement === "reserved" && x.estimated_cost_micros! > 0)).toBe(
-      true,
-    );
+    expect(t.rows().map((x) => x.media_settlement)).toEqual([
+      "reserved",
+      ...pieces.slice(1).map(() => "pending_send"),
+    ]);
+    expect(t.rows().every((x) => x.estimated_cost_micros! > 0)).toBe(true);
     const pending = t.app.media!.budget.remaining(t.f.users.owner.id).pendingUsd;
     expect(pending).toBeCloseTo(t.rows().reduce((a, x) => a + x.estimated_cost_micros!, 0) / 1_000_000, 6);
     release();
@@ -613,6 +633,311 @@ describe("speech_generate: long scripts through the tool (#248)", () => {
     expect(speechTools(undefined, "/data", "linux")).toBeUndefined();
     expect(speechTools("/nope/ffmpeg", "/data", "darwin")).toBeUndefined();
     expect(sandboxedSpeechAudio({ dataDir: "/data", platform: "linux" })).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------- review round 1 (#251)
+
+/** The fixture speech model's price lines (its bound: input bytes × $0.000015 × 1.2). */
+const FIXTURE_ENDPOINTS = [
+  { provider_name: "Fixture", tag: "fixture", pricing: { prompt: "0.000015", completion: "0" } },
+];
+const microsOf = (text: string) => boundMicros(speechCostBound(FIXTURE_ENDPOINTS, { text })!);
+
+describe("speech_generate: review round 1 regressions (#251)", () => {
+  it("P2: a restart with pieces never sent removes their rows; only the sent one keeps its bound", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    const t = await start({
+      answer: async (input, n) => {
+        if (n === 0) await gate;
+        return fakeMp3(speechSeconds(input, LIMITS.typical));
+      },
+    });
+    const pieces = splitSpeech(LONG, LIMITS);
+    const call = t.speak({ text: LONG });
+    await vi.waitFor(() => expect(t.posts).toHaveLength(1));
+    // The start-up recovery as a new process runs it (this process "stopped" while the first piece was out).
+    expect(t.app.usageStore!.recoverReservedMedia()).toBe(pieces.length);
+    expect(t.rows()).toEqual([expect.objectContaining({ media_settlement: "unconfirmed" })]);
+    expect(t.app.media!.budget.remaining(t.f.users.owner.id).pendingUsd).toBeCloseTo(
+      t.rows()[0]!.estimated_cost_micros! / 1_000_000,
+      6,
+    );
+    // The call that was "lost" goes on: its next piece has no unsent row any more — nothing more is sent.
+    release();
+    expect(await call).toMatchObject({ ok: false, code: "media_failed" });
+    expect(t.posts).toHaveLength(1);
+    expect(t.rows()).toHaveLength(1);
+    expect(t.files()).toEqual([]);
+  });
+
+  it("P2: past midnight a piece is checked against the new day's budget and counted there", async () => {
+    // 23:59:59 in Seoul; the first answer comes at 00:00:01 the next day.
+    const before = Date.parse("2026-11-25T14:59:59.000Z");
+    const after = Date.parse("2026-11-25T15:00:01.000Z");
+    let clock = before;
+    const t = await start({
+      now: () => clock,
+      answer: (input, n) => {
+        if (n === 0) clock = after;
+        return fakeMp3(speechSeconds(input, LIMITS.typical));
+      },
+    });
+    const r = await t.speak({ text: LONG });
+    expect(r.ok).toBe(true);
+    const rows = t.rows();
+    expect(rows[0]!.created_at).toBe(before);
+    expect(rows.slice(1).every((x) => x.created_at === after)).toBe(true);
+
+    // The new day already spent up to the limit: the next piece is not sent.
+    clock = after;
+    const t2 = await start({
+      now: () => clock,
+      answer: (input, n) => {
+        if (n === 0) clock = after;
+        return fakeMp3(speechSeconds(input, LIMITS.typical));
+      },
+    });
+    t2.app.usageStore!.recordMedia({
+      userId: t2.f.users.owner.id,
+      conversationId: t2.scope.conversationId,
+      runId: "next-day",
+      callId: "c1",
+      model: "fixture/voice-one",
+      costUsd: 49.9999,
+    });
+    clock = before;
+    const r2 = await t2.speak({ text: LONG });
+    expect(r2).toMatchObject({ ok: false, code: "media_budget" });
+    expect(t2.posts).toHaveLength(1);
+    expect(t2.files()).toEqual([]);
+    // The next day's spend and the earlier day's piece (paid); no reservation left.
+    expect(t2.rows().map((x) => x.cost_usd)).toEqual([49.9999, PIECE_COST]);
+    expect(t2.app.media!.budget.remaining(t2.f.users.owner.id, after).pendingUsd).toBe(0);
+    expect(t2.app.media!.budget.remaining(t2.f.users.owner.id, before).pendingUsd).toBe(0);
+  });
+
+  it("P2: the up-front check sums exactly the integer micro-USD the rows hold", async () => {
+    const pieces = splitSpeech(LONG, LIMITS);
+    const each = pieces.map(microsOf);
+    const headroom = Math.max(
+      ...pieces.map((p) => resplitSpeech(p, LIMITS).reduce((a, q) => a + microsOf(q), 0)),
+    );
+    const need = each.reduce((a, b) => a + b, 0) + headroom;
+    const spend = async (left: number) => {
+      const t = await start();
+      t.app.usageStore!.recordMedia({
+        userId: t.f.users.owner.id,
+        conversationId: t.scope.conversationId,
+        runId: "earlier",
+        callId: "c1",
+        model: "fixture/voice-one",
+        costUsd: (50_000_000 - left) / 1_000_000,
+      });
+      expect(Math.round(t.app.media!.budget.remaining(t.f.users.owner.id).remainingUsd * 1_000_000)).toBe(
+        left,
+      );
+      return t;
+    };
+    // Exactly what is needed is left: it goes, and every row holds its piece's integer bound.
+    const ok = await spend(need);
+    expect((await ok.speak({ text: LONG })).ok).toBe(true);
+    expect(
+      ok
+        .rows()
+        .filter((x) => !x.run_id.startsWith("earlier"))
+        .map((x) => x.estimated_cost_micros),
+    ).toEqual(each);
+    // One micro-USD less: refused before any request.
+    const short = await spend(need - 1);
+    expect(await short.speak({ text: LONG })).toMatchObject({ ok: false, code: "media_budget" });
+    expect(short.posts).toEqual([]);
+  });
+
+  it("P2: a secret registered during the call blocks the next piece carrying it (never sent)", async () => {
+    const secret = "zqSYNTHETIC7Xk2Lp9Wm4split251";
+    const text = `${SENTENCES.slice(0, 4).join(" ")}\n\n${SENTENCES[4]} 암호는 ${secret} 이에요. ${SENTENCES[5]}`;
+    const pieces = splitSpeech(text, LIMITS);
+    expect(pieces[0]).not.toContain(secret);
+    expect(pieces.some((p) => p.includes(secret))).toBe(true);
+    const t = await start({
+      answer: (input, n) => {
+        if (n === 0) knownSecrets.add(secret, { fresh: true });
+        return fakeMp3(speechSeconds(input, LIMITS.typical));
+      },
+    });
+    expect(await t.speak({ text })).toMatchObject({ ok: false, code: "media_secret_blocked" });
+    expect(t.posts.every((p) => !p.input.includes(secret))).toBe(true);
+    expect(t.files()).toEqual([]);
+    // Only the pieces sent keep a row; the blocked one and the rest are released.
+    expect(t.rows()).toHaveLength(t.posts.length);
+    expect(t.app.media!.budget.remaining(t.f.users.owner.id).pendingUsd).toBe(0);
+  });
+
+  it("P2: a retry that would pass the call's cap on paid requests is not made", async () => {
+    const pieces = splitSpeech(LONG, LIMITS);
+    // The cap: the first split's pieces and nothing more.
+    const t = await start({
+      split: { ...LIMITS, maxRequests: pieces.length },
+      answer: (input, n) => fakeMp3(n === 0 ? 14.5 : speechSeconds(input, LIMITS.typical)),
+    });
+    const r = await t.speak({ text: LONG });
+    expect(r).toMatchObject({ ok: false, code: "media_truncated" });
+    expect(!r.ok && r.hint).toMatch(/요청 수를 넘어/);
+    expect(!r.ok && r.hint).toMatch(/이미 나간 비용은 기록/);
+    expect(t.posts).toHaveLength(1);
+    expect(t.rows()).toEqual([expect.objectContaining({ cost_usd: PIECE_COST })]);
+    // With room for the retry it goes through.
+    const t2 = await start({
+      split: { ...LIMITS, maxRequests: pieces.length + resplitSpeech(pieces[0]!, LIMITS).length },
+      answer: (input, n) => fakeMp3(n === 0 ? 14.5 : speechSeconds(input, LIMITS.typical)),
+    });
+    expect((await t2.speak({ text: LONG })).ok).toBe(true);
+    expect(SPEECH_SPLIT.maxRequests).toBeGreaterThan(SPEECH_SPLIT.maxPieces);
+  });
+
+  it("P3: a run stopped through the MCP tool aborts the join under way (media_cancelled)", async () => {
+    let dataDir = "";
+    let joining!: () => void;
+    const inJoin = new Promise<void>((res) => (joining = res));
+    let aborted = false;
+    const fake = fakeAudio(() => dataDir);
+    const slowJoin: SpeechAudio = {
+      workdir: () => makeSpeechWorkdir(dataDir),
+      probe: fake.audio.probe,
+      join: (_job, signal) =>
+        new Promise((res) => {
+          joining();
+          const done = () => res(undefined);
+          const abort = () => {
+            aborted = true;
+            done();
+          };
+          if (signal?.aborted) abort();
+          signal?.addEventListener("abort", abort);
+          setTimeout(done, 10_000).unref();
+        }),
+    };
+    const t = await start({ audio: slowJoin });
+    dataDir = t.dataDir;
+    const { url } = await t.app.mcp!.endpoint();
+    const token = t.app.runs!.mcpTokens.issue(t.scope);
+    const started = Date.now();
+    const call = fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "speech_generate", arguments: { text: LONG } },
+      }),
+    });
+    await inJoin;
+    t.app.runs!.mcpTokens.revokeRun(t.scope.runId);
+    const res = await call;
+    await res.text();
+    // The join was stopped by the revocation itself (not by its own time limit); the stopped run's call answers
+    // nothing to the model (its token is gone), stores nothing and leaves no working folder.
+    expect(aborted).toBe(true);
+    expect(Date.now() - started).toBeLessThan(8_000);
+    await vi.waitFor(() => expect(t.scratch()).toEqual([]));
+    expect(t.app.media!.budget.remaining(t.f.users.owner.id).pendingUsd).toBe(0);
+    expect(t.files()).toEqual([]);
+  });
+
+  it("P3: an aborted measurement or join is media_cancelled (generator signal)", async () => {
+    let dataDir = "";
+    const stop = new AbortController();
+    const fake = fakeAudio(() => dataDir);
+    const aborting: SpeechAudio = {
+      workdir: () => makeSpeechWorkdir(dataDir),
+      probe: fake.audio.probe,
+      async join() {
+        stop.abort();
+        return undefined;
+      },
+    };
+    const t = await start({ audio: aborting });
+    dataDir = t.dataDir;
+    expect(await t.speak({ text: LONG }, { signal: stop.signal })).toMatchObject({
+      ok: false,
+      code: "media_cancelled",
+    });
+  });
+
+  it("P1: the start-up sweep never follows a linked speech-scratch root or a link inside it", () => {
+    const data = tmp();
+    const outside = tmp();
+    fs.writeFileSync(path.join(outside, "keep.txt"), "family data");
+    const victim = path.join(outside, "11111111-2222-4333-8444-555555555555");
+    fs.mkdirSync(victim);
+    fs.writeFileSync(path.join(victim, "keep.txt"), "x");
+    const root = storagePaths(data).speechScratch;
+    fs.symlinkSync(outside, root);
+    expect(sweepSpeechScratch(data)).toBe(false);
+    expect(fs.existsSync(path.join(outside, "keep.txt"))).toBe(true);
+    expect(fs.existsSync(path.join(victim, "keep.txt"))).toBe(true);
+    expect(() => makeSpeechWorkdir(data)).toThrow();
+    // A real root: a link inside is removed as a link (its target stays); a folder not of ours is left.
+    fs.unlinkSync(root);
+    fs.mkdirSync(root, { mode: 0o700 });
+    fs.symlinkSync(victim, path.join(root, "22222222-2222-4333-8444-555555555555"));
+    fs.mkdirSync(path.join(root, "not-ours"));
+    const w = makeSpeechWorkdir(data);
+    fs.writeFileSync(path.join(w, "in", "piece-000.mp3"), "x");
+    expect(sweepSpeechScratch(data)).toBe(false);
+    expect(fs.readdirSync(root)).toEqual(["not-ours"]);
+    expect(fs.existsSync(path.join(victim, "keep.txt"))).toBe(true);
+    fs.rmdirSync(path.join(root, "not-ours"));
+    expect(sweepSpeechScratch(data)).toBe(true);
+    // A missing root is nothing to do.
+    expect(sweepSpeechScratch(tmp())).toBe(true);
+  });
+
+  it("P3: sentences typed without a space, grapheme-safe cuts, lossless spans", () => {
+    const glued = SENTENCES.join("");
+    const pieces = splitSpeech(glued, LIMITS);
+    expect(pieces.length).toBeGreaterThan(1);
+    // Every piece ends a sentence (the boundary without a space was found).
+    expect(pieces.every((p) => /[.!?]$/.test(p))).toBe(true);
+    // A decimal point is not a sentence end.
+    expect(splitSpans("값은 3.14입니다. ".repeat(20), LIMITS).every((sp) => sp.end > 0)).toBe(true);
+    for (const p of splitSpeech("값은 3.14입니다. ".repeat(20), LIMITS)) expect(p).not.toMatch(/^14/);
+    const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+    const whole = (text: string) => {
+      const spans = splitSpans(text, LIMITS);
+      // The spans cover the source exactly, in order: nothing lost, nothing repeated.
+      expect(spans[0]!.start).toBe(0);
+      expect(spans.at(-1)!.end).toBe(text.length);
+      for (let i = 1; i < spans.length; i++) expect(spans[i]!.start).toBe(spans[i - 1]!.end);
+      expect(spans.map((sp) => text.slice(sp.start, sp.end)).join("")).toBe(text);
+      // What is sent is each span with its edge whitespace trimmed (blank ones dropped).
+      if (spans.length > 1)
+        expect(splitSpeech(text, LIMITS)).toEqual(
+          spans.map((sp) => text.slice(sp.start, sp.end).trim()).filter(Boolean),
+        );
+      // Every cut is a grapheme boundary of the source.
+      const ends = new Set([...seg.segment(text)].map((g) => g.index + g.segment.length));
+      for (const sp of spans) expect(ends.has(sp.end)).toBe(true);
+      return spans;
+    };
+    // Combining accents (e + U+0301) and ZWJ family emoji, without any space or punctuation.
+    const accents = "é".repeat(300);
+    expect(whole(accents).length).toBeGreaterThan(1);
+    const family = "\u{1F468}‍\u{1F469}‍\u{1F467}".repeat(200);
+    expect(whole(family).length).toBeGreaterThan(1);
+    for (const p of splitSpeech(family, LIMITS)) {
+      expect(p.startsWith("‍")).toBe(false);
+      expect(p.endsWith("‍")).toBe(false);
+    }
+    whole(`  ${LONG}\n\n  ${glued}  `);
+    whole(SENTENCES.join("\n\n\n"));
   });
 });
 

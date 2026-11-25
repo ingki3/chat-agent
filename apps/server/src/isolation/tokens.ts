@@ -109,7 +109,9 @@ export class McpTokens {
   /** Called once when the run's tokens are revoked (#234: a PDF extraction of that run stops at once). */
   private readonly stopWatchers = new Map<string, Set<() => void>>();
   onRevoke(runId: string, fn: () => void): () => void {
-    if (this.revoked.has(runId)) {
+    // Revoked and not given a token again since: it is stopped now. (A run issued a token after a revocation —
+    // tests that reopen a run — is watched for its next revocation.)
+    if (this.revoked.has(runId) && !this.hasRun(runId)) {
       fn();
       return () => {};
     }

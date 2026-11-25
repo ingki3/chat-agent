@@ -200,8 +200,18 @@ export class UsageStore {
     runId: string;
     callId: string;
     model: string;
-    estimateUsd: number;
+    /** The bound in USD (rounded up to micro-USD here), or — #248 — already as integer micro-USD. */
+    estimateUsd?: number;
+    estimateMicros?: number;
+    /**
+     * #248: `pending_send` — a speech piece reserved ahead of its request (`sendingMedia` turns it `reserved` right
+     * before the request). Default `reserved` (the request follows at once).
+     */
+    state?: "pending_send" | "reserved";
   }): void {
+    const micros =
+      m.estimateMicros !== undefined ? m.estimateMicros : Math.ceil((m.estimateUsd ?? NaN) * 1_000_000);
+    if (!Number.isSafeInteger(micros) || micros < 0) throw new Error("bad estimate");
     const at = this.now();
     this.db
       .insert(usageRecords)
@@ -218,8 +228,8 @@ export class UsageStore {
         authType: "api_key",
         priceVersion: null,
         pricedCostMicros: null,
-        estimatedCostMicros: Math.ceil(m.estimateUsd * 1_000_000),
-        mediaSettlement: "reserved",
+        estimatedCostMicros: micros,
+        mediaSettlement: m.state ?? "reserved",
         mediaSettleTries: 0,
         inputTokens: null,
         outputTokens: null,
@@ -230,6 +240,32 @@ export class UsageStore {
         updatedAt: at,
       })
       .run();
+  }
+
+  /**
+   * #248: a reserved speech piece whose request goes out now (`pending_send` → `reserved`). `at` (when the service
+   * day changed since it was reserved): the row moves to that moment, so it counts for the day it is really sent.
+   * False when there is no such unsent row (nothing may be sent then).
+   */
+  sendingMedia(runKey: string, at?: number): boolean {
+    const now = this.now();
+    return (
+      this.db
+        .update(usageRecords)
+        .set({
+          mediaSettlement: "reserved",
+          updatedAt: now,
+          ...(at !== undefined ? { createdAt: at } : {}),
+        })
+        .where(
+          and(
+            eq(usageRecords.runId, runKey),
+            eq(usageRecords.purpose, "media"),
+            eq(usageRecords.mediaSettlement, "pending_send"),
+          ),
+        )
+        .run().changes === 1
+    );
   }
 
   /**
@@ -310,7 +346,8 @@ export class UsageStore {
    * At start, before the server takes any request (#238 review r4): **every** `reserved` row is a previous
    * process's — one server holds the data folder's lock (storage/data-lock.ts), and no media call of this process
    * has started yet — so no clock is compared. With a generation id it waits for its cost (`awaiting_cost`), without
-   * one it is `unconfirmed` (its reserved amount stays). One transaction: both moves, or none. Returns the count.
+   * one it is `unconfirmed` (its reserved amount stays). A `pending_send` row (#248: a speech piece whose request
+   * was never sent) is removed — it cost nothing. One transaction: all of it, or none. Returns the count.
    */
   recoverReservedMedia(o: { noWait?: boolean } = {}): number {
     const at = this.now();
@@ -327,7 +364,11 @@ export class UsageStore {
         .set({ mediaSettlement: "unconfirmed", updatedAt: at })
         .where(and(reserved, isNull(usageRecords.mediaGenerationId)))
         .run().changes;
-      return a + b;
+      const c = this.db
+        .delete(usageRecords)
+        .where(and(eq(usageRecords.purpose, "media"), eq(usageRecords.mediaSettlement, "pending_send")))
+        .run().changes;
+      return a + b + c;
     });
     // BEGIN IMMEDIATE: the write lock is taken first. `noWait` (a background retry, review r6): with the busy
     // handler off for this one statement, a lock held elsewhere is SQLITE_BUSY at once — the event loop never

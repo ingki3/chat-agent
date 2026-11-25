@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
-import { FILE_LIMITS } from "@agentlee/shared";
+import { FILE_LIMITS, MEDIA_TOOL_LIMITS } from "@agentlee/shared";
 import { ffmpegOf, type Ffmpeg } from "../audio/packages.js";
 import { runIsolated, type RunIsolatedOptions, type RunResult } from "../isolation/sandbox.js";
 import { removeTree } from "../python/service.js";
@@ -37,23 +37,49 @@ export type SpeechAudio = {
 };
 
 export const SPEECH_AUDIO_LIMITS = {
-  probeTimeoutMs: 20_000,
-  joinTimeoutMs: 180_000,
+  probeTimeoutMs: MEDIA_TOOL_LIMITS.speechProbeTimeoutMs,
+  joinTimeoutMs: MEDIA_TOOL_LIMITS.speechJoinTimeoutMs,
   memoryBytes: 1024 * 1024 * 1024,
 } as const;
 
+/**
+ * The `speech-scratch` folder, checked: a real folder (not a link) whose resolved path is exactly
+ * `<resolved DATA_DIR>/speech-scratch`. `missing` when it does not exist; `bad` for anything else (a link, a file,
+ * a folder that resolves elsewhere, an error reading it) — nothing below such a root is touched.
+ */
+function scratchRoot(dataDir: string): { ok: string } | "missing" | "bad" {
+  const root = storagePaths(dataDir).speechScratch;
+  let st: fs.Stats | undefined;
+  try {
+    st = fs.lstatSync(root, { throwIfNoEntry: false });
+  } catch {
+    return "bad";
+  }
+  if (!st) return "missing";
+  if (st.isSymbolicLink() || !st.isDirectory()) return "bad";
+  try {
+    const real = fs.realpathSync.native(root);
+    const want = path.join(fs.realpathSync.native(dataDir), path.basename(root));
+    return real === want ? { ok: real } : "bad";
+  } catch {
+    return "bad";
+  }
+}
+
+const WORKDIR_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 /** `speech-scratch/<uuid>` under the data folder (resolved, never a link), with `in/` and `out/`. */
 export function makeSpeechWorkdir(dataDir: string): string {
-  const root = storagePaths(dataDir).speechScratch;
-  let st = fs.lstatSync(root, { throwIfNoEntry: false });
-  if (!st) {
-    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-    st = fs.lstatSync(root);
+  let root = scratchRoot(dataDir);
+  if (root === "missing") {
+    fs.mkdirSync(storagePaths(dataDir).speechScratch, { recursive: true, mode: 0o700 });
+    root = scratchRoot(dataDir);
   }
-  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error("speech-scratch is not a folder");
-  const dir = path.join(root, crypto.randomUUID());
+  if (typeof root === "string") throw new Error("speech-scratch is not a folder of DATA_DIR");
+  const dir = path.join(root.ok, crypto.randomUUID());
   fs.mkdirSync(dir, { mode: 0o700 });
   const real = fs.realpathSync.native(dir);
+  if (real !== dir) throw new Error("speech working folder moved");
   fs.mkdirSync(path.join(real, "in"), { mode: 0o700 });
   fs.mkdirSync(path.join(real, "out"), { mode: 0o700 });
   return real;
@@ -61,17 +87,38 @@ export function makeSpeechWorkdir(dataDir: string): string {
 
 export const removeSpeechWorkdir = (dir: string): boolean => removeTree(dir);
 
-/** Removes the working folders an earlier process left (server start). Never throws. */
+/**
+ * Removes the working folders an earlier process left (server start). Only below a checked root
+ * (`scratchRoot`): a missing root is nothing to do (true); a root that is a link, resolves outside DATA_DIR or
+ * cannot be read is left alone (false — logged `media.sweep_failed`). Below it, only working folders
+ * (`<uuid>`, real folders) are removed whole; any other entry — a link included — is only unlinked itself, never
+ * followed. Never throws.
+ */
 export function sweepSpeechScratch(dataDir: string): boolean {
-  const root = storagePaths(dataDir).speechScratch;
+  const root = scratchRoot(dataDir);
+  if (root === "missing") return true;
+  if (root === "bad") return false;
   let names: string[];
   try {
-    names = fs.readdirSync(root);
+    names = fs.readdirSync(root.ok);
   } catch {
-    return true;
+    return false;
   }
   let ok = true;
-  for (const n of names) if (!removeTree(path.join(root, n))) ok = false;
+  for (const n of names) {
+    const p = path.join(root.ok, n);
+    try {
+      const st = fs.lstatSync(p);
+      if (st.isDirectory() && !st.isSymbolicLink() && WORKDIR_NAME.test(n)) {
+        if (!removeTree(p)) ok = false;
+      } else if (st.isDirectory() && !st.isSymbolicLink()) {
+        // Not one of ours: left for the operator.
+        ok = false;
+      } else fs.unlinkSync(p);
+    } catch {
+      ok = false;
+    }
+  }
   return ok;
 }
 

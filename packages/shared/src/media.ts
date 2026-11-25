@@ -208,6 +208,9 @@ export const MEDIA_TOOL_LIMITS = {
    * still finish (the runtimes' MCP tool timeout is set above all of it — runtime/lockdown.ts).
    */
   speechCallTimeoutMs: 30 * 60_000,
+  /** #248: one ffprobe measurement and one ffmpeg join (a join may run twice: re-encoded when over 50MB). */
+  speechProbeTimeoutMs: 20_000,
+  speechJoinTimeoutMs: 180_000,
   /** Tries of `GET /generation?id=` after a speech call (its record can lag a little), and the wait between. */
   costTries: 3,
   costWaitMs: 1500,

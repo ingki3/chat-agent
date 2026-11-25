@@ -46,7 +46,9 @@ type Row = UsageRow & { userName: string | null; connectionLabel: string | null 
 export const isPending = (r: Pick<UsageRow, "purpose" | "pricedCostMicros" | "mediaSettlement">): boolean =>
   r.purpose === "media" &&
   r.pricedCostMicros === null &&
-  (r.mediaSettlement === "reserved" || r.mediaSettlement === "awaiting_cost");
+  (r.mediaSettlement === "pending_send" ||
+    r.mediaSettlement === "reserved" ||
+    r.mediaSettlement === "awaiting_cost");
 
 export function emptyTotals(): UsageTotals {
   return {

@@ -22,7 +22,7 @@ import { carriesSecret } from "../secrets/egress.js";
 import { MIN_KNOWN_LENGTH, scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 import type { UsageStore } from "../usage/store.js";
 import type { MediaBudget } from "./budget.js";
-import { imageCostBound, MAX_IMAGE_PIXELS, speechCostBound } from "./cost.js";
+import { boundMicros, imageCostBound, MAX_IMAGE_PIXELS, speechCostBound } from "./cost.js";
 import type { OpenRouterKeys } from "./keys.js";
 import {
   GENERATION_ID,
@@ -90,10 +90,14 @@ import {
  * rate) — one piece for a text that fits, sent exactly as before. Every piece is its own generation with the same
  * model, voice, instructions and moderation, and its **own usage row** (its own call id and generation id, reserved,
  * settled and late-settled like any single call). Up front, in the one synchronous budget step: the sum of the
- * pieces' bounds **plus the largest one re-split** (the headroom of one retry) must fit, and every piece's row is
- * reserved. Pieces go one after another; each answer is measured (ffprobe, `speech-audio.ts`) and a piece that came
- * back cut (at the provider's mark, or far shorter than its estimate) is split smaller and tried once more — its
- * pieces are reserved (budget check again) just before they are sent; cut again is `media_truncated`. Then ffmpeg
+ * pieces' bounds **plus the largest one re-split** (the headroom of one retry) must fit — all in integer micro-USD,
+ * the same integers the rows hold — and every piece's row is reserved as `pending_send` (never billed: the start-up
+ * recovery removes such rows). Pieces go one after another. Right before each request, synchronously: its fields
+ * pass the egress check again (a secret registered meanwhile), a new service day (past midnight) must still have the
+ * piece's bound left (the row moves to that day), and the row becomes `reserved` (sent). Each answer is measured
+ * (ffprobe, `speech-audio.ts`) and a piece that came back cut (at the provider's mark, or far shorter than its
+ * estimate) is split smaller and tried once more — within the call's cap on paid requests, its pieces reserved
+ * (budget check again) just before they are sent; cut again is `media_truncated`. Then ffmpeg
  * joins the pieces into one MP3 (stream copy; re-encoded when their streams differ, or at a lower rate when the
  * result passes 50MB), its length is checked against the pieces' sum, and it is stored as one file. Any stop on
  * the way (a failed or refused piece, cancel, a settings change, the call's time budget) stores nothing: the pieces
@@ -106,7 +110,7 @@ export type MediaGeneratorOptions = {
   files: () => FileStore | undefined;
   keys: Pick<OpenRouterKeys, "resolve">;
   settings: Pick<MediaSettingsStore, "get" | "revision">;
-  budget: Pick<MediaBudget, "allows">;
+  budget: Pick<MediaBudget, "allows" | "allowsMicros" | "dayOf">;
   usage:
     | Pick<
         UsageStore,
@@ -116,6 +120,7 @@ export type MediaGeneratorOptions = {
         | "answeredMedia"
         | "unconfirmMedia"
         | "generationMedia"
+        | "sendingMedia"
       >
     | undefined;
   /**
@@ -398,7 +403,7 @@ export class MediaGenerator {
       if (!alive()) throw new MediaToolError("media_cancelled");
       if (kind === "speech") {
         // The budget check and every piece's reserving row in one synchronous step (#248).
-        const pieces = this.reserve(ctx, plan.pieces!, plan.bound);
+        const pieces = this.reserve(ctx, plan.pieces!, plan.checkMicros!);
         return await this.speech(ctx, plan, pieces);
       }
       // The budget check and the reserving row in one synchronous step.
@@ -421,26 +426,55 @@ export class MediaGenerator {
   }
 
   /**
-   * Speech pieces' reservations (#248), synchronous: the budget must allow `check` (the pieces' bounds, plus the
-   * headroom asked for), then every piece gets its reserving row. A row that cannot be written undoes the ones
-   * written (nothing is sent).
+   * Speech pieces' reservations (#248), synchronous: the budget must allow `checkMicros` (the pieces' bounds, plus
+   * the headroom asked for — integer micro-USD, the same integers the rows get), then every piece gets its
+   * reserving row, `pending_send` until its request goes out. A row that cannot be written undoes the ones written
+   * (nothing is sent).
    */
-  private reserve(ctx: CallCtx, pieces: readonly PlannedPiece[], check: number): Piece[] {
-    if (!this.o.budget.allows(ctx.scope.userId, check)) throw new MediaToolError("media_budget");
+  private reserve(ctx: CallCtx, pieces: readonly PlannedPiece[], checkMicros: number): Piece[] {
+    const at = this.now();
+    if (!this.o.budget.allowsMicros(ctx.scope.userId, checkMicros, at))
+      throw new MediaToolError("media_budget");
+    const day = this.o.budget.dayOf(at);
     const out: Piece[] = [];
     for (const p of pieces) {
       const callId = crypto.randomUUID();
       if (
         !this.write(ctx, "reserve", () =>
-          this.o.usage?.reserveMedia({ ...this.row(ctx, callId), estimateUsd: p.bound }),
+          this.o.usage?.reserveMedia({
+            ...this.row(ctx, callId),
+            estimateMicros: p.micros,
+            state: "pending_send",
+          }),
         )
       ) {
         for (const r of out) this.release(ctx, r.callId);
         throw new MediaToolError("media_failed");
       }
-      out.push({ ...p, callId });
+      out.push({ ...p, callId, day });
     }
     return out;
+  }
+
+  /**
+   * Right before a piece's request (#248), synchronous: its fields pass the egress check again (a secret may have
+   * been registered since the call started); if the service day changed since it was reserved, the new day's budget
+   * must still hold its bound and the row moves to now; then the row is `reserved` (sent). Throws — the row still
+   * unsent, released by the caller — when any of it fails.
+   */
+  private sending(ctx: CallCtx, plan: Plan, p: Piece): void {
+    if (this.secret([p.text, ...(plan.sentTexts ?? [])])) throw new MediaToolError("media_secret_blocked");
+    const at = this.now();
+    const today = this.o.budget.dayOf(at);
+    const moved = today !== p.day;
+    if (moved && !this.o.budget.allowsMicros(ctx.scope.userId, p.micros, at))
+      throw new MediaToolError("media_budget");
+    let ok = true;
+    const wrote = this.write(ctx, "reserve", () => {
+      ok = this.o.usage?.sendingMedia(mediaRunKey(ctx.scope.runId, p.callId), moved ? at : undefined) ?? true;
+    });
+    if (!wrote || !ok) throw new MediaToolError("media_failed");
+    p.day = today;
   }
 
   /** A reserving row whose request was never sent goes (it never cost anything). */
@@ -711,21 +745,25 @@ export class MediaGenerator {
       ...(input.instructions ? { instructions: input.instructions } : {}),
       ...(moderation ? { moderation } : {}),
     });
-    const boundOf = (text: string) => speechCostBound(endpoints, { text, instructions: input.instructions });
-    const pieces = texts.map((text) => ({ text, bound: boundOf(text) }));
+    // Every bound as the integer micro-USD its row will hold: the check sums exactly what is reserved (#248).
+    const microsOf = (text: string) => {
+      const b = speechCostBound(endpoints, { text, instructions: input.instructions });
+      return b === null ? null : boundMicros(b);
+    };
+    const pieces = texts.map((text) => ({ text, micros: microsOf(text) }));
     // The headroom of one retry: the largest piece's bound when split smaller (its pieces' bounds summed).
     let headroom = 0;
-    let bound: number | null = 0;
+    let total: number | null = 0;
     for (const p of pieces) {
-      if (p.bound === null || bound === null) {
-        bound = null;
+      if (p.micros === null || total === null) {
+        total = null;
         break;
       }
-      bound += p.bound;
+      total += p.micros;
       if (!ctx.audio) continue;
-      const again = resplitSpeech(p.text, this.split).map(boundOf);
+      const again = resplitSpeech(p.text, this.split).map(microsOf);
       if (again.some((b) => b === null)) {
-        bound = null;
+        total = null;
         break;
       }
       headroom = Math.max(
@@ -733,6 +771,7 @@ export class MediaGenerator {
         (again as number[]).reduce((a, b) => a + b, 0),
       );
     }
+    const check = total === null ? null : total + headroom;
     return {
       body,
       voice,
@@ -744,9 +783,12 @@ export class MediaGenerator {
         input.instructions ?? "",
         moderation ?? "",
       ],
-      bound: bound === null ? null : bound + headroom,
-      pieces: bound === null ? [] : (pieces as PlannedPiece[]),
-      boundOf: (text) => boundOf(text),
+      bound: check === null ? null : check / 1_000_000,
+      checkMicros: check ?? undefined,
+      pieces: check === null ? [] : (pieces as PlannedPiece[]),
+      microsOf,
+      // What each piece's request carries besides its text (checked again before every request).
+      sentTexts: [OPENROUTER_SPEECH_URL, ctx.model, voice ?? "", input.instructions ?? "", moderation ?? ""],
     };
   }
 
@@ -919,6 +961,8 @@ export class MediaGenerator {
         }
         const left = FILE_LIMITS.bytes - bytesSoFar;
         if (left <= 0) throw new MediaToolError("media_failed");
+        // Synchronously from here to the request: egress check, a new day's budget, the row marked sent.
+        this.sending(ctx, plan, p);
         unsent.delete(p.callId);
         const r = await this.piece(ctx, p, plan.body, left);
         costs.push(r.cost);
@@ -933,19 +977,22 @@ export class MediaGenerator {
         const file = path.join(workdir, "in", `piece-${String(n++).padStart(3, "0")}.mp3`);
         fs.writeFileSync(file, r.bytes, { flag: "wx", mode: 0o600 });
         const info = await audio.probe(file, ctx.signal);
-        if (!info) throw new MediaToolError("media_failed");
+        if (!info) throw this.stopped(ctx) ?? new MediaToolError("media_failed");
         if (looksCut(p.text, info.seconds, this.split)) {
           // Cut by the provider: smaller pieces, once (their rows reserved — and the budget checked — first).
           fs.rmSync(file, { force: true });
           const parts = p.retry ? [] : resplitSpeech(p.text, this.split);
           if (!parts.length) throw new MediaToolError("media_truncated");
           if (!ctx.alive()) throw new MediaToolError("media_cancelled");
-          const bounds = parts.map((t) => plan.boundOf!(t));
-          if (bounds.some((b) => b === null)) throw new MediaToolError("media_no_price");
+          // The call's cap on paid requests, the retry included (the ones made, the ones queued, these).
+          if (costs.length + queue.length + parts.length > this.split.maxRequests)
+            throw new MediaToolError("media_truncated", TOO_MANY_REQUESTS);
+          const micros = parts.map((t) => plan.microsOf!(t));
+          if (micros.some((b) => b === null)) throw new MediaToolError("media_no_price");
           const again = this.reserve(
             ctx,
-            parts.map((text, i) => ({ text, bound: bounds[i]! })),
-            (bounds as number[]).reduce((a, b) => a + b, 0),
+            parts.map((text, i) => ({ text, micros: micros[i]! })),
+            (micros as number[]).reduce((a, b) => a + b, 0),
           );
           for (const a of again) unsent.add(a.callId);
           queue.unshift(...again.map((a) => ({ ...a, retry: true })));
@@ -975,6 +1022,11 @@ export class MediaGenerator {
       await Promise.all(costs.map((c) => c.catch(() => null)));
       if (workdir) removeSpeechWorkdir(workdir);
     }
+  }
+
+  /** `media_cancelled` when the call was stopped (a measurement or join killed with it); else undefined. */
+  private stopped(ctx: CallCtx): MediaToolError | undefined {
+    return ctx.signal?.aborted || !ctx.alive() ? new MediaToolError("media_cancelled") : undefined;
   }
 
   /**
@@ -1015,10 +1067,11 @@ export class MediaGenerator {
         { workdir, files, reencode: { bitrateK: 64, sampleRate: head.sampleRate, channels: 1 } },
         ctx.signal,
       );
-    if (!out || !size(out) || size(out) > FILE_LIMITS.bytes) throw new MediaToolError("media_failed");
+    if (!out || !size(out) || size(out) > FILE_LIMITS.bytes)
+      throw this.stopped(ctx) ?? new MediaToolError("media_failed");
     const info = await audio.probe(out, ctx.signal);
-    if (!info || Math.abs(info.seconds - want) > 1 + 0.25 * made.length)
-      throw new MediaToolError("media_failed");
+    if (!info) throw this.stopped(ctx) ?? new MediaToolError("media_failed");
+    if (Math.abs(info.seconds - want) > 1 + 0.25 * made.length) throw new MediaToolError("media_failed");
     const bytes = fs.readFileSync(out);
     if (!isMp3(bytes)) throw new MediaToolError("media_failed");
     return { bytes, seconds: round(info.seconds) };
@@ -1104,14 +1157,26 @@ type Plan = {
   /** The call's cost upper bound (USD); null = none can be given (the call is refused). */
   bound: number | null;
   voice?: string | undefined;
-  /** Speech (#248): the pieces of the text with their bounds (`bound` is their sum plus one retry's headroom). */
+  /** Speech (#248): the pieces of the text with their bounds. */
   pieces?: PlannedPiece[];
-  /** Speech: a piece's bound (a retry's smaller pieces). */
-  boundOf?: (text: string) => number | null;
+  /** Speech: what the budget must allow up front — the pieces' bounds plus one retry's headroom (micro-USD). */
+  checkMicros?: number | undefined;
+  /** Speech: a piece's bound in micro-USD (a retry's smaller pieces). */
+  microsOf?: (text: string) => number | null;
+  /** Speech: every text a piece's request carries besides its own text (the egress check before each request). */
+  sentTexts?: string[];
 };
-type PlannedPiece = { text: string; bound: number };
-/** A reserved piece: its own call id (usage row). `retry`: already a smaller piece of one that came back cut. */
-type Piece = PlannedPiece & { callId: string; retry?: boolean };
+/** A piece of a speech text and its bound as the integer micro-USD its row holds. */
+type PlannedPiece = { text: string; micros: number };
+/**
+ * A reserved piece: its own call id (usage row) and the service day its row counts for. `retry`: already a smaller
+ * piece of one that came back cut.
+ */
+type Piece = PlannedPiece & { callId: string; day: number; retry?: boolean };
+
+/** #248: a retry that would pass the call's cap on paid requests. */
+const TOO_MANY_REQUESTS =
+  "음성 조각이 제공자 쪽에서 끊겨 다시 나누면 한 번의 호출에서 보낼 수 있는 요청 수를 넘어 멈췄어요. 파일은 저장하지 않았고, 이미 나간 비용은 기록됐어요. 글을 몇 부분으로 나눠 따로 요청해 주세요.";
 /** A piece's answer: its bytes, and (measured) its file in the working folder and its stream. */
 type Made = { bytes: Buffer; file?: string; info?: Mp3Info };
 

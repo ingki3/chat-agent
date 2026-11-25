@@ -19,6 +19,11 @@ export const MAX_IMAGE_MEGAPIXELS = MAX_IMAGE_PIXELS / 1_000_000;
 export const SPEECH_SECONDS_PER_CHAR = 0.5;
 export const SPEECH_EXTRA_SECONDS = 30;
 export const AUDIO_TOKENS_PER_SECOND = 50;
+/**
+ * A bound as the integer micro-USD a reserving row holds (rounded up once). #248: a speech call's pieces are summed,
+ * checked against the budget and written in these same integers.
+ */
+export const boundMicros = (usd: number): number => Math.ceil(usd * 1_000_000);
 /** Text tokens never outnumber UTF-8 bytes (byte-level tokenizers); a per-character price is bounded the same. */
 const utf8 = (s: string) => Buffer.byteLength(s, "utf8");
 

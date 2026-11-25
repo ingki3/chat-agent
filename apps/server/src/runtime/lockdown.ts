@@ -7,6 +7,19 @@ import { IMAGE_GENERATE_TOOL, SPEECH_GENERATE_TOOL } from "@agentlee/mcp-tools/m
 import { YOUTUBE_AUDIO_TOOL } from "@agentlee/mcp-tools/youtube";
 import { AUDIO_LIMITS, MEDIA_TOOL_LIMITS, YOUTUBE_LIMITS } from "@agentlee/shared";
 
+/** The longest a `speech_generate` call may take (#248), from the limits the server itself enforces. */
+export function speechCallBudgetMs(): number {
+  const l = MEDIA_TOOL_LIMITS;
+  return (
+    l.speechCallTimeoutMs +
+    l.speechTimeoutMs +
+    l.speechProbeTimeoutMs +
+    2 * l.speechJoinTimeoutMs +
+    l.speechProbeTimeoutMs +
+    l.costTries * (l.costWaitMs + 15_000)
+  );
+}
+
 /** Our tools that may take minutes (#173, #191, #238), with the call budget each one enforces itself. */
 const SLOW_TOOLS: readonly { name: string; callTimeoutMs: number }[] = [
   { name: AUDIO_TRANSCRIBE_TOOL.name, callTimeoutMs: AUDIO_LIMITS.callTimeoutMs },
@@ -14,13 +27,10 @@ const SLOW_TOOLS: readonly { name: string; callTimeoutMs: number }[] = [
   { name: IMAGE_GENERATE_TOOL.name, callTimeoutMs: MEDIA_TOOL_LIMITS.imageTimeoutMs + 30_000 },
   {
     name: SPEECH_GENERATE_TOOL.name,
-    // A long script (#248): pieces start until the call's budget is spent; the last piece, the join (3 min) and
-    // the cost lookups still finish after it.
-    callTimeoutMs:
-      MEDIA_TOOL_LIMITS.speechCallTimeoutMs +
-      MEDIA_TOOL_LIMITS.speechTimeoutMs +
-      180_000 +
-      MEDIA_TOOL_LIMITS.costTries * (MEDIA_TOOL_LIMITS.costWaitMs + 15_000),
+    // A long script (#248): pieces start until the call's budget is spent; after it still finish the last piece
+    // and its measurement, up to two joins (the second re-encodes a result over 50MB), the final measurement and
+    // the cost lookups.
+    callTimeoutMs: speechCallBudgetMs(),
   },
 ];
 
