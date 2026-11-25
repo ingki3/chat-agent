@@ -15,17 +15,17 @@ import { storagePaths } from "../storage/paths.js";
  * environment, a time, memory and output limit; it reads only the call's folders. Without it (not macOS, no ffmpeg)
  * there is no `SpeechAudio`, and no speech is made at all (`media_audio_unavailable`, before anything is paid).
  *
- * **What is taken, and how it is measured (#251 re-plan 3):**
+ * **What is taken, and how it is measured (#251 re-plan 3, narrowed in r7):**
  * 1. the form, over the whole file, in this process (`mp3.ts`): MPEG Layer III with one sample rate and one channel
- *    count, frames to the end — else `unsupported` (another layer, a rate or channel change) or `corrupt` (not a
- *    clean frame stream). Its frames bound the length from above: over the cap (`maxSeconds`) is `too_long`, and
- *    nothing is decoded;
- * 2. the length, exactly: ffmpeg decodes the whole file at its own rate — no resampling, no cut-off before its end —
- *    strictly (`-xerror -err_detect explode`: the first decoding error stops it: `corrupt`), into the null muxer,
- *    and reports how much audio it played (`-progress`: `out_time_us` = samples ÷ rate, exact). Samples are counted
- *    as integers (`round(out_time_us × rate ÷ 10⁶)`). No PCM is stored; the output is a few progress lines;
- * 3. a run that could not be done (no sandbox, a spawn failure, a time or memory limit) is `failed` — never
- *    `corrupt`.
+ *    count — else `unsupported` (another layer, a rate or channel change, not MPEG audio at all). A form check only:
+ *    tags and other bytes are stepped over, never called corrupt;
+ * 2. the length and the integrity, by ffmpeg alone: it decodes the whole file at its own rate — no resampling, no
+ *    cut-off before its end — strictly (`-xerror -err_detect explode`: the first decoding error stops it, or an
+ *    error-level line: `corrupt`), into the null muxer, and `astats` sums the **decoded samples** (`Number of
+ *    samples`, an integer — no clock is converted). Over the cap (`maxSeconds`, by those samples) is `too_long`. No
+ *    PCM is stored; the output is a few log lines;
+ * 3. a run that could not be done (no sandbox, a spawn failure, out of memory, a time or memory limit, a signal, no
+ *    sample count reported) is `failed` — never `corrupt`.
  *
  * The join (`join`): the pieces — all of one form (the caller checks) — each decoded to the same PCM inside one
  * ffmpeg (`aformat` s16 mono at their own rate), concatenated in order (`concat` filter) and encoded once.
@@ -163,9 +163,11 @@ export function measureOptions(tools: { ffmpeg: Ffmpeg }, file: string): RunIsol
     args: [
       "-nostdin",
       "-hide_banner",
-      "-v",
-      "error",
-      // The first decoding error stops the run (exit ≠ 0, a line on stderr): the file is corrupt.
+      "-nostats",
+      // Info level, each line tagged with its level: the sample count is an info line, an error an `[error]` one.
+      "-loglevel",
+      "level+info",
+      // The first decoding error stops the run (exit ≠ 0): the file is corrupt.
       "-xerror",
       "-err_detect",
       "explode",
@@ -179,13 +181,9 @@ export function measureOptions(tools: { ffmpeg: Ffmpeg }, file: string): RunIsol
       "-vn",
       "-sn",
       "-dn",
-      // Decoded at its own rate (no `-ar`), to its end (no `-t`), into nothing: only how much it played is kept.
-      "-c:a",
-      "pcm_s16le",
-      "-stats_period",
-      "5",
-      "-progress",
-      "pipe:1",
+      // Decoded at its own rate (no `-ar`), to its end (no `-t`), into nothing; `astats` counts the decoded samples.
+      "-af",
+      "astats=measure_perchannel=none:measure_overall=Number_of_samples",
       "-f",
       "null",
       "-",
@@ -256,22 +254,37 @@ export function joinOptions(
   };
 }
 
-/** The last `out_time_us` of ffmpeg's progress report, when it ended (`progress=end`); undefined otherwise. */
-export function progressMicros(stdout: string): number | undefined {
-  if (!/^progress=end$/mu.test(stdout)) return undefined;
-  const all = [...stdout.matchAll(/^out_time_us=(\d+)$/gmu)];
-  const last = all.at(-1);
-  return last ? Number(last[1]) : undefined;
+/**
+ * The decoded samples (per channel) `astats` reported at the end of the run: its one `Number of samples:` line.
+ * Undefined when there is none, or more than one (not a single audio stream measured).
+ */
+export function decodedSamples(stderr: string): number | undefined {
+  const all = [...stderr.matchAll(/\[Parsed_astats_\d+ @ [^\]]*\] \[info\] Number of samples: (\d+)\s*$/gmu)];
+  return all.length === 1 ? Number(all[0]![1]) : undefined;
 }
+
+/** Whether the run logged an error (or worse) — the strict decoder's verdict. */
+const loggedError = (stderr: string): boolean => /\[(?:error|fatal|panic)\]/u.test(stderr);
 
 /**
  * A finished measuring run that did not succeed, classified: the sandbox or the program not starting (sandbox-exec
- * refusing, exit 71/126/127), or the file not opening, is `failed` (nothing was learnt about the audio); any other
- * error — the strict decoder stopping — is `corrupt`.
+ * refusing, exit 71/126/127), the file not opening, the machine out of memory (ENOMEM, ffmpeg's exit 244) or a
+ * signal is `failed` (nothing was learnt about the audio); any other error — the strict decoder stopping — is
+ * `corrupt`.
  */
-export function measureFailure(r: { code: number | null; stderr: string }): "failed" | "corrupt" {
-  if (r.code === 71 || r.code === 126 || r.code === 127) return "failed";
-  if (/sandbox|Operation not permitted|Permission denied|No such file|exec/iu.test(r.stderr)) return "failed";
+export function measureFailure(r: {
+  code: number | null;
+  signal?: NodeJS.Signals | null;
+  stderr: string;
+}): "failed" | "corrupt" {
+  if (r.signal || r.code === null) return "failed";
+  if (r.code === 71 || r.code === 126 || r.code === 127 || r.code === 244) return "failed";
+  if (
+    /sandbox|Operation not permitted|Permission denied|No such file|exec|Cannot allocate memory|ENOMEM/iu.test(
+      r.stderr,
+    )
+  )
+    return "failed";
   return "corrupt";
 }
 
@@ -304,21 +317,17 @@ export function sandboxedSpeechAudio(o: {
     workdir: () => makeSpeechWorkdir(o.dataDir),
     async measure(file, m) {
       if (plainSize(file) === undefined) return { ok: false, reason: "failed" };
-      // 1. The form, over the whole file (nothing decoded yet).
+      // 1. The form, over the whole file (nothing decoded yet; never a verdict on the audio's integrity).
       const walk = walkMp3(fs.readFileSync(file));
-      if (!walk.ok) return { ok: false, reason: walk.reason === "unsupported" ? "unsupported" : "corrupt" };
-      // Its frames are the most it can play: over the cap, it is not decoded at all.
-      if (walk.samples > m.maxSeconds * walk.sampleRate) return { ok: false, reason: "too_long" };
-      // 2. Decoded to its end, strictly, at its own rate.
+      if (!walk.ok) return { ok: false, reason: "unsupported" };
+      // 2. Decoded to its end, strictly, at its own rate; the decoded samples counted.
       const r = await attempt(measureOptions(tools, file), m.signal);
-      if (!r || r.killed) return { ok: false, reason: "failed" };
+      if (!r || r.killed || r.signal) return { ok: false, reason: "failed" };
       if (r.code !== 0) return { ok: false, reason: measureFailure(r) };
-      if (r.stderr.trim()) return { ok: false, reason: "corrupt" };
-      const us = progressMicros(r.stdout);
-      if (us === undefined) return { ok: false, reason: "failed" };
-      const samples = Math.round((us * walk.sampleRate) / 1_000_000);
-      // Decoding never plays more than the frames hold.
-      if (samples > walk.samples) return { ok: false, reason: "corrupt" };
+      if (loggedError(r.stderr)) return { ok: false, reason: measureFailure(r) };
+      const samples = decodedSamples(r.stderr);
+      if (samples === undefined) return { ok: false, reason: "failed" };
+      // The cap, on the decoded samples alone.
       if (samples > m.maxSeconds * walk.sampleRate) return { ok: false, reason: "too_long" };
       return {
         ok: true,

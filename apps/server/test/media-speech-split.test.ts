@@ -30,7 +30,7 @@ import {
   makeSpeechWorkdir,
   measureFailure,
   measureOptions,
-  progressMicros,
+  decodedSamples,
   removeSpeechWorkdir,
   sandboxedSpeechAudio,
   speechTools,
@@ -431,7 +431,7 @@ describe("speech_generate: long scripts through the tool (#248)", () => {
         response_format: "mp3",
         provider: { data_collection: "deny" },
       });
-    // Joined in order, stream copy (same stream throughout).
+    // Joined in order (from the same PCM, encoded once at 128 kbit/s).
     expect(t.joins).toEqual([
       { names: pieces.map((_, i) => `piece-${String(i).padStart(3, "0")}.mp3`), bitrateK: 128 },
     ]);
@@ -651,10 +651,12 @@ describe("speech_generate: long scripts through the tool (#248)", () => {
       noFlagChanges: true,
       trusted: ["/opt/x/bin"],
     });
-    // A strict decode of the whole file at its own rate into nothing; only its progress (played time) is read.
+    // A strict decode of the whole file at its own rate into nothing; `astats` counts the decoded samples.
     expect(m.args).toEqual(
-      expect.arrayContaining(["-xerror", "-err_detect", "explode", "-progress", "pipe:1", "null"]),
+      expect.arrayContaining(["-xerror", "-err_detect", "explode", "level+info", "null"]),
     );
+    expect(m.args.join(" ")).toContain("astats=measure_perchannel=none:measure_overall=Number_of_samples");
+    expect(m.args).not.toContain("-progress");
     expect(m.args).not.toContain("-ar");
     expect(m.args).not.toContain("-t");
     expect(m.args.join(" ")).not.toMatch(/duration|count_packets/);
@@ -1243,11 +1245,12 @@ describe("speech_generate: review round 4 regressions (#251)", () => {
   it("P2: the scripted decoder walks every frame at its own rate (VBR) and skips a leading Xing/Info frame", () => {
     const vbr = vbrWithoutHeader(14.6);
     const f = walkMp3(vbr);
-    expect(f.ok && f.samples / f.sampleRate).toBeCloseTo(14.6, 1);
+    const audioFrames = (w: typeof f) =>
+      w.ok ? w.frames.filter((x) => !x.info).length * w.samplesPerFrame : -1;
+    expect(audioFrames(f) / 44100).toBeCloseTo(14.6, 1);
     const xing = mp3Frame(9);
     xing.write("Xing", 36, "latin1");
-    const g = walkMp3(Buffer.concat([xing, vbr]));
-    expect(g.ok && g.samples).toBe(f.ok && f.samples);
+    expect(audioFrames(walkMp3(Buffer.concat([xing, vbr])))).toBe(audioFrames(f));
   });
 
   it("P2: a header-less VBR piece near the provider's mark is caught (measured by frames) and re-split", async () => {
@@ -1350,38 +1353,59 @@ describe("speech_generate: review rounds 5–6 re-plans — one form, exact deco
     expect(t.files()).toEqual([]);
   });
 
-  it("the form check walks the whole file: Layer III only, one rate and channel count, frames to the end", () => {
-    const cbr = silentMp3(30);
+  it("the form check walks the whole file: Layer III only, one rate and channel count — and judges nothing else", () => {
+    const frames = (n: number) => Array.from({ length: n }, () => mp3Frame(9));
+    const cbr = Buffer.concat(frames(30));
     const w = walkMp3(cbr);
     expect(w).toMatchObject({ ok: true, sampleRate: 44100, channels: 2, samplesPerFrame: 1152 });
-    expect(w.ok && w.samples).toBe(30 * 1152);
-    // A rate change after many good frames (8 kHz → 44.1 kHz): unsupported — not just the first frame is read.
-    const mixed = Buffer.concat([
-      ...Array.from({ length: 200 }, () => mp3Frame22(8)),
-      ...Array.from({ length: 3 }, () => mp3Frame(9)),
-    ]);
+    expect(w.ok && w.frames).toHaveLength(30);
+    // A rate change after many good frames (22.05 kHz → 44.1 kHz): unsupported — not just the first frame is read.
+    const mixed = Buffer.concat([...Array.from({ length: 200 }, () => mp3Frame22(8)), ...frames(3)]);
     expect(walkMp3(mixed)).toEqual({ ok: false, reason: "unsupported" });
     // A channel-count change.
-    const stereo = mp3Frame(9);
     const mono = mp3Frame(9);
     mono[3] = 0xc4;
-    expect(walkMp3(Buffer.concat([stereo, stereo, mono]))).toEqual({ ok: false, reason: "unsupported" });
+    expect(walkMp3(Buffer.concat([...frames(2), mono, mono]))).toEqual({ ok: false, reason: "unsupported" });
     // MP2 (Layer II) frames.
     const mp2 = mp3Frame(9);
     mp2[1] = 0xfd;
-    expect(walkMp3(Buffer.concat([mp2, mp2]))).toEqual({ ok: false, reason: "unsupported" });
-    // Garbage after the frames, a cut last frame, no frames: not a clean frame stream (corrupt).
-    expect(walkMp3(Buffer.concat([cbr, Buffer.from("junk")]))).toEqual({ ok: false, reason: "not_mp3" });
-    expect(walkMp3(cbr.subarray(0, cbr.length - 10))).toEqual({ ok: false, reason: "not_mp3" });
-    expect(walkMp3(Buffer.from("not audio"))).toEqual({ ok: false, reason: "not_mp3" });
-    // An ID3v1 tag at the end is allowed; a leading Xing/Info frame holds no audio.
-    const tag = Buffer.alloc(128);
-    tag.write("TAG", 0, "latin1");
-    expect(walkMp3(Buffer.concat([cbr, tag]))).toMatchObject({ ok: true });
-    const xing = mp3Frame(9);
-    xing.write("Info", 36, "latin1");
-    const withInfo = walkMp3(Buffer.concat([xing, ...Array.from({ length: 30 }, () => mp3Frame(9))]));
-    expect(withInfo.ok && withInfo.samples).toBe(30 * 1152);
+    expect(walkMp3(Buffer.concat([mp2, mp2, mp2]))).toEqual({ ok: false, reason: "unsupported" });
+    // Not MPEG audio at all (WAV, text): unsupported.
+    const wav = Buffer.concat([Buffer.from("RIFF\0\0\0\0WAVEfmt ", "latin1"), Buffer.alloc(2000)]);
+    expect(walkMp3(wav)).toEqual({ ok: false, reason: "unsupported" });
+    expect(walkMp3(Buffer.from("not audio"))).toEqual({ ok: false, reason: "unsupported" });
+    // Tags and other bytes are stepped over — integrity is the decoder's business: APEv2, APEv2 + ID3v1, junk,
+    // a cut last frame.
+    const ape = Buffer.concat([
+      Buffer.from("APETAGEX", "latin1"),
+      Buffer.alloc(24),
+      Buffer.from("Title\0x", "latin1"),
+    ]);
+    const id3v1 = Buffer.alloc(128);
+    id3v1.write("TAG", 0, "latin1");
+    for (const tail of [ape, Buffer.concat([ape, id3v1]), Buffer.from("junk"), id3v1])
+      expect(walkMp3(Buffer.concat([cbr, tail]))).toMatchObject({ ok: true, sampleRate: 44100 });
+    expect(walkMp3(cbr.subarray(0, cbr.length - 10))).toMatchObject({ ok: true });
+    // `TAG` inside the last frame's data, `Info` anywhere but its place: frames like the others.
+    const last = mp3Frame(9);
+    last.write("TAG", last.length - 128 + 417 - last.length, "latin1");
+    const tagInside = Buffer.concat([...frames(5), last]);
+    tagInside.write("TAG", tagInside.length - 128, "latin1");
+    const t = walkMp3(tagInside);
+    expect(t.ok && t.frames).toHaveLength(6);
+    const side = mp3Frame(9);
+    side.write("Info", 100, "latin1");
+    const s2 = walkMp3(Buffer.concat([side, ...frames(3)]));
+    expect(s2.ok && s2.frames[0]!.info).toBe(false);
+    // `Info` at its place (after the side information) marks a length-header frame.
+    const info = mp3Frame(9);
+    info.write("Info", 36, "latin1");
+    const s3 = walkMp3(Buffer.concat([info, ...frames(3)]));
+    expect(s3.ok && s3.frames[0]!.info).toBe(true);
+    // Sync-like bytes inside frame data are never read as headers: a Layer II header pattern inside a frame.
+    const trap = mp3Frame(9);
+    trap.set([0xff, 0xfd, 0x90, 0x64], 100);
+    expect(walkMp3(Buffer.concat([...frames(3), trap, ...frames(3)]))).toMatchObject({ ok: true });
   });
 
   it("the scripted decoder (FAKE_RUNTIME) has the real one's semantics", async () => {
@@ -1409,7 +1433,7 @@ describe("speech_generate: review rounds 5–6 re-plans — one form, exact deco
     });
     expect(await audio.measure(write("piece-002.mp3", Buffer.from("x")), m)).toEqual({
       ok: false,
-      reason: "corrupt",
+      reason: "unsupported",
     });
     expect(
       await audio.measure(
@@ -1423,18 +1447,116 @@ describe("speech_generate: review rounds 5–6 re-plans — one form, exact deco
     });
   });
 
-  it("a run that could not start (the sandbox refusing) is a failed measurement, never corrupt", () => {
+  it("a run that could not start, ran out of memory or was signalled is a failed measurement, never corrupt", async () => {
     expect(measureFailure({ code: 71, stderr: "sandbox-exec: sandbox_apply: Operation not permitted" })).toBe(
       "failed",
     );
     expect(measureFailure({ code: 1, stderr: "x.mp3: Permission denied" })).toBe("failed");
-    expect(measureFailure({ code: 183, stderr: "[mp3float] big_values too big\nError while decoding" })).toBe(
-      "corrupt",
-    );
-    expect(progressMicros("out_time_us=1000\nprogress=continue\nout_time_us=20000\nprogress=end\n")).toBe(
-      20000,
-    );
-    expect(progressMicros("out_time_us=1000\nprogress=continue\n")).toBeUndefined();
+    expect(measureFailure({ code: 244, stderr: "[error] Cannot allocate memory" })).toBe("failed");
+    expect(measureFailure({ code: 1, stderr: "[error] ... ENOMEM" })).toBe("failed");
+    expect(measureFailure({ code: null, signal: "SIGKILL", stderr: "" })).toBe("failed");
+    expect(measureFailure({ code: 183, stderr: "[mp3float] [error] big_values too big" })).toBe("corrupt");
+    // The decoded samples: the one `astats` line; none (or N/A, or two streams) is no count.
+    const line = (n: string) => `[Parsed_astats_0 @ 0x1] [info] Number of samples: ${n}\n`;
+    expect(decodedSamples(`[info] Overall\n${line("969536")}`)).toBe(969536);
+    expect(decodedSamples("[info] size=N/A time=N/A\n")).toBeUndefined();
+    expect(decodedSamples(line("N/A"))).toBeUndefined();
+    expect(decodedSamples(line("1") + line("2"))).toBeUndefined();
+    // Through the real measuring path with a scripted runner (an ffmpeg file of our own, never run).
+    const bin = path.join(tmp(), "ff", "bin");
+    fs.mkdirSync(bin, { recursive: true });
+    fs.writeFileSync(path.join(bin, "ffmpeg"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const scripted = (result: { code: number | null; signal?: NodeJS.Signals | null; stderr: string }) =>
+      sandboxedSpeechAudio({
+        dataDir: tmp(),
+        platform: "darwin",
+        ffmpegPath: path.join(bin, "ffmpeg"),
+        run: async () => ({ stdout: "", killed: null, signal: null, ...result }),
+      })!;
+    const data = tmp();
+    const w = makeSpeechWorkdir(data);
+    const file = path.join(w, "in", "piece-000.mp3");
+    fs.writeFileSync(file, Buffer.concat(Array.from({ length: 30 }, () => mp3Frame(9))));
+    const M = { maxSeconds: 600 };
+    expect(await scripted({ code: 0, stderr: line("969536") }).measure(file, M)).toMatchObject({
+      ok: true,
+      samples: 969536,
+      sampleRate: 44100,
+    });
+    // The final report without a valid count (N/A): not measured.
+    expect(await scripted({ code: 0, stderr: line("N/A") }).measure(file, M)).toEqual({
+      ok: false,
+      reason: "failed",
+    });
+    expect(await scripted({ code: 244, stderr: "[error] Cannot allocate memory" }).measure(file, M)).toEqual({
+      ok: false,
+      reason: "failed",
+    });
+    expect(await scripted({ code: null, signal: "SIGTERM", stderr: "" }).measure(file, M)).toEqual({
+      ok: false,
+      reason: "failed",
+    });
+    expect(
+      await scripted({ code: 183, stderr: "[mp3float] [error] big_values too big" }).measure(file, M),
+    ).toEqual({
+      ok: false,
+      reason: "corrupt",
+    });
+    // The 600 s cap on decoded samples only: 599.49 s of audio is taken (whatever its frames add up to).
+    expect(
+      await scripted({ code: 0, stderr: line(String(Math.round(599.488125 * 44100))) }).measure(file, M),
+    ).toMatchObject({ ok: true });
+    expect(await scripted({ code: 0, stderr: line(String(600 * 44100 + 1)) }).measure(file, M)).toEqual({
+      ok: false,
+      reason: "too_long",
+    });
+    removeSpeechWorkdir(w);
+  });
+
+  it("the first answer measured fixes the call's form — also when it was cut: a retry at another rate is refused", async () => {
+    const t = await start({
+      answer: (input, n) =>
+        n === 0
+          ? Buffer.concat([fakeMp3(14.5), Buffer.from("RATE=22050;", "latin1")])
+          : fakeMp3(speechSeconds(input, LIMITS.typical)),
+    });
+    expect(await t.speak({ text: LONG })).toMatchObject({ ok: false, code: "media_audio_unsupported" });
+    expect(t.posts).toHaveLength(2);
+    expect(t.files()).toEqual([]);
+    expect(t.rows().every((x) => x.cost_usd === PIECE_COST)).toBe(true);
+  });
+
+  it("a paid answer that is not MP3 (WAV) is media_audio_unsupported with the cost hint, not a model error", async () => {
+    const wav = Buffer.concat([Buffer.from("RIFF\0\0\0\0WAVEfmt ", "latin1"), Buffer.alloc(2000)]);
+    const t = await start({ answer: () => wav });
+    const r = await t.speak({ text: SENTENCES[0]! });
+    expect(r).toMatchObject({ ok: false, code: "media_audio_unsupported" });
+    expect(!r.ok && r.hint).toMatch(/비용은 기록/);
+    expect(t.rows()).toEqual([expect.objectContaining({ cost_usd: PIECE_COST })]);
+  });
+
+  it("a joined result that cannot be measured is media_measure_failed (the cost hint), a gross loss media_failed", async () => {
+    let dataDir = "";
+    const fake = fakeAudio(() => dataDir);
+    let joins = 0;
+    const failing: SpeechAudio = {
+      workdir: () => makeSpeechWorkdir(dataDir),
+      async measure(file, m) {
+        return path.basename(path.dirname(file)) === "out"
+          ? { ok: false, reason: "failed" }
+          : fake.audio.measure(file, m);
+      },
+      async join(job) {
+        joins++;
+        return fake.audio.join(job);
+      },
+    };
+    const t = await start({ audio: failing });
+    dataDir = t.dataDir;
+    const r = await t.speak({ text: LONG });
+    expect(r).toMatchObject({ ok: false, code: "media_measure_failed" });
+    expect(!r.ok && r.hint).toMatch(/비용은 기록/);
+    expect(joins).toBe(1);
   });
 
   it("estimates and limits compare in whole microseconds: 20 s exactly is 20 s, whatever the classes", () => {
@@ -1748,5 +1870,110 @@ describe("speech_generate: the real sandboxed ffmpeg (#248, macOS)", () => {
       expect(r.ok).toBe(true);
       expect(t.posts.map((p) => p.input)).toEqual([pieces[0], ...again, ...pieces.slice(1)]);
     }
+  });
+
+  realIt(
+    "identical 8 kHz frames joined in six pieces: their decoded samples add up exactly — the join is kept",
+    async () => {
+      let dataDir = "";
+      const unit = encode([
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=300:duration=2:sample_rate=8000",
+        "-ac",
+        "1",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "16k",
+        "-write_xing",
+        "0",
+        "-id3v2_version",
+        "0",
+      ]);
+      const pieces = splitSpeech(LONG, LIMITS);
+      const t = await start({
+        audio: realAudio(() => dataDir),
+        // Each answer: the same frames repeated to about its expected length (no length header at all).
+        answer: (input) =>
+          Buffer.concat(
+            Array.from(
+              { length: Math.max(1, Math.round(speechSeconds(input, LIMITS.typical) / 2)) },
+              () => unit,
+            ),
+          ),
+      });
+      dataDir = t.dataDir;
+      const r = await t.speak({ text: LONG });
+      expect(r.ok).toBe(true);
+      expect((r as { output: { chunks: number } }).output.chunks).toBe(pieces.length);
+    },
+  );
+
+  realIt(
+    "tags around the audio (APEv2, APEv2 + ID3v1) decode as the audio itself: taken, same samples",
+    async () => {
+      const { audio, put } = bench();
+      const base = tone(3, 22050);
+      const plain = await audio.measure(put(base), M);
+      expect(plain.ok).toBe(true);
+      // An APEv2 tag as taggers write it: a header, one item, a footer.
+      const item = Buffer.concat([
+        Buffer.from([5, 0, 0, 0, 0, 0, 0, 0]),
+        Buffer.from("Title\0Hello", "latin1"),
+      ]);
+      const apeBlock = (flags: number) => {
+        const f = Buffer.alloc(32);
+        f.write("APETAGEX", 0, "latin1");
+        f.writeUInt32LE(2000, 8);
+        f.writeUInt32LE(item.length + 32, 12);
+        f.writeUInt32LE(1, 16);
+        f.writeUInt32LE(flags >>> 0, 20);
+        return f;
+      };
+      const ape = Buffer.concat([apeBlock(0xa0000000), item, apeBlock(0x80000000)]);
+      const id3v1 = Buffer.alloc(128);
+      id3v1.write("TAGTitle", 0, "latin1");
+      for (const tail of [ape, Buffer.concat([ape, id3v1])]) {
+        const m = await audio.measure(put(Buffer.concat([base, tail])), M);
+        expect(m).toMatchObject({ ok: true, samples: plain.ok ? plain.samples : -1 });
+      }
+    },
+  );
+
+  realIt("599.49 s of audio is taken (the cap is on decoded samples); a remuxed long piece too", async () => {
+    const { audio, put } = bench();
+    const long = encode([
+      "-f",
+      "lavfi",
+      "-i",
+      "anullsrc=r=8000:cl=mono:d=599.488125",
+      "-c:a",
+      "libmp3lame",
+      "-b:a",
+      "8k",
+    ]);
+    const m = await audio.measure(put(long), M);
+    expect(m.ok && m.seconds).toBeGreaterThan(599);
+    expect(m.ok && m.seconds).toBeLessThan(600);
+    // Remuxed (stream copy, its length header dropped): its frames add up past 600 s, its decoded samples do not.
+    const dir = tmp();
+    fs.writeFileSync(path.join(dir, "a.mp3"), long);
+    const r = spawnSync(realTools!.ffmpeg.exe, [
+      "-nostdin",
+      "-v",
+      "error",
+      "-i",
+      path.join(dir, "a.mp3"),
+      "-c",
+      "copy",
+      "-write_xing",
+      "0",
+      path.join(dir, "b.mp3"),
+    ]);
+    expect(r.status).toBe(0);
+    const remuxed = await audio.measure(put(fs.readFileSync(path.join(dir, "b.mp3"))), M);
+    expect(remuxed.ok && remuxed.seconds).toBeLessThan(600.1);
   });
 });

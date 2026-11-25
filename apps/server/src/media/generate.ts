@@ -940,6 +940,8 @@ export class MediaGenerator {
     const unsent = new Set(reserved.map((p) => p.callId));
     const costs: Promise<number | null>[] = [];
     const made: Made[] = [];
+    /** The call's audio form: the first answer measured. */
+    let form: { sampleRate: number; channels: 1 | 2 } | undefined;
     let bytesSoFar = 0;
     let n = 0;
     const started = this.now();
@@ -972,7 +974,9 @@ export class MediaGenerator {
         const r = await this.piece(ctx, p, plan.body, left);
         costs.push(r.cost);
         if (!r.bytes) throw new MediaToolError("media_failed");
-        if (!r.bytes.length || !isMp3(r.bytes)) throw new MediaToolError("media_unsupported_model");
+        // A paid answer that is not MP3 (WAV, …) from a model that passed the planning check: the answer's form,
+        // not the model's settings (#251 r7) — like any other unsupported answer.
+        if (!r.bytes.length || !isMp3(r.bytes)) throw new MediaToolError("media_audio_unsupported");
         const file = path.join(workdir, "in", `piece-${String(n++).padStart(3, "0")}.mp3`);
         fs.writeFileSync(file, r.bytes, { flag: "wx", mode: 0o600 });
         // Its form checked and its length decoded to the end (#251 re-plans 2–3): a corrupt, unsupported or
@@ -980,9 +984,10 @@ export class MediaGenerator {
         // stays recorded); a clean but short one goes to the re-split below.
         const m = await audio.measure(file, { maxSeconds: this.split.pieceMaxSeconds, signal: ctx.signal });
         if (!m.ok) throw this.stopped(ctx) ?? measuredError(m.reason);
-        // Every piece of one call in one form (they are joined from the same PCM).
-        const form = made[0];
-        if (form && (form.sampleRate !== m.sampleRate || form.channels !== m.channels))
+        // Every answer of one call in one form (they are joined from the same PCM): the first one measured fixes it —
+        // also when it was cut and is not kept (#251 r7), so a retry's answer is held to it too.
+        form ??= { sampleRate: m.sampleRate, channels: m.channels };
+        if (form.sampleRate !== m.sampleRate || form.channels !== m.channels)
           throw new MediaToolError("media_audio_unsupported");
         if (looksCut(p.text, m.seconds, this.split)) {
           // Cut by the provider: smaller pieces, once (their rows reserved — and the budget checked — first).
@@ -1046,8 +1051,7 @@ export class MediaGenerator {
    * The pieces as one MP3 (#248): one piece as it came (its form already checked: MPEG Layer III); several joined
    * by ffmpeg from PCM — each decoded to the same PCM at their one rate, concatenated in order, encoded once (128
    * kbit/s mono; over 50MB once more at 64 kbit/s) — and the result decoded and measured like a piece: the pieces'
-   * exact summed samples, give or take the encoder's delay and padding (≤ 0.1 s and a little per piece), or nothing
-   * is stored (#251 re-plan 3).
+   * summed samples within 1 s + 0.25 s per piece (a gross loss only — #251 r7), or nothing is stored.
    */
   private async joined(
     ctx: CallCtx,
@@ -1072,9 +1076,14 @@ export class MediaGenerator {
     if (!out || !size(out) || size(out) > FILE_LIMITS.bytes)
       throw this.stopped(ctx) ?? new MediaToolError("media_failed");
     const m = await audio.measure(out, { maxSeconds: (want / sampleRate) * 2 + 60, signal: ctx.signal });
-    if (!m.ok) throw this.stopped(ctx) ?? new MediaToolError("media_failed");
-    // Encoded once: only the encoder's delay and padding may differ (≤ 0.1 s, and a little per seam).
-    if (m.sampleRate !== sampleRate || Math.abs(m.samples - want) > sampleRate * (0.1 + 0.01 * made.length))
+    // Not measured: the same outcome (and hint — the cost is recorded) as a piece's; anything else is ours.
+    if (!m.ok)
+      throw (
+        this.stopped(ctx) ??
+        new MediaToolError(m.reason === "failed" ? "media_measure_failed" : "media_failed")
+      );
+    // A gross loss only (#251 r7: the encoder's delay and padding, and decoders' own rounding, are well inside this).
+    if (m.sampleRate !== sampleRate || Math.abs(m.samples - want) > sampleRate * (1 + 0.25 * made.length))
       throw new MediaToolError("media_failed");
     const bytes = fs.readFileSync(out);
     if (!isMp3(bytes)) throw new MediaToolError("media_failed");

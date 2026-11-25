@@ -228,9 +228,10 @@ export const FIXTURE_CORRUPT_MARK = "FIXTURE-CORRUPT";
 
 /**
  * A scripted ffmpeg (measure, join) for the FAKE_RUNTIME (e2e) server and tests, with the real one's semantics
- * (#251 re-plans 2–3): the same form check over the whole file (`walkMp3` — the real code), then the length as what
- * decoding would play (the audio frames × samples per frame; the real decoder also takes the encoder's delay and
- * padding off), `corrupt` for `FIXTURE_CORRUPT_MARK`, `too_long` over the cap. The join is the pieces' audio frames
+ * (#251 re-plans 2–3, r7): the same form check over the whole file (`walkMp3` — the real code; tags and other bytes
+ * stepped over), then the length as what decoding would play (the audio frames × samples per frame; the real decoder
+ * also takes the encoder's delay and padding off), `corrupt` only for `FIXTURE_CORRUPT_MARK` (the real one: only the
+ * strict decoder says so), `too_long` over the cap. The join is the pieces' audio frames
  * one after another. No program runs. Working folders as the real one's.
  */
 export function fixtureSpeechAudio(dataDir: string): SpeechAudio {
@@ -240,13 +241,15 @@ export function fixtureSpeechAudio(dataDir: string): SpeechAudio {
     async measure(file, m): Promise<Measured> {
       const b = fs.readFileSync(file);
       const walk = walkMp3(b);
-      if (!walk.ok) return { ok: false, reason: walk.reason === "unsupported" ? "unsupported" : "corrupt" };
+      if (!walk.ok) return { ok: false, reason: "unsupported" };
       if (b.includes(FIXTURE_CORRUPT_MARK, 0, "latin1")) return { ok: false, reason: "corrupt" };
-      if (walk.samples > m.maxSeconds * walk.sampleRate) return { ok: false, reason: "too_long" };
+      // What decoding would play: the audio frames (a leading Xing/Info frame holds none).
+      const samples = walk.frames.filter((f) => !f.info).length * walk.samplesPerFrame;
+      if (samples > m.maxSeconds * walk.sampleRate) return { ok: false, reason: "too_long" };
       return {
         ok: true,
-        samples: walk.samples,
-        seconds: walk.samples / walk.sampleRate,
+        samples,
+        seconds: samples / walk.sampleRate,
         sampleRate: walk.sampleRate,
         channels: walk.channels,
       };
