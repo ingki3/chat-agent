@@ -1075,12 +1075,16 @@ export class MediaGenerator {
         throw new MediaToolError("media_measure_failed");
       }
     };
-    let out = await audio.encode(
-      { workdir, pcms, bitrateK: made.length === 1 ? 192 : 128, sampleRate },
-      ctx.signal,
-    );
-    if (out && size(out) > FILE_LIMITS.bytes)
-      out = await audio.encode({ workdir, pcms, bitrateK: 64, sampleRate }, ctx.signal);
+    // An encode whose own result checks fail under it (an I/O error, #251 r14): not measured — never the raw error.
+    const encode = async (bitrateK: number) => {
+      try {
+        return await audio.encode({ workdir, pcms, bitrateK, sampleRate }, ctx.signal);
+      } catch {
+        throw new MediaToolError("media_measure_failed");
+      }
+    };
+    let out = await encode(made.length === 1 ? 192 : 128);
+    if (out && size(out) > FILE_LIMITS.bytes) out = await encode(64);
     if (!out || !size(out) || size(out) > FILE_LIMITS.bytes)
       throw this.stopped(ctx) ?? new MediaToolError("media_failed");
     // The pieces' PCM is done with.

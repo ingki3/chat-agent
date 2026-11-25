@@ -1713,6 +1713,56 @@ describe("speech_generate: review rounds 5–6 re-plans — one form, exact deco
     expect(!r.ok && r.hint).not.toMatch(/형식이 이 서버가 받는 형식/);
   });
 
+  it("#251 r14: an I/O error checking the encoder's result is media_measure_failed — no path in what is told", async () => {
+    // The real encode path (scripted runner): its result's lstat fails with EIO.
+    const bin = path.join(tmp(), "ff", "bin");
+    fs.mkdirSync(bin, { recursive: true });
+    for (const n of ["ffmpeg", "ffprobe"])
+      fs.writeFileSync(path.join(bin, n), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const real = sandboxedSpeechAudio({
+      dataDir: tmp(),
+      platform: "darwin",
+      ffmpegPath: path.join(bin, "ffmpeg"),
+      run: async (o) => {
+        fs.writeFileSync(path.join(o.cwd, o.args.at(-1)!), Buffer.from("mp3"));
+        return { code: 0, signal: null, stdout: "", stderr: "", killed: null };
+      },
+    })!;
+    const w = real.workdir();
+    const pcm = path.join(w, "out", "pcm-1.s16");
+    fs.writeFileSync(pcm, Buffer.alloc(16));
+    const lstat = fs.lstatSync.bind(fs);
+    const spy = vi.spyOn(fs, "lstatSync").mockImplementation(((p: fs.PathLike, o?: fs.StatSyncOptions) => {
+      if (/speech-\d+\.mp3$/.test(String(p)))
+        throw Object.assign(new Error(`EIO: i/o error, lstat '${String(p)}'`), { code: "EIO" });
+      return lstat(p, o);
+    }) as typeof fs.lstatSync);
+    try {
+      await expect(real.encode({ workdir: w, pcms: [pcm], bitrateK: 192, sampleRate: 8000 })).rejects.toThrow(
+        /EIO/,
+      );
+    } finally {
+      spy.mockRestore();
+      removeSpeechWorkdir(w);
+    }
+    // Through the tool: such a throw is media_measure_failed with the cost hint, and the path is not told.
+    let dataDir = "";
+    const fake = fakeAudio(() => dataDir);
+    const failing: SpeechAudio = {
+      ...fake.audio,
+      encode: async () => {
+        throw new Error(`EIO: i/o error, lstat '${dataDir}/speech-scratch/x/out/speech-1.mp3'`);
+      },
+    };
+    const t = await start({ audio: failing });
+    dataDir = t.dataDir;
+    const r = await t.speak({ text: SENTENCES[0]! });
+    expect(r).toMatchObject({ ok: false, code: "media_measure_failed" });
+    expect(!r.ok && r.hint).toMatch(/비용은 기록/);
+    expect(JSON.stringify(r)).not.toContain(dataDir);
+    expect(t.rows()).toEqual([expect.objectContaining({ cost_usd: PIECE_COST })]);
+  });
+
   it("estimates and limits compare in whole microseconds: 20 s exactly is 20 s, whatever the classes", () => {
     const text = "a".repeat(300);
     expect(speechSeconds(text, SPEECH_SPLIT.typical)).toBe(20);
