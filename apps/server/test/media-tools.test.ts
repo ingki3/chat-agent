@@ -876,9 +876,12 @@ describe("media tools: review round 1 regressions (#246)", () => {
       }),
     ).toBeNull();
     expect(imageCostBound([], { prompt: "x", references: [] })).toBeNull();
-    // Speech: input prices × bytes, output prices × the longest audio as tokens, overrides' dearer tier, variable = none.
-    const sp = speechCostBound([{ pricing: { prompt: "0.000001", completion: "0.0001" } }], { text: "ab" })!;
-    expect(sp).toBeCloseTo((0.000001 * (2 + 64) + 0.0001 * (2 * 0.5 + 30) * 50) * 1.2, 9);
+    // Speech: input prices × bytes, overrides' dearer tier, variable = none; an output price = no bound (#251 r9).
+    expect(
+      speechCostBound([{ pricing: { prompt: "0.000001", completion: "0.0001" } }], { text: "ab" }),
+    ).toBeNull();
+    const sp = speechCostBound([{ pricing: { prompt: "0.000001", completion: "0" } }], { text: "ab" })!;
+    expect(sp).toBeCloseTo(0.000001 * (2 + 64) * 1.2, 9);
     const over = speechCostBound(
       [{ pricing: { prompt: "0.000001", completion: "0", overrides: [{ prompt: "0.000004" }] } }],
       { text: "ab" },
@@ -1238,13 +1241,55 @@ describe("media tools: review round 1 regressions (#246)", () => {
     ).rejects.toMatchObject({ code: "media_model_unsupported" });
   });
 
+  it("#251 r9: a speech model priced on its output is refused — before any request, and when chosen", async () => {
+    const inner = fixtureOpenRouterFetch();
+    const outputPriced = (async (url: string | URL | Request, init?: RequestInit) =>
+      String(url).endsWith("/models/fixture/voice-one/endpoints")
+        ? Response.json({
+            data: {
+              id: "fixture/voice-one",
+              endpoints: [{ pricing: { prompt: "0", completion: "0.00001" } }],
+            },
+          })
+        : inner(url, init)) as typeof fetch;
+    const t = await start({ fetchImpl: outputPriced });
+    // Chosen in 관리자 → 미디어 생성: not saved.
+    await expect(
+      t.app.media!.admin.saveSettings(
+        settingsWith({ speech: "fixture/voice-one" }),
+        t.app.media!.settings.revision(),
+        () => true,
+      ),
+    ).rejects.toMatchObject({ code: "media_model_output_priced" });
+    // Already chosen (set directly): the call is refused before anything is paid.
+    t.enable(settingsWith({ speech: "fixture/voice-one" }));
+    const conv = t.app.conversations!.create(t.f.users.owner.id);
+    const scope = await t.scopeOf(conv.id);
+    const r = await t.app.media!.tools.run("speech", scope, { text: "안녕" });
+    expect(r).toMatchObject({ ok: false, code: "media_no_price" });
+    expect(!r.ok && r.hint).toMatch(/음성의 양/);
+    expect(t.posts()).toEqual([]);
+    expect(t.usageRows()).toEqual([]);
+    // An input-priced model is still chosen as before.
+    const t2 = await start();
+    await expect(
+      t2.app.media!.admin.saveSettings(
+        settingsWith({ speech: "fixture/voice-one" }),
+        t2.app.media!.settings.revision(),
+        () => true,
+      ),
+    ).resolves.toBeTruthy();
+  });
+
   it("P2: inline audio answers a single byte range (206), a suffix, and 416 beyond the end", async () => {
     const t = await start();
     t.enable(settingsWith({ speech: "fixture/voice-one" }));
     const conv = t.app.conversations!.create(t.f.users.owner.id);
     const r = await t.send(conv.id, "/speech 안녕하세요");
     const id = String(outputOf(r).fileId);
-    const size = silentMp3().length;
+    // The stored file is this server's own encode (#251 re-plan 5), not the fixture's bytes.
+    const stored = t.app.files!.get(id)!;
+    const size = stored.bytes;
     const get = (range?: string) =>
       t.app.inject({
         url: `/api/files/${id}/content?inline=1`,
@@ -1257,7 +1302,7 @@ describe("media tools: review round 1 regressions (#246)", () => {
     expect(part.statusCode).toBe(206);
     expect(part.headers["content-range"]).toBe(`bytes 0-1/${size}`);
     expect(part.headers["content-length"]).toBe("2");
-    expect(part.rawPayload.equals(silentMp3().subarray(0, 2))).toBe(true);
+    expect(part.rawPayload.equals(whole.rawPayload.subarray(0, 2))).toBe(true);
     const suffix = await get("bytes=-10");
     expect(suffix.statusCode).toBe(206);
     expect(suffix.headers["content-range"]).toBe(`bytes ${size - 10}-${size - 1}/${size}`);
@@ -1380,10 +1425,8 @@ describe("media tools: review round 2 regressions (#246)", () => {
     expect(sp({ prompt: "0.000001" })).toBeNull(); // completion missing
     expect(sp({ prompt: "0", completion: "0" })).toBe(0);
     // A key only in an override counts; a -1 anywhere is no bound — not hidden behind a positive price.
-    expect(sp({ prompt: "0", completion: "0", overrides: [{ audio_output: "0.001" }] })!).toBeCloseTo(
-      0.001 * (2 * 0.5 + 30) * 50 * 1.2,
-      9,
-    );
+    // …and an output price only in an override is still an output price: no bound.
+    expect(sp({ prompt: "0", completion: "0", overrides: [{ audio_output: "0.001" }] })).toBeNull();
     expect(sp({ prompt: "0.000001", completion: "0", overrides: [{ prompt: "-1" }] })).toBeNull();
     expect(sp({ prompt: "0.000001", completion: "-1", overrides: [{ completion: "0.5" }] })).toBeNull();
     expect(sp({ prompt: "abc", completion: "0" })).toBeNull();
@@ -1775,7 +1818,7 @@ describe("media tools: review round 2 regressions (#246)", () => {
       headers: { ...LOCAL, cookie: t.f.cookies.owner, range: "bytes=0-1", "if-range": '"abc"' },
     });
     expect(r.statusCode).toBe(200);
-    expect(r.rawPayload.length).toBe(silentMp3().length);
+    expect(r.rawPayload.length).toBe(t.app.files!.get(id)!.bytes);
   });
 
   it("P3 usage screen: a reservation in progress is 진행 중, not 미제공; an unconfirmed one is 미제공", () => {

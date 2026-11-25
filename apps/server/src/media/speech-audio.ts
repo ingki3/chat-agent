@@ -9,51 +9,46 @@ import { removeTree } from "../python/service.js";
 import { storagePaths } from "../storage/paths.js";
 
 /**
- * The audio side of a long `speech_generate` (#248): every piece's MP3 is checked and measured, and the pieces are
- * joined into one MP3, by `audio_transcribe`'s ffmpeg (`AUDIO_FFMPEG`, default Homebrew's — `ffmpegOf`, ops §46) and
- * the ffprobe beside it, each run as its own sandboxed process group (`runIsolated`, #42): no network, no child
- * processes, a fixed environment, a time, memory and output limit; it reads only the call's folders. Without them
- * (not macOS, no ffmpeg/ffprobe) there is no `SpeechAudio`, and no speech is made at all (`media_audio_unavailable`,
- * before anything is paid).
+ * The audio side of a long `speech_generate` (#248): every answer is checked, decoded and measured, and the stored
+ * MP3 is always one this server encodes. The programs are `audio_transcribe`'s ffmpeg (`AUDIO_FFMPEG`, default
+ * Homebrew's — `ffmpegOf`, ops §46) and the ffprobe beside it, each run as its own sandboxed process group
+ * (`runIsolated`, #42): no network, no child processes, a fixed environment, a time, memory and output limit; it
+ * reads only the call's folders and writes only its `out/`. Without them (not macOS, no ffmpeg/ffprobe) there is no
+ * `SpeechAudio`, and no speech is made at all (`media_audio_unavailable`, before anything is paid).
  *
- * **How an answer is judged (#251 re-plan 4 — nothing of our own interprets audio bytes or log text):**
- * 1. integrity, from the strict decoder's **exit status only**: ffmpeg decodes the whole file (`-xerror -err_detect
- *    explode`, into the null muxer). Exit 0: clean. A run that did not really run — the runner failing to start it,
- *    a kill or time/memory/output limit, a signal, or an exit status that means one (sandbox-exec 71, 126, 127,
- *    ENOMEM 244, ffmpeg's own "received a signal" 255) — is `failed`; any other exit status is `corrupt`. Its log is
- *    never read;
- * 2. form and length, from what the decoder reports per frame: ffprobe decodes the file again and lists, as JSON,
- *    every stream (type, codec, attached-picture flag) and every decoded audio frame (channels, `nb_samples`, and its
- *    duration in the stream's time base — the frame's own rate is `nb_samples ÷ duration`). Taken: exactly one audio
- *    stream, codec `mp3`, no other stream but attached pictures, every frame at one rate and one channel count.
- *    Anything else is `unsupported`. The length is the integer sum of `nb_samples` — decoded samples, with the
- *    encoder's delay and padding already taken off by the decoder (as ffmpeg plays it). Over `maxSeconds` is
- *    `too_long`. The report is bounded (`probeOutputBytes`); one that does not read as that structure is `failed`.
- *
- * The join (`join`): the pieces — all of one form (the caller checks) — each decoded to the same PCM inside one
- * ffmpeg (`aformat` s16 mono at their own rate), concatenated in order (`concat` filter) and encoded once.
+ * **How an answer is taken (#251 re-plan 5 — the provider's bytes are never stored):**
+ * 1. the gate, from ffprobe's stream and container fields only (stable across versions): container `mp3`, exactly
+ *    one audio stream, codec `mp3`, no other stream but attached pictures — else `unsupported` (another container
+ *    such as WAV/MP4 even around MP3, another codec, no audio at all such as a PNG, a file ffprobe cannot read);
+ * 2. the decode: ffmpeg decodes the whole file strictly (`-xerror -err_detect explode`) to mono s16 PCM at one
+ *    rate — the call's (its first answer's stream rate), so a rate that changes inside an answer, or between
+ *    answers, is converted, not judged — into `out/`. Integrity is its **exit status only** (`decodeVerdict`: a run
+ *    that did not really run is `failed`, any other non-zero status `corrupt`); the length is the PCM's size: whole
+ *    samples. Over `maxSeconds` is `too_long` (ffmpeg's own `-fs` bounds the file);
+ * 3. the stored file: the call's PCM (one piece, or the pieces in order) encoded once by ffmpeg (`encode`) — and
+ *    measured again the same way before it is stored.
  *
  * Working folders: `<DATA_DIR>/speech-scratch/<uuid>/{in,out}`, removed when the call ends (and at server start).
  */
-/** A measurement: the decoded length, or why there is none. */
+/** A measurement: the decoded PCM (`pcm`, in `out/`) and its length, or why there is none. */
 export type Measured =
-  | { ok: true; seconds: number; samples: number; sampleRate: number; channels: 1 | 2 }
+  | { ok: true; seconds: number; samples: number; sampleRate: number; pcm: string }
   | { ok: false; reason: "corrupt" | "unsupported" | "too_long" | "failed" };
 
 export type SpeechAudio = {
   /** A fresh, owner-only working folder with `in/` and `out/` (the caller removes it: `removeSpeechWorkdir`). */
   workdir(): string;
   /**
-   * One MP3 of the working folder (`in/` or `out/`): its form checked over the whole file, then decoded to its end;
-   * its length from the decoded samples. `maxSeconds`: longer is `too_long`.
+   * One MP3 of the working folder: gated, then decoded to its end into mono s16 PCM at `sampleRate` (default: its
+   * own stream's) in `out/`; its length from that PCM. `maxSeconds`: longer is `too_long`.
    */
-  measure(file: string, o: { maxSeconds: number; signal?: AbortSignal | undefined }): Promise<Measured>;
-  /**
-   * The files (in `in/`, in this order, of one form at `sampleRate`) joined into one MP3 in `out/`: decoded to the
-   * same PCM, concatenated, encoded once (`bitrateK`, mono, at that rate). Its path, or undefined when ffmpeg failed.
-   */
-  join(
-    job: { workdir: string; files: string[]; bitrateK: number; sampleRate: number },
+  measure(
+    file: string,
+    o: { maxSeconds: number; sampleRate?: number | undefined; signal?: AbortSignal | undefined },
+  ): Promise<Measured>;
+  /** PCM files (`out/`, in this order, mono s16 at `sampleRate`) encoded once into one MP3 in `out/`; its path. */
+  encode(
+    job: { workdir: string; pcms: string[]; bitrateK: number; sampleRate: number },
     signal?: AbortSignal,
   ): Promise<string | undefined>;
 };
@@ -167,11 +162,41 @@ export function speechTools(
   return { ffmpeg: ff.ffmpeg, ffprobe: probe };
 }
 
-const PIECE = /^piece-\d{3}\.mp3$/;
-
-/** The strict ffmpeg decode of one whole file — its exit status is the integrity verdict (exported for tests). */
-export function decodeOptions(tools: { ffmpeg: Ffmpeg }, file: string): RunIsolatedOptions {
+/** ffprobe's gate: the container and the streams, as JSON (exported for tests). */
+export function gateOptions(tools: { ffmpeg: Ffmpeg; ffprobe: string }, file: string): RunIsolatedOptions {
   const dir = path.dirname(file);
+  return {
+    command: tools.ffprobe,
+    args: [
+      "-v",
+      "error",
+      "-hide_banner",
+      "-show_entries",
+      "format=format_name:stream=codec_type,codec_name,sample_rate,channels:stream_disposition=attached_pic",
+      "-of",
+      "json",
+      file,
+    ],
+    cwd: dir,
+    env: { HOME: dir, LANG: "en_US.UTF-8" },
+    read: [dir],
+    write: [],
+    trusted: tools.ffmpeg.trusted,
+    network: "none",
+    noFlagChanges: true,
+    timeoutMs: SPEECH_AUDIO_LIMITS.measureTimeoutMs,
+    maxRssBytes: SPEECH_AUDIO_LIMITS.memoryBytes,
+    maxOutputBytes: 64 * 1024,
+  };
+}
+
+/** The strict decode of one whole file into mono s16 PCM at `sampleRate` (exported for tests). */
+export function decodeOptions(
+  tools: { ffmpeg: Ffmpeg },
+  job: { file: string; pcm: string; sampleRate: number; maxSeconds: number },
+): RunIsolatedOptions {
+  const dir = path.dirname(job.file);
+  const outDir = path.dirname(job.pcm);
   return {
     command: tools.ffmpeg.exe,
     args: [
@@ -184,21 +209,32 @@ export function decodeOptions(tools: { ffmpeg: Ffmpeg }, file: string): RunIsola
       "-xerror",
       "-err_detect",
       "explode",
+      "-f",
+      "mp3",
       "-i",
-      file,
+      job.file,
       "-map",
       "0:a:0",
       "-vn",
       "-sn",
       "-dn",
+      "-ac",
+      "1",
+      "-ar",
+      String(job.sampleRate),
+      "-c:a",
+      "pcm_s16le",
+      // A little over the cap: a longer answer is seen as longer, never written without bound.
+      "-fs",
+      String(Math.ceil((job.maxSeconds + 1) * job.sampleRate) * 2),
       "-f",
-      "null",
-      "-",
+      "s16le",
+      job.pcm,
     ],
-    cwd: dir,
-    env: { HOME: dir, LANG: "en_US.UTF-8" },
-    read: [dir],
-    write: [],
+    cwd: outDir,
+    env: { HOME: outDir, LANG: "en_US.UTF-8" },
+    read: dir === outDir ? [] : [dir],
+    write: [outDir],
     trusted: tools.ffmpeg.trusted,
     network: "none",
     noFlagChanges: true,
@@ -208,72 +244,35 @@ export function decodeOptions(tools: { ffmpeg: Ffmpeg }, file: string): RunIsola
   };
 }
 
-/** The bound of ffprobe's report for `maxSeconds` of audio: 50 frames a second at 100 bytes each, and some room. */
-export const probeOutputBytes = (maxSeconds: number): number => Math.ceil(maxSeconds * 50 * 100) + 256 * 1024;
-
-/** The ffprobe run that reports the streams and every decoded audio frame (exported for tests). */
-export function probeOptions(
-  tools: { ffmpeg: Ffmpeg; ffprobe: string },
-  file: string,
-  maxSeconds: number,
-): RunIsolatedOptions {
-  const dir = path.dirname(file);
-  return {
-    command: tools.ffprobe,
-    args: [
-      "-v",
-      "error",
-      "-hide_banner",
-      "-show_entries",
-      "stream=index,codec_type,codec_name,sample_rate,time_base:stream_disposition=attached_pic:frame=stream_index,channels,nb_samples,duration",
-      "-of",
-      "json=c=1",
-      file,
-    ],
-    cwd: dir,
-    env: { HOME: dir, LANG: "en_US.UTF-8" },
-    read: [dir],
-    write: [],
-    trusted: tools.ffmpeg.trusted,
-    network: "none",
-    noFlagChanges: true,
-    timeoutMs: SPEECH_AUDIO_LIMITS.measureTimeoutMs,
-    maxRssBytes: SPEECH_AUDIO_LIMITS.memoryBytes,
-    maxOutputBytes: probeOutputBytes(maxSeconds),
-  };
-}
-
-/** The ffmpeg run that joins the pieces from PCM, encoded once (exported for the profile tests). */
-export function joinOptions(
+/** The ffmpeg run that encodes the PCM files, in order, into one MP3 (exported for tests). */
+export function encodeOptions(
   tools: { ffmpeg: Ffmpeg },
-  job: { workdir: string; files: string[]; bitrateK: number; sampleRate: number; out: string },
+  job: { workdir: string; pcms: string[]; bitrateK: number; sampleRate: number; out: string },
 ): RunIsolatedOptions {
-  const inDir = path.join(job.workdir, "in");
   const outDir = path.join(job.workdir, "out");
-  const names = job.files.map((f) => path.basename(f));
-  // Every piece decoded to the same PCM (s16, mono, the pieces' one rate), then concatenated in order.
-  const pcm = names.map(
-    (_, i) => `[${i}:a:0]aformat=sample_fmts=s16:channel_layouts=mono:sample_rates=${job.sampleRate}[p${i}]`,
-  );
   return {
     command: tools.ffmpeg.exe,
     args: [
       "-nostdin",
       "-hide_banner",
+      "-nostats",
       "-v",
       "error",
-      "-xerror",
-      ...names.flatMap((n) => ["-f", "mp3", "-i", path.join(inDir, n)]),
-      "-filter_complex",
-      `${pcm.join(";")};${names.map((_, i) => `[p${i}]`).join("")}concat=n=${names.length}:v=0:a=1[a]`,
-      "-map",
-      "[a]",
+      "-f",
+      "s16le",
+      "-ar",
+      String(job.sampleRate),
+      "-ac",
+      "1",
+      // The PCM files one after another, as one input (raw samples: nothing between them).
+      "-protocol_whitelist",
+      "concat,file",
+      "-i",
+      `concat:${job.pcms.join("|")}`,
       "-c:a",
       "libmp3lame",
       "-b:a",
       `${job.bitrateK}k`,
-      "-ac",
-      "1",
       "-map_metadata",
       "-1",
       // The 50MB file cap as ffmpeg's own output limit (a bigger result is refused by the caller).
@@ -285,7 +284,7 @@ export function joinOptions(
     ],
     cwd: outDir,
     env: { HOME: outDir, LANG: "en_US.UTF-8" },
-    read: [inDir],
+    read: [],
     write: [outDir],
     trusted: tools.ffmpeg.trusted,
     network: "none",
@@ -311,77 +310,44 @@ export function decodeVerdict(
   return "corrupt";
 }
 
-const Probe = z.object({
+const Gate = z.object({
+  format: z.object({ format_name: z.string().max(200).optional() }).optional(),
   streams: z
     .array(
       z.object({
-        index: z.number().int().min(0),
         codec_type: z.string().max(40).optional(),
         codec_name: z.string().max(40).optional(),
         sample_rate: z.coerce.number().int().positive().optional(),
-        time_base: z
-          .string()
-          .regex(/^\d{1,12}\/\d{1,12}$/)
-          .optional(),
         disposition: z.object({ attached_pic: z.number().int() }).partial().optional(),
       }),
     )
-    .max(16),
-  frames: z
-    .array(
-      z.object({
-        stream_index: z.number().int().min(0),
-        channels: z.number().int().min(0).max(8).optional(),
-        nb_samples: z.number().int().min(0).optional(),
-        duration: z.number().int().min(0).optional(),
-      }),
-    )
+    .max(64)
     .optional(),
 });
 
 /**
- * ffprobe's report judged (exported for tests): the one form taken — one audio stream, `mp3`, nothing else but
- * attached pictures, every decoded frame at the stream's rate (`nb_samples ÷ duration` in its time base) and at
- * one channel count — and its decoded samples summed. `failed` when the report is not that structure.
+ * ffprobe's gate judged (exported for tests): container `mp3`, exactly one audio stream, codec `mp3`, no other
+ * stream but attached pictures — its stream rate (the call's PCM rate when it is the first answer). Anything else,
+ * or a report that is not that structure, is `unsupported` (the file is not an answer this server takes).
  */
-export function judgeProbe(
-  stdout: string,
-):
-  | { ok: true; samples: number; sampleRate: number; channels: 1 | 2 }
-  | { ok: false; reason: "unsupported" | "failed" } {
-  let parsed: z.infer<typeof Probe>;
+export function judgeGate(stdout: string): { ok: true; sampleRate: number } | { ok: false } {
+  let g: z.infer<typeof Gate>;
   try {
-    const p = Probe.safeParse(JSON.parse(stdout));
-    if (!p.success) return { ok: false, reason: "failed" };
-    parsed = p.data;
+    const p = Gate.safeParse(JSON.parse(stdout));
+    if (!p.success) return { ok: false };
+    g = p.data;
   } catch {
-    return { ok: false, reason: "failed" };
+    return { ok: false };
   }
-  const audio = parsed.streams.filter((st) => st.codec_type === "audio");
-  const others = parsed.streams.filter(
+  if (g.format?.format_name !== "mp3") return { ok: false };
+  const streams = g.streams ?? [];
+  const audio = streams.filter((st) => st.codec_type === "audio");
+  const others = streams.filter(
     (st) => st.codec_type !== "audio" && !(st.codec_type === "video" && st.disposition?.attached_pic === 1),
   );
-  if (audio.length !== 1 || others.length) return { ok: false, reason: "unsupported" };
-  const a = audio[0]!;
-  if (a.codec_name !== "mp3") return { ok: false, reason: "unsupported" };
-  if (!a.sample_rate || !a.time_base) return { ok: false, reason: "failed" };
-  const [num, den] = a.time_base.split("/").map(Number) as [number, number];
-  if (!num || !den) return { ok: false, reason: "failed" };
-  const frames = (parsed.frames ?? []).filter((f) => f.stream_index === a.index);
-  let samples = 0;
-  let channels: number | undefined;
-  for (const f of frames) {
-    if (f.nb_samples === undefined || f.channels === undefined || f.duration === undefined)
-      return { ok: false, reason: "failed" };
-    if (f.nb_samples === 0) continue;
-    // The frame's own rate, exactly: nb_samples = rate × duration × num ÷ den.
-    if (f.nb_samples * den !== a.sample_rate * f.duration * num) return { ok: false, reason: "unsupported" };
-    if (channels === undefined) channels = f.channels;
-    else if (channels !== f.channels) return { ok: false, reason: "unsupported" };
-    samples += f.nb_samples;
-  }
-  if (channels !== 1 && channels !== 2) return { ok: false, reason: samples ? "unsupported" : "failed" };
-  return { ok: true, samples, sampleRate: a.sample_rate, channels };
+  if (audio.length !== 1 || others.length || audio[0]!.codec_name !== "mp3" || !audio[0]!.sample_rate)
+    return { ok: false };
+  return { ok: true, sampleRate: audio[0]!.sample_rate };
 }
 
 /** A regular file with one name (not a link): its size, or undefined. */
@@ -390,7 +356,7 @@ function plainSize(file: string): number | undefined {
   return st?.isFile() && st.nlink === 1 ? st.size : undefined;
 }
 
-/** The `SpeechAudio` the app uses: the sandboxed ffmpeg (undefined without it). */
+/** The `SpeechAudio` the app uses: the sandboxed ffmpeg and ffprobe (undefined without them). */
 export function sandboxedSpeechAudio(o: {
   dataDir: string;
   ffmpegPath?: string | undefined;
@@ -413,33 +379,39 @@ export function sandboxedSpeechAudio(o: {
     workdir: () => makeSpeechWorkdir(o.dataDir),
     async measure(file, m) {
       if (plainSize(file) === undefined) return { ok: false, reason: "failed" };
-      // 1. Integrity: the strict decode's exit status.
-      const verdict = decodeVerdict(await attempt(decodeOptions(tools, file), m.signal));
-      if (verdict !== "ok") return { ok: false, reason: verdict };
-      // 2. Form and length: what the decoder reports for every frame.
-      const r = await attempt(probeOptions(tools, file, m.maxSeconds), m.signal);
-      if (decodeVerdict(r) !== "ok") return { ok: false, reason: "failed" };
-      const j = judgeProbe(r!.stdout);
-      if (!j.ok) return j;
-      // The cap, on the decoded samples.
-      if (j.samples > m.maxSeconds * j.sampleRate) return { ok: false, reason: "too_long" };
-      return {
-        ok: true,
-        samples: j.samples,
-        seconds: j.samples / j.sampleRate,
-        sampleRate: j.sampleRate,
-        channels: j.channels,
-      };
+      // 1. The gate: ffprobe's container and stream fields.
+      const g = await attempt(gateOptions(tools, file), m.signal);
+      const gv = decodeVerdict(g);
+      if (gv === "failed") return { ok: false, reason: "failed" };
+      // A file ffprobe cannot read, or not the one form: not an answer this server takes.
+      const gate = gv === "ok" ? judgeGate(g!.stdout) : { ok: false as const };
+      if (!gate.ok) return { ok: false, reason: "unsupported" };
+      // 2. The strict decode into PCM at the call's rate.
+      const sampleRate = m.sampleRate ?? gate.sampleRate;
+      const pcm = path.join(path.dirname(path.dirname(file)), "out", `pcm-${++n}.s16`);
+      const verdict = decodeVerdict(
+        await attempt(decodeOptions(tools, { file, pcm, sampleRate, maxSeconds: m.maxSeconds }), m.signal),
+      );
+      const size = verdict === "ok" ? plainSize(pcm) : undefined;
+      if (verdict !== "ok" || size === undefined || size % 2) {
+        fs.rmSync(pcm, { force: true });
+        return { ok: false, reason: verdict === "corrupt" ? "corrupt" : "failed" };
+      }
+      const samples = size / 2;
+      if (samples > m.maxSeconds * sampleRate) {
+        fs.rmSync(pcm, { force: true });
+        return { ok: false, reason: "too_long" };
+      }
+      return { ok: true, samples, seconds: samples / sampleRate, sampleRate, pcm };
     },
-    async join(job, signal) {
-      const inDir = path.join(job.workdir, "in");
-      if (!job.files.length) return undefined;
-      for (const f of job.files)
-        if (path.dirname(f) !== inDir || !PIECE.test(path.basename(f)) || plainSize(f) === undefined)
-          return undefined;
-      const out = path.join(job.workdir, "out", `speech-${++n}.mp3`);
-      const r = await attempt(joinOptions(tools, { ...job, out }), signal);
-      if (!r || r.killed || r.code !== 0) return undefined;
+    async encode(job, signal) {
+      const outDir = path.join(job.workdir, "out");
+      if (!job.pcms.length) return undefined;
+      for (const f of job.pcms)
+        if (path.dirname(f) !== outDir || plainSize(f) === undefined) return undefined;
+      const out = path.join(outDir, `speech-${++n}.mp3`);
+      const r = await attempt(encodeOptions(tools, { ...job, out }), signal);
+      if (decodeVerdict(r) !== "ok") return undefined;
       return plainSize(out) === undefined ? undefined : out;
     },
   };

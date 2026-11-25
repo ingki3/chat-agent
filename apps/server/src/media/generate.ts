@@ -22,7 +22,13 @@ import { carriesSecret } from "../secrets/egress.js";
 import { MIN_KNOWN_LENGTH, scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 import type { UsageStore } from "../usage/store.js";
 import type { MediaBudget } from "./budget.js";
-import { boundMicros, imageCostBound, MAX_IMAGE_PIXELS, speechCostBound } from "./cost.js";
+import {
+  boundMicros,
+  imageCostBound,
+  MAX_IMAGE_PIXELS,
+  speechCostBound,
+  speechOutputPriced,
+} from "./cost.js";
 import type { OpenRouterKeys } from "./keys.js";
 import {
   GENERATION_ID,
@@ -97,13 +103,13 @@ import {
  * reservation's moment, `ctx.startedAt` — #251 r3): every row, retry pieces included, is written with that moment and
  * every budget check is for that day only; past midnight nothing moves (two days' limits may be used back to back
  * across midnight). Pieces go one after another. Right before each request, synchronously: its fields pass the
- * egress check again (a secret registered meanwhile) and the row becomes `reserved` (sent). Each answer is measured
- * (decoded to its end by ffmpeg, `speech-audio.ts`; a decoding error is `media_audio_corrupt`) and a piece that came back cut (at the provider's mark, or far shorter than its
- * estimate) is split smaller and tried once more — within the call's cap on paid requests, its pieces reserved
- * (budget check again) just before they are sent; cut again is `media_truncated`. Then ffmpeg
- * joins the pieces into one MP3 (every piece — all of one form — decoded to the same PCM, concatenated, encoded
- * once; at a lower rate when the result passes 50MB), its exact length is checked against the pieces' summed
- * samples, and it is stored as one file. Any stop on
+ * egress check again (a secret registered meanwhile) and the row becomes `reserved` (sent). Each answer is gated
+ * and decoded to its end into PCM at the call's rate (`speech-audio.ts`; a decoding error is `media_audio_corrupt`),
+ * and a piece that came back cut (at the provider's mark, or far shorter than its estimate) is split smaller and
+ * tried once more — within the call's cap on paid requests, its pieces reserved (budget check again) just before
+ * they are sent; cut again is `media_truncated`. Then the pieces' PCM is encoded once by ffmpeg into the MP3 that is
+ * stored — never the provider's bytes (#251 re-plan 5) — and that MP3's length is checked against the pieces'
+ * summed samples. Any stop on
  * the way (a failed or refused piece, cancel, a settings change, the call's time budget) stores nothing: the pieces
  * already sent keep their rows (their cost is recorded), the reserved rows of pieces never sent are removed. Every
  * piece is measured (decoded; its length from the decoded samples): without ffmpeg no speech is made at all —
@@ -750,6 +756,8 @@ export class MediaGenerator {
       ...(input.instructions ? { instructions: input.instructions } : {}),
       ...(moderation ? { moderation } : {}),
     });
+    // Priced on its output (audio tokens or seconds): its cost has no bound — refused before anything is sent.
+    if (speechOutputPriced(endpoints)) throw new MediaToolError("media_no_price", OUTPUT_PRICED);
     // Every bound as the integer micro-USD its row will hold: the check sums exactly what is reserved (#248).
     const microsOf = (text: string) => {
       const b = speechCostBound(endpoints, { text, instructions: input.instructions });
@@ -940,8 +948,8 @@ export class MediaGenerator {
     const unsent = new Set(reserved.map((p) => p.callId));
     const costs: Promise<number | null>[] = [];
     const made: Made[] = [];
-    /** The call's audio form: the first answer measured. */
-    let form: { sampleRate: number; channels: 1 | 2 } | undefined;
+    /** The call's PCM rate: the first answer's own (#251 re-plan 5). */
+    let sampleRate: number | undefined;
     let bytesSoFar = 0;
     let n = 0;
     const started = this.now();
@@ -979,19 +987,22 @@ export class MediaGenerator {
         if (!r.bytes.length) throw new MediaToolError("media_audio_unsupported");
         const file = path.join(workdir, "in", `piece-${String(n++).padStart(3, "0")}.mp3`);
         fs.writeFileSync(file, r.bytes, { flag: "wx", mode: 0o600 });
-        // Its form checked and its length decoded to the end (#251 re-plans 2–3): a corrupt, unsupported or
+        // Gated, then decoded to its end into PCM at the call's rate (#251 re-plan 5): a corrupt, unsupported or
         // abnormally long answer, or one that could not be measured, ends the call — no file, no retry (the cost
-        // stays recorded); a clean but short one goes to the re-split below.
-        const m = await audio.measure(file, { maxSeconds: this.split.pieceMaxSeconds, signal: ctx.signal });
+        // stays recorded); a clean but short one goes to the re-split below. The first answer decoded fixes the
+        // call's rate (also when it is cut and not kept); later ones are converted to it.
+        const m = await audio.measure(file, {
+          maxSeconds: this.split.pieceMaxSeconds,
+          sampleRate,
+          signal: ctx.signal,
+        });
         if (!m.ok) throw this.stopped(ctx) ?? measuredError(m.reason);
-        // Every answer of one call in one form (they are joined from the same PCM): the first one measured fixes it —
-        // also when it was cut and is not kept (#251 r7), so a retry's answer is held to it too.
-        form ??= { sampleRate: m.sampleRate, channels: m.channels };
-        if (form.sampleRate !== m.sampleRate || form.channels !== m.channels)
-          throw new MediaToolError("media_audio_unsupported");
+        sampleRate ??= m.sampleRate;
+        // The provider's bytes are done with: only the PCM goes on.
+        fs.rmSync(file, { force: true });
         if (looksCut(p.text, m.seconds, this.split)) {
           // Cut by the provider: smaller pieces, once (their rows reserved — and the budget checked — first).
-          fs.rmSync(file, { force: true });
+          fs.rmSync(m.pcm, { force: true });
           const parts = p.retry ? [] : resplitSpeech(p.text, this.split);
           if (!parts.length) throw new MediaToolError("media_truncated");
           if (!ctx.alive()) throw new MediaToolError("media_cancelled");
@@ -1009,14 +1020,7 @@ export class MediaGenerator {
           queue.unshift(...again.map((a) => ({ ...a, retry: true })));
           continue;
         }
-        made.push({
-          file,
-          bytes: r.bytes,
-          seconds: m.seconds,
-          samples: m.samples,
-          sampleRate: m.sampleRate,
-          channels: m.channels,
-        });
+        made.push({ pcm: m.pcm, seconds: m.seconds, samples: m.samples, sampleRate: m.sampleRate });
         bytesSoFar += r.bytes.length;
       }
       const joined = await this.joined(ctx, made, workdir);
@@ -1048,10 +1052,10 @@ export class MediaGenerator {
   }
 
   /**
-   * The pieces as one MP3 (#248): one piece as it came (its form already checked: MPEG Layer III); several joined
-   * by ffmpeg from PCM — each decoded to the same PCM at their one rate, concatenated in order, encoded once (128
-   * kbit/s mono; over 50MB once more at 64 kbit/s) — and the result decoded and measured like a piece: the pieces'
-   * summed samples within 1 s + 0.25 s per piece (a gross loss only — #251 r7), or nothing is stored.
+   * The stored MP3 (#248, #251 re-plan 5): always this server's own encode — never the provider's bytes. The pieces'
+   * PCM (one piece, or several in order) encoded once (one piece 192 kbit/s, several 128; over 50MB once more at 64)
+   * and the result decoded and measured like an answer: the pieces' summed samples within 1 s + 0.25 s per piece (a
+   * gross loss only), or nothing is stored. A result that cannot be measured is `media_measure_failed`.
    */
   private async joined(
     ctx: CallCtx,
@@ -1063,29 +1067,36 @@ export class MediaGenerator {
     if (!first) throw new MediaToolError("media_failed");
     const round = (s: number) => Math.round(s * 100) / 100;
     if (!audio || !workdir) throw new MediaToolError("media_failed");
-    if (made.length === 1) return { bytes: first.bytes, seconds: round(first.seconds) };
     if (!ctx.alive()) throw new MediaToolError("media_cancelled");
-    const files = made.map((m) => m.file);
+    const pcms = made.map((m) => m.pcm);
     const sampleRate = first.sampleRate;
-    // The exact sum of the pieces' decoded samples: the joined audio must hold all of it.
     const want = made.reduce((a, m) => a + m.samples, 0);
     const size = (f: string) => fs.statSync(f).size;
-    let out = await audio.join({ workdir, files, bitrateK: 128, sampleRate }, ctx.signal);
+    let out = await audio.encode(
+      { workdir, pcms, bitrateK: made.length === 1 ? 192 : 128, sampleRate },
+      ctx.signal,
+    );
     if (out && size(out) > FILE_LIMITS.bytes)
-      out = await audio.join({ workdir, files, bitrateK: 64, sampleRate }, ctx.signal);
+      out = await audio.encode({ workdir, pcms, bitrateK: 64, sampleRate }, ctx.signal);
     if (!out || !size(out) || size(out) > FILE_LIMITS.bytes)
       throw this.stopped(ctx) ?? new MediaToolError("media_failed");
-    const m = await audio.measure(out, { maxSeconds: (want / sampleRate) * 2 + 60, signal: ctx.signal });
+    // The pieces' PCM is done with.
+    for (const f of pcms) fs.rmSync(f, { force: true });
+    const m = await audio.measure(out, {
+      maxSeconds: (want / sampleRate) * 2 + 60,
+      sampleRate,
+      signal: ctx.signal,
+    });
     // Not measured: the same outcome (and hint — the cost is recorded) as a piece's; anything else is ours.
     if (!m.ok)
       throw (
         this.stopped(ctx) ??
         new MediaToolError(m.reason === "failed" ? "media_measure_failed" : "media_failed")
       );
-    // A gross loss only (#251 r7: the encoder's delay and padding, and decoders' own rounding, are well inside this).
-    if (m.sampleRate !== sampleRate || Math.abs(m.samples - want) > sampleRate * (1 + 0.25 * made.length))
+    fs.rmSync(m.pcm, { force: true });
+    // A gross loss only (the encoder's delay and padding are well inside this).
+    if (Math.abs(m.samples - want) > sampleRate * (1 + 0.25 * made.length))
       throw new MediaToolError("media_failed");
-    // Our own encode, measured above as one mp3 stream.
     return { bytes: fs.readFileSync(out), seconds: round(m.seconds) };
   }
 
@@ -1190,6 +1201,10 @@ type PlannedPiece = { text: string; micros: number };
  */
 type Piece = PlannedPiece & { callId: string; retry?: boolean };
 
+/** #251 r9: a speech model priced on its output — no upper bound of a call's cost. */
+const OUTPUT_PRICED =
+  "이 음성 모델은 만든 음성의 양(오디오 토큰·초)으로 과금돼 한 번 호출의 최대 비용을 정할 수 없어 보내지 않았어요. 관리자에게 글자(입력) 기준으로 과금되는 모델을 부탁하세요.";
+
 /** #251 r3: a single character (grapheme cluster) too long to be read in one piece. */
 const UNSPLITTABLE =
   "글 안에 나눌 수 없을 만큼 긴 한 글자(결합 문자열)가 있어 읽을 수 없어요. 그 부분을 고쳐 다시 요청해 주세요(비용은 나가지 않았어요).";
@@ -1198,14 +1213,8 @@ const UNSPLITTABLE =
 const TOO_MANY_REQUESTS =
   "음성 조각이 제공자 쪽에서 끊겨 다시 나누면 한 번의 호출에서 보낼 수 있는 요청 수를 넘어 멈췄어요. 파일은 저장하지 않았고, 이미 나간 비용은 기록됐어요. 글을 몇 부분으로 나눠 따로 요청해 주세요.";
 /** A piece's answer: its bytes, and (measured) its file in the working folder and its stream. */
-type Made = {
-  bytes: Buffer;
-  file: string;
-  seconds: number;
-  samples: number;
-  sampleRate: number;
-  channels: 1 | 2;
-};
+/** A piece kept: its decoded PCM (in `out/`) and its length at the call's rate. */
+type Made = { pcm: string; seconds: number; samples: number; sampleRate: number };
 
 /** A measurement that did not succeed, as the tool's outcome (#251 re-plans 2–3). */
 function measuredError(reason: "corrupt" | "unsupported" | "too_long" | "failed"): MediaToolError {

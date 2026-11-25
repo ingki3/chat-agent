@@ -25,8 +25,8 @@ export const SPEECH_SPLIT = {
   slow: { syllables: 4.5, digits: 3, chars: 11, sentencePause: 0.4 },
   typical: { syllables: 6.5, digits: 4.5, chars: 15, sentencePause: 0.25 },
   /**
-   * The longest a piece's decoded audio may be (#251 re-plan 3): an answer longer than this is abnormal (no file,
-   * no retry, its cost recorded) — it is not even decoded when its frames already say so.
+   * The longest a piece's decoded audio may be (#251 re-plans 3–5): an answer whose decoded samples are longer than
+   * this is abnormal (no file, no retry, its cost recorded); the decode stops writing a little past it (`-fs`).
    */
   pieceMaxSeconds: 600,
   /** Pieces of one call at most, as first split; more is `media_too_long` (nothing is sent). */

@@ -274,47 +274,52 @@ export function fixtureMp3Frames(
   return out;
 }
 
+/** One silent MPEG Layer III frame at `rate` (any of the nine MPEG-1/2/2.5 rates), mono. */
+function silentFrame(rate: number): Buffer {
+  const version = [3, 2, 0].find((v) => RATES[v]!.includes(rate));
+  if (version === undefined) throw new Error(`no MPEG rate ${rate}`);
+  const si = RATES[version]!.indexOf(rate);
+  const v1 = version === 3;
+  const bi = 9;
+  const len = Math.floor(((v1 ? 144 : 72) * (v1 ? KBPS_V1 : KBPS_V2)[bi]! * 1000) / rate);
+  const f = Buffer.alloc(len);
+  f.set([0xff, 0xe2 | (version << 3) | (1 << 1) | 1, (bi << 4) | (si << 2), 0xc4]);
+  return f;
+}
+
 /**
- * A scripted ffmpeg/ffprobe (measure, join) for the FAKE_RUNTIME (e2e) server and tests, with the real one's
- * semantics (#251 re-plan 4) on its own small model (`fixtureMp3Frames`): `corrupt` for `FIXTURE_CORRUPT_MARK`;
- * `unsupported` unless every frame is Layer III at one rate and channel count; the length is the frames' samples;
- * `too_long` over the cap. The join is the pieces' frames one after another. No program runs. Working folders as the
- * real one's.
+ * A scripted ffprobe/ffmpeg (measure, encode) for the FAKE_RUNTIME (e2e) server and tests, with the real one's
+ * semantics (#251 re-plan 5) on its own small model (`fixtureMp3Frames`): `corrupt` for `FIXTURE_CORRUPT_MARK`;
+ * `unsupported` when there is no Layer III frame at all; the "decode" converts every frame's samples to the call's
+ * rate (the first answer's) and writes that many PCM samples (silence) into `out/`; `too_long` over the cap. The
+ * "encode" writes silent frames for the PCM files' samples. It does not model the decoder's delay/padding trimming
+ * or Xing/Info frames — boundary tests use counts the real decoder confirmed. No program runs.
  */
 export function fixtureSpeechAudio(dataDir: string): SpeechAudio {
-  let joins = 0;
+  let n = 0;
   return {
     workdir: () => makeSpeechWorkdir(dataDir),
     async measure(file, m): Promise<Measured> {
       const b = fs.readFileSync(file);
       if (b.includes(FIXTURE_CORRUPT_MARK, 0, "latin1")) return { ok: false, reason: "corrupt" };
-      const frames = fixtureMp3Frames(b);
+      const frames = fixtureMp3Frames(b).filter((f) => f.layer === 1);
       const first = frames[0];
-      if (
-        !first ||
-        frames.some((f) => f.layer !== 1 || f.rate !== first.rate || f.channels !== first.channels)
-      )
-        return { ok: false, reason: "unsupported" };
-      const samples = frames.reduce((a, f) => a + f.samples, 0);
-      if (samples > m.maxSeconds * first.rate) return { ok: false, reason: "too_long" };
-      return {
-        ok: true,
-        samples,
-        seconds: samples / first.rate,
-        sampleRate: first.rate,
-        channels: first.channels,
-      };
+      if (!first) return { ok: false, reason: "unsupported" };
+      const sampleRate = m.sampleRate ?? first.rate;
+      const samples = Math.round(frames.reduce((a, f) => a + (f.samples * sampleRate) / f.rate, 0));
+      if (samples > m.maxSeconds * sampleRate) return { ok: false, reason: "too_long" };
+      const pcm = path.join(path.dirname(path.dirname(file)), "out", `pcm-${++n}.s16`);
+      fs.writeFileSync(pcm, Buffer.alloc(samples * 2), { mode: 0o600 });
+      return { ok: true, samples, seconds: samples / sampleRate, sampleRate, pcm };
     },
-    async join(job) {
-      const parts: Buffer[] = [];
-      for (const file of job.files) {
-        const b = fs.readFileSync(file);
-        const frames = fixtureMp3Frames(b);
-        if (!frames.length) return undefined;
-        for (const fr of frames) parts.push(b.subarray(fr.start, fr.end));
-      }
-      const out = path.join(job.workdir, "out", `speech-${++joins}.mp3`);
-      fs.writeFileSync(out, Buffer.concat(parts), { mode: 0o600 });
+    async encode(job) {
+      const samples = job.pcms.reduce((a, f) => a + fs.statSync(f).size / 2, 0);
+      const frame = silentFrame(job.sampleRate);
+      const spf = job.sampleRate >= 32000 ? 1152 : 576;
+      const out = path.join(job.workdir, "out", `speech-${++n}.mp3`);
+      fs.writeFileSync(out, Buffer.concat(Array.from({ length: Math.round(samples / spf) }, () => frame)), {
+        mode: 0o600,
+      });
       return out;
     },
   };
