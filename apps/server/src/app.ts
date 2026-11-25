@@ -106,6 +106,8 @@ import { registerMediaRoutes } from "./media/routes.js";
 import { fixtureOpenRouterFetch } from "./media/fixture.js";
 import { MediaGenerator } from "./media/generate.js";
 import { MediaRecovery, MediaSettler } from "./media/settle.js";
+import { sandboxedSpeechAudio, sweepSpeechScratch, type SpeechAudio } from "./media/speech-audio.js";
+import type { SpeechSplitLimits } from "./media/speech-split.js";
 import { youtubeState, type YoutubeState } from "./youtube/packages.js";
 import { sandboxedYoutubeRunner, type YoutubeRunner } from "./youtube/runner.js";
 import { YoutubeAudioFetcher } from "./youtube/service.js";
@@ -374,6 +376,12 @@ export type BuildOptions = {
     recoverAtStart?: boolean;
     /** Tests: whether the recovery retries in the background. */
     recovery?: { background?: boolean };
+    /**
+     * Long speech (#248): ffprobe/ffmpeg that measure and join the pieces (default: the sandboxed ones beside
+     * AUDIO_FFMPEG; in tests none, unless given) and the piece sizing (tests: short pieces).
+     */
+    speechAudio?: () => SpeechAudio | undefined;
+    split?: SpeechSplitLimits;
   };
   python?: {
     runner?: PythonRunner;
@@ -686,6 +694,13 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       keyGeneration: () => mediaAdmin.generation(),
       recovering: () => mediaRecovery.recovering(),
       ...(opts.media?.sleep ? { sleep: opts.media.sleep } : {}),
+      // #248: resolved per call (ffmpeg may be installed or removed while the server runs).
+      speechAudio:
+        opts.media?.speechAudio ??
+        (config.env === "test"
+          ? () => undefined
+          : () => sandboxedSpeechAudio({ dataDir: config.dataDir, ffmpegPath: config.audioFfmpeg })),
+      ...(opts.media?.split ? { split: opts.media.split } : {}),
     });
     // Late cost settlement (#238 review r2): generations still waiting for their cost are looked up again with a
     // backoff, also after a restart. Not in tests (they drive `runOnce`).
@@ -1134,6 +1149,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         if (!scratchpad.sweep(pythonAccount)) logEvent(app.log, "warn", "python.sweep_failed");
         if (!audio.sweep()) logEvent(app.log, "warn", "audio.sweep_failed");
         if (!youtube.sweep()) logEvent(app.log, "warn", "youtube.sweep_failed");
+        if (!sweepSpeechScratch(config.dataDir)) logEvent(app.log, "warn", "media.sweep_failed");
         startSelfCheck();
         // Worker job folders of the last process (#122), then the worker account's checks.
         if (!sweepWorkerScratch(config.dataDir, workerAccount))

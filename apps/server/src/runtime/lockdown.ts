@@ -14,8 +14,12 @@ const SLOW_TOOLS: readonly { name: string; callTimeoutMs: number }[] = [
   { name: IMAGE_GENERATE_TOOL.name, callTimeoutMs: MEDIA_TOOL_LIMITS.imageTimeoutMs + 30_000 },
   {
     name: SPEECH_GENERATE_TOOL.name,
+    // A long script (#248): pieces start until the call's budget is spent; the last piece, the join (3 min) and
+    // the cost lookups still finish after it.
     callTimeoutMs:
+      MEDIA_TOOL_LIMITS.speechCallTimeoutMs +
       MEDIA_TOOL_LIMITS.speechTimeoutMs +
+      180_000 +
       MEDIA_TOOL_LIMITS.costTries * (MEDIA_TOOL_LIMITS.costWaitMs + 15_000),
   },
 ];

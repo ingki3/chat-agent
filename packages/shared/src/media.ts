@@ -187,7 +187,11 @@ export const MEDIA_ERRORS: Record<string, string> = {
 /** `image_generate` / `speech_generate` (#238 stage 2): input limits and the stored files. */
 export const MEDIA_TOOL_LIMITS = {
   promptChars: 4000,
-  speechChars: 4000,
+  /**
+   * The whole text of one speech call (#248: longer than one provider call can read — it is split into pieces,
+   * see apps/server/src/media/speech-split.ts; about 40 minutes of Korean at a slow reading rate).
+   */
+  speechChars: 12_000,
   instructionsChars: 500,
   voiceChars: 100,
   /** Conversation images an image call may take as references (png·jpg·webp of the same conversation). */
@@ -197,7 +201,13 @@ export const MEDIA_TOOL_LIMITS = {
   referenceTotalBytes: 20 * 1024 * 1024,
   /** How long one generation may take (the image providers can take a minute). */
   imageTimeoutMs: 180_000,
+  /** One TTS request (one piece of a long text). */
   speechTimeoutMs: 120_000,
+  /**
+   * A whole speech call (#248): no new piece starts after this; the one under way, the join and the cost lookups
+   * still finish (the runtimes' MCP tool timeout is set above all of it — runtime/lockdown.ts).
+   */
+  speechCallTimeoutMs: 30 * 60_000,
   /** Tries of `GET /generation?id=` after a speech call (its record can lag a little), and the wait between. */
   costTries: 3,
   costWaitMs: 1500,
@@ -229,6 +239,12 @@ export const MEDIA_TOOL_CODES = [
   /** A usage row of a generation could not be written (operator's log and error list only). */
   "media_usage_failed",
   "media_recovering",
+  /** #248: the text needs more pieces than one call may make. */
+  "media_too_long",
+  /** #248: the text needs several pieces, and this server has no ffmpeg/ffprobe to measure and join them. */
+  "media_split_unavailable",
+  /** #248: a piece came back cut by the provider, and again after it was split smaller. */
+  "media_truncated",
 ] as const;
 export type MediaToolCode = (typeof MEDIA_TOOL_CODES)[number];
 
@@ -258,4 +274,10 @@ export const MEDIA_TOOL_HINTS: Partial<Record<MediaToolCode, string>> = {
   media_recovering:
     "서버가 지난번 미디어 생성 비용 기록을 정리하는 중이라 지금은 만들 수 없어요. 잠시 뒤에 다시 해 주세요.",
   media_changed: "그사이 관리자가 생성 설정이나 키를 바꿨어요. 다시 요청해 주세요.",
+  media_too_long:
+    "글이 너무 길어 한 번에 읽을 수 없어요. 몇 부분으로 나눠 따로 요청해 주세요(이미 나간 비용은 없어요).",
+  media_split_unavailable:
+    "이 글은 약 4분이 넘어 여러 조각으로 나눠 합성해야 하는데, 이 서버에 ffmpeg가 없어 이어 붙일 수 없어요. 더 짧게 나눠 요청하거나 관리자에게 ffmpeg 설치를 부탁하세요(비용은 나가지 않았어요).",
+  media_truncated:
+    "음성이 제공자 쪽에서 중간에 끊겨 와서(더 잘게 나눠 다시 해도 끊김) 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 글을 더 짧게 나눠 요청해 주세요.",
 };

@@ -57,6 +57,8 @@ export function storagePaths(dataDir: string) {
     youtubePackages: path.join(root, "youtube-packages"),
     /** `youtube_audio_fetch` working folders (#191): `youtube-scratch/<job id>`, removed when the call ends and at start. */
     youtubeScratch: path.join(root, "youtube-scratch"),
+    /** `speech_generate` working folders (#248): `speech-scratch/<uuid>`, removed when the call ends and at start. */
+    speechScratch: path.join(root, "speech-scratch"),
     conversationFiles: (userId: string, conversationId: string) =>
       path.join(root, "files", assertSafeId("user", userId), assertSafeId("conversation", conversationId)),
     runtimeHome: (connectionId: string) =>
