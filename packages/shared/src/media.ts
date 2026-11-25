@@ -244,8 +244,8 @@ export const MEDIA_TOOL_CODES = [
   "media_recovering",
   /** #248: the text needs more pieces than one call may make. */
   "media_too_long",
-  /** #248: the text needs several pieces, and this server has no ffmpeg/ffprobe to measure and join them. */
-  "media_split_unavailable",
+  /** #248: this server has no ffprobe/ffmpeg to measure (and join) the speech — nothing is made (#251 r3). */
+  "media_audio_unavailable",
   /** #248: a piece came back cut by the provider, and again after it was split smaller. */
   "media_truncated",
 ] as const;
@@ -279,8 +279,8 @@ export const MEDIA_TOOL_HINTS: Partial<Record<MediaToolCode, string>> = {
   media_changed: "그사이 관리자가 생성 설정이나 키를 바꿨어요. 다시 요청해 주세요.",
   media_too_long:
     "글이 너무 길어 한 번에 읽을 수 없어요. 몇 부분으로 나눠 따로 요청해 주세요(이미 나간 비용은 없어요).",
-  media_split_unavailable:
-    "이 글은 약 4분이 넘어 여러 조각으로 나눠 합성해야 하는데, 이 서버에 ffmpeg가 없어 이어 붙일 수 없어요. 더 짧게 나눠 요청하거나 관리자에게 ffmpeg 설치를 부탁하세요(비용은 나가지 않았어요).",
+  media_audio_unavailable:
+    "이 서버에 ffprobe·ffmpeg가 없어 만든 음성의 길이를 확인할 수 없어서(중간에 끊긴 음성을 저장하지 않으려고) 음성을 만들지 않았어요. 관리자에게 ffmpeg(ffprobe 포함) 설치를 부탁하세요(비용은 나가지 않았어요).",
   media_truncated:
     "음성이 제공자 쪽에서 중간에 끊겨 와서(더 잘게 나눠 다시 해도 끊김) 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 글을 더 짧게 나눠 요청해 주세요.",
 };

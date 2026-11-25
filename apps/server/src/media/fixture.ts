@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import zlib from "node:zlib";
 import {
   MEDIA_CATALOG_URLS,
@@ -7,6 +9,7 @@ import {
   OPENROUTER_SPEECH_URL,
   SPEECH_PRICING_URL,
 } from "./openrouter.js";
+import { makeSpeechWorkdir, type Mp3Info, type SpeechAudio } from "./speech-audio.js";
 
 /**
  * A scripted OpenRouter for the e2e run and manual testing with FAKE_RUNTIME=1 (#238): the server never reaches
@@ -217,4 +220,71 @@ export function fixtureOpenRouterFetch(): typeof fetch {
     if (body) return Response.json(body);
     return Response.json({ error: { code: 404 } }, { status: 404 });
   }) as typeof fetch;
+}
+
+/** MPEG-1 Layer III bit rates (kbit/s) by index, and sample rates. */
+const MP3_KBPS = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+const MP3_RATES = [44100, 48000, 32000];
+
+/**
+ * The frames of an MPEG-1 Layer III file (after an ID3v2 tag), counted from their headers: where each one starts
+ * and ends, its rate and channels. Undefined when there is none. The scripted ffprobe/ffmpeg's ground (#251 r3).
+ */
+export function mp3Frames(
+  b: Buffer,
+): { frames: { start: number; end: number }[]; sampleRate: number; channels: number } | undefined {
+  let p = 0;
+  if (b.length >= 10 && b.toString("latin1", 0, 3) === "ID3")
+    p = 10 + (((b[6]! & 0x7f) << 21) | ((b[7]! & 0x7f) << 14) | ((b[8]! & 0x7f) << 7) | (b[9]! & 0x7f));
+  const frames: { start: number; end: number }[] = [];
+  let sampleRate = 0;
+  let channels = 0;
+  while (p + 4 <= b.length) {
+    if (b[p] !== 0xff || (b[p + 1]! & 0xe0) !== 0xe0) break;
+    if (((b[p + 1]! >> 3) & 3) !== 3 || ((b[p + 1]! >> 1) & 3) !== 1) break;
+    const bi = (b[p + 2]! >> 4) & 15;
+    const si = (b[p + 2]! >> 2) & 3;
+    if (bi === 0 || bi === 15 || si === 3) break;
+    sampleRate = MP3_RATES[si]!;
+    channels = ((b[p + 3]! >> 6) & 3) === 3 ? 1 : 2;
+    const len = Math.floor((144 * MP3_KBPS[bi]! * 1000) / sampleRate) + ((b[p + 2]! >> 1) & 1);
+    if (p + len > b.length) break;
+    frames.push({ start: p, end: p + len });
+    p += len;
+  }
+  return frames.length ? { frames, sampleRate, channels } : undefined;
+}
+
+/**
+ * A scripted ffprobe/ffmpeg for the FAKE_RUNTIME (e2e) server and tests (#251 r3: speech is made only where its
+ * length can be measured): the length from the MP3's frame headers (1152 samples each), the join as the pieces'
+ * frames one after another. No program runs. Working folders as the real one's (`speech-scratch/<uuid>`).
+ */
+export function fixtureSpeechAudio(dataDir: string): SpeechAudio {
+  let joins = 0;
+  return {
+    workdir: () => makeSpeechWorkdir(dataDir),
+    async probe(file) {
+      const f = mp3Frames(fs.readFileSync(file));
+      if (!f) return undefined;
+      return {
+        seconds: (f.frames.length * 1152) / f.sampleRate,
+        codec: "mp3",
+        sampleRate: f.sampleRate,
+        channels: f.channels,
+      } satisfies Mp3Info;
+    },
+    async join(job) {
+      const parts: Buffer[] = [];
+      for (const file of job.files) {
+        const b = fs.readFileSync(file);
+        const f = mp3Frames(b);
+        if (!f) return undefined;
+        for (const fr of f.frames) parts.push(b.subarray(fr.start, fr.end));
+      }
+      const out = path.join(job.workdir, "out", `speech-${++joins}.mp3`);
+      fs.writeFileSync(out, Buffer.concat(parts), { mode: 0o600 });
+      return out;
+    },
+  };
 }

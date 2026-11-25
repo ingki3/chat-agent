@@ -63,11 +63,6 @@ export class MediaBudget {
     return left > 0 && micros <= left;
   }
 
-  /** The start of the service-zone day `at` belongs to (#248: a long call that runs past midnight). */
-  dayOf(at: number = this.now()): number {
-    return monthInfo(at, this.timeZone).dayStart;
-  }
-
   private micros(userId: string, at: number) {
     const day = monthInfo(at, this.timeZone);
     const rows = this.db

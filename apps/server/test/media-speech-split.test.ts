@@ -16,7 +16,12 @@ import { SPEECH_GENERATE_TOOL } from "@agentlee/mcp-tools/media";
 import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
-import { FIXTURE_OPENROUTER_KEY_PREFIX, fixtureOpenRouterFetch, silentMp3 } from "../src/media/fixture.js";
+import {
+  FIXTURE_OPENROUTER_KEY_PREFIX,
+  fixtureOpenRouterFetch,
+  fixtureSpeechAudio,
+  silentMp3,
+} from "../src/media/fixture.js";
 import { isMp3 } from "../src/media/generate.js";
 import { OPENROUTER_SPEECH_URL } from "../src/media/openrouter.js";
 import {
@@ -168,7 +173,7 @@ const settingsWith = (more: Partial<MediaSettings> = {}): MediaSettings => {
 async function start(
   o: {
     answer?: Parameters<typeof fakeOpenRouter>[0];
-    audio?: "fake" | "none" | SpeechAudio;
+    audio?: "fake" | "none" | "fixture" | SpeechAudio;
     settings?: Partial<MediaSettings>;
     split?: SpeechSplitLimits;
     now?: () => number;
@@ -180,7 +185,14 @@ async function start(
   const db = createTestDb();
   const or = fakeOpenRouter(o.answer);
   const fake = fakeAudio(() => dataDir);
-  const audio = o.audio === "none" ? undefined : o.audio && o.audio !== "fake" ? o.audio : fake.audio;
+  const audio =
+    o.audio === "none"
+      ? undefined
+      : o.audio === "fixture"
+        ? fixtureSpeechAudio(dataDir)
+        : o.audio && o.audio !== "fake"
+          ? o.audio
+          : fake.audio;
   const app = await buildApp(
     loadConfig({
       NODE_ENV: "test",
@@ -337,7 +349,7 @@ describe("speech_generate: long scripts through the tool (#248)", () => {
     expect(SPEECH_GENERATE_TOOL.description).toMatch(/split automatically/);
     expect(SPEECH_GENERATE_TOOL.description).toMatch(/durationSeconds/);
     expect(SPEECH_GENERATE_TOOL.description).toMatch(/chunks/);
-    for (const c of ["media_too_long", "media_split_unavailable", "media_truncated"] as const) {
+    for (const c of ["media_too_long", "media_audio_unavailable", "media_truncated"] as const) {
       expect(MEDIA_TOOL_CODES).toContain(c);
       expect(MEDIA_TOOL_HINTS[c]).toBeTruthy();
     }
@@ -525,16 +537,22 @@ describe("speech_generate: long scripts through the tool (#248)", () => {
     });
   });
 
-  it("no ffmpeg on this server: a long text is refused before anything is asked; a short one works unmeasured", async () => {
+  it("no ffprobe/ffmpeg on this server: nothing is made — not even a text of one piece — before anything is asked", async () => {
     const t = await start({ audio: "none" });
-    expect(await t.speak({ text: LONG })).toMatchObject({ ok: false, code: "media_split_unavailable" });
+    expect(await t.speak({ text: LONG })).toMatchObject({ ok: false, code: "media_audio_unavailable" });
+    const r = await t.speak({ text: SENTENCES[0]! });
+    expect(r).toMatchObject({ ok: false, code: "media_audio_unavailable" });
+    expect(!r.ok && r.hint).toMatch(/ffprobe/);
     expect(t.urls).toEqual([]);
     expect(t.rows()).toEqual([]);
-    const r = await t.speak({ text: SENTENCES[0]! });
-    expect(r).toMatchObject({ ok: true, output: { chunks: 1, durationSeconds: null, costUsd: PIECE_COST } });
-    expect(t.posts.map((p) => p.input)).toEqual([SENTENCES[0]]);
+    // The FAKE_RUNTIME's scripted ffprobe/ffmpeg measures the fixture's MP3 by its frames.
+    const t2 = await start({ audio: "fixture" });
+    // (A text short enough not to be judged by its length: the fake answers are 2 frames long.)
+    expect(await t2.speak({ text: "안녕." })).toMatchObject({
+      ok: true,
+      output: { chunks: 1, durationSeconds: 0.05 },
+    });
   });
-
   it("a text needing more pieces than allowed is media_too_long before anything is asked", async () => {
     const t = await start();
     const long = Array.from({ length: 12 }, () => SENTENCES.join(" ")).join("\n\n");
@@ -673,52 +691,40 @@ describe("speech_generate: review round 1 regressions (#251)", () => {
     expect(t.files()).toEqual([]);
   });
 
-  it("P2: past midnight a piece is checked against the new day's budget and counted there", async () => {
-    // 23:59:59 in Seoul; the first answer comes at 00:00:01 the next day.
+  it("P2 (r3 re-plan): a call that runs past midnight counts every piece — retry pieces too — for its start day", async () => {
+    // 23:59:59 in Seoul; the first answer comes at 00:00:01 the next day and is cut, so a retry follows.
     const before = Date.parse("2026-11-25T14:59:59.000Z");
     const after = Date.parse("2026-11-25T15:00:01.000Z");
-    let clock = before;
+    let clock = after;
     const t = await start({
       now: () => clock,
       answer: (input, n) => {
         if (n === 0) clock = after;
-        return fakeMp3(speechSeconds(input, LIMITS.typical));
+        return fakeMp3(n === 0 ? 14.5 : speechSeconds(input, LIMITS.typical));
       },
     });
-    const r = await t.speak({ text: LONG });
-    expect(r.ok).toBe(true);
-    const rows = t.rows();
-    expect(rows[0]!.created_at).toBe(before);
-    expect(rows.slice(1).every((x) => x.created_at === after)).toBe(true);
-
-    // The new day already spent up to the limit: the next piece is not sent.
-    clock = after;
-    const t2 = await start({
-      now: () => clock,
-      answer: (input, n) => {
-        if (n === 0) clock = after;
-        return fakeMp3(speechSeconds(input, LIMITS.typical));
-      },
-    });
-    t2.app.usageStore!.recordMedia({
-      userId: t2.f.users.owner.id,
-      conversationId: t2.scope.conversationId,
+    // The new day is already spent to its limit: the call is not checked against it.
+    t.app.usageStore!.recordMedia({
+      userId: t.f.users.owner.id,
+      conversationId: t.scope.conversationId,
       runId: "next-day",
       callId: "c1",
       model: "fixture/voice-one",
       costUsd: 49.9999,
     });
     clock = before;
-    const r2 = await t2.speak({ text: LONG });
-    expect(r2).toMatchObject({ ok: false, code: "media_budget" });
-    expect(t2.posts).toHaveLength(1);
-    expect(t2.files()).toEqual([]);
-    // The next day's spend and the earlier day's piece (paid); no reservation left.
-    expect(t2.rows().map((x) => x.cost_usd)).toEqual([49.9999, PIECE_COST]);
-    expect(t2.app.media!.budget.remaining(t2.f.users.owner.id, after).pendingUsd).toBe(0);
-    expect(t2.app.media!.budget.remaining(t2.f.users.owner.id, before).pendingUsd).toBe(0);
+    const r = await t.speak({ text: LONG });
+    expect(r.ok).toBe(true);
+    const pieces = splitSpeech(LONG, LIMITS);
+    expect(t.posts).toHaveLength(pieces.length + resplitSpeech(pieces[0]!, LIMITS).length);
+    const mine = t.rows().filter((x) => !x.run_id.startsWith("next-day"));
+    expect(mine).toHaveLength(t.posts.length);
+    expect(mine.every((x) => x.created_at === before)).toBe(true);
+    // The start day holds the call's cost; the next day only what it had.
+    const b = t.app.media!.budget;
+    expect(b.remaining(t.f.users.owner.id, before).spentUsd).toBeCloseTo(PIECE_COST * t.posts.length, 9);
+    expect(b.remaining(t.f.users.owner.id, after).spentUsd).toBe(49.9999);
   });
-
   it("P2: the up-front check sums exactly the integer micro-USD the rows hold", async () => {
     const pieces = splitSpeech(LONG, LIMITS);
     const each = pieces.map(microsOf);
@@ -945,34 +951,45 @@ describe("speech_generate: review round 1 regressions (#251)", () => {
 // ---------------------------------------------------------------- review round 2 (#251)
 
 describe("speech_generate: review round 2 regressions (#251)", () => {
-  it("P2: midnight between the budget check and the inserts — the rows count for the day that was checked", async () => {
-    // A text of one piece (no ffmpeg: no retry headroom) whose bound is over half of a $0.01 day.
-    const split = { ...LIMITS, targetSeconds: 100 };
-    const text = SENTENCES.join(" ");
-    const bound = microsOf(text);
-    expect(bound).toBeGreaterThan(5_000);
-    expect(bound).toBeLessThanOrEqual(10_000);
+  it("P2 (r3 re-plan): midnight right after the up-front check — every row is written for the start day, checked once", async () => {
     const before = Date.parse("2026-11-25T14:59:59.999Z");
     const after = before + 1;
     let clock = before;
-    const t = await start({ audio: "none", split, settings: { dailyCostLimitUsd: 0.01 }, now: () => clock });
-    // The clock passes midnight right after the up-front budget check, before any row is written.
+    const t = await start({ settings: { dailyCostLimitUsd: 0.05 }, now: () => clock });
     const budget = t.app.media!.budget;
     const check = budget.allowsMicros.bind(budget);
     let checks = 0;
     vi.spyOn(budget, "allowsMicros").mockImplementation((u, m, at) => {
       const r = check(u, m, at);
-      if (checks++ === 0) clock = after;
+      checks++;
+      clock = after;
       return r;
     });
-    const r = await t.speak({ text });
+    const r = await t.speak({ text: LONG });
     expect(r.ok).toBe(true);
-    expect(t.posts).toHaveLength(1);
-    // Written for the checked day, then moved — with the new day's check, counted once — to the day it was sent.
-    expect(t.rows()).toEqual([expect.objectContaining({ created_at: after, cost_usd: PIECE_COST })]);
-    expect(checks).toBe(2);
+    expect(checks).toBe(1);
+    expect(t.rows()).toHaveLength(splitSpeech(LONG, LIMITS).length);
+    expect(t.rows().every((x) => x.created_at === before && x.cost_usd === PIECE_COST)).toBe(true);
   });
 
+  it("P2 (r3 re-plan): an image call checked just before midnight counts for that day too", async () => {
+    const before = Date.parse("2026-11-25T14:59:59.999Z");
+    const after = before + 1;
+    let clock = before;
+    const t = await start({ now: () => clock });
+    const s = settingsWith();
+    s.kinds.image = { enabled: true, model: "fixture/image-one" };
+    t.app.media!.settings.set(s);
+    const budget = t.app.media!.budget;
+    const allows = budget.allows.bind(budget);
+    vi.spyOn(budget, "allows").mockImplementation((u, m, at) => {
+      const r = allows(u, m, at);
+      clock = after;
+      return r;
+    });
+    expect((await t.app.media!.tools.run("image", t.scope, { prompt: "고양이" })).ok).toBe(true);
+    expect(t.rows()).toEqual([expect.objectContaining({ created_at: before, cost_usd: 0.04 })]);
+  });
   it("P3: a run revoked, given a token again and watched again keeps its new watcher when the old call ends", () => {
     let clock = 1_000;
     const tokens = new McpTokens(() => clock);
@@ -1054,6 +1071,133 @@ describe("speech_generate: review round 2 regressions (#251)", () => {
       1,
     );
   });
+});
+
+// ---------------------------------------------------------------- review round 3 (#251)
+
+describe("speech_generate: review round 3 regressions (#251)", () => {
+  it("P3: a sentence end before a URL that starts after a space or a line break is still a sentence end", () => {
+    const first = "The work on the new site was finished.";
+    for (const gap of [" ", "\n", "\n\n"]) {
+      const second = "https://example.com/path is where it lives now.";
+      const text = `${first}${gap}${second}`;
+      const target = Math.max(speechSeconds(first, LIMITS.slow), speechSeconds(second, LIMITS.slow)) + 0.1;
+      expect(speechSeconds(text, LIMITS.slow)).toBeGreaterThan(target);
+      expect(splitSpeech(text, LIMITS, target)).toEqual([first, second]);
+    }
+    // The URL's own periods and slashes still stay together.
+    const own = "Read https://www.Example.COM/path today.";
+    expect(splitSpeech(`${own} ${own}`, LIMITS, speechSeconds(own, LIMITS.slow) + 0.1)).toEqual([own, own]);
+  });
+
+  it("P3: one grapheme cluster longer than a piece is refused before anything is asked", async () => {
+    // 1,300 Hangul leading jamo (U+1100) form a single grapheme cluster: no cut can bring it under the target.
+    const blob = "\u1100".repeat(1300);
+    expect([...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(blob)]).toHaveLength(1);
+    const t = await start({ split: SPEECH_SPLIT });
+    const r = await t.speak({ text: `안녕하세요. ${blob}` });
+    expect(r).toMatchObject({ ok: false, code: "media_too_long" });
+    expect(!r.ok && r.hint).toMatch(/나눌 수 없을 만큼 긴 한 글자/);
+    expect(t.urls).toEqual([]);
+    expect(t.rows()).toEqual([]);
+  });
+
+  for (const which of ["usage", "media"] as const)
+    it(`P3: one media clock (only ${which}.now given): reservation, updates and the settler's backoff agree`, async () => {
+      // A week ago: a clock apart from the real one, given on one side only.
+      let clock = Date.now() - 7 * 24 * 3600_000;
+      let record = false;
+      const inner = fixtureOpenRouterFetch();
+      const dataDir = path.join(tmp(), "data");
+      const lookups: string[] = [];
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const u = String(url);
+        if (init?.method === "POST" && u === OPENROUTER_SPEECH_URL)
+          return new Response(new Uint8Array(silentMp3()), {
+            headers: { "content-type": "audio/mpeg", "x-generation-id": "gen-clock-0001" },
+          });
+        if (u.includes("/generation?id=gen-clock-0001")) {
+          lookups.push(u);
+          return record
+            ? Response.json({ data: { id: "gen-clock-0001", total_cost: PIECE_COST } })
+            : Response.json({ error: { code: 404 } }, { status: 404 });
+        }
+        return inner(url, init);
+      }) as typeof fetch;
+      const registry = new RuntimeRegistry();
+      registry.register(new FakeRuntime({ runTools: true }));
+      const db = createTestDb();
+      const app = await buildApp(
+        loadConfig({
+          NODE_ENV: "test",
+          DATA_DIR: dataDir,
+          MASTER_KEY_PATH: path.join(tmp(), "master.key"),
+          OPENROUTER_API_KEY: KEY,
+        }),
+        {
+          db,
+          runtimes: registry,
+          runs: { flushMs: 0 },
+          ...(which === "usage" ? { usage: { now: () => clock } } : {}),
+          media: {
+            fetchImpl,
+            sleep: async () => {},
+            speechAudio: () => fixtureSpeechAudio(dataDir),
+            ...(which === "media" ? { now: () => clock } : {}),
+          },
+        },
+      );
+      closers.push(() => app.close());
+      const f = await createFamily(app);
+      app.media!.settings.set(settingsWith());
+      const conv = app.conversations!.create(f.users.owner.id);
+      const res = await app.inject({
+        method: "POST",
+        url: `/api/conversations/${conv.id}/messages`,
+        headers: {
+          host: "localhost:3000",
+          origin: "http://localhost:3000",
+          [CSRF_HEADER]: "1",
+          cookie: f.cookies.owner,
+          "content-type": "application/json",
+        },
+        payload: { text: "안녕" },
+      });
+      const runId = (res.json() as { run: Run }).run.id;
+      await vi.waitFor(() => expect(app.runs!.get(runId)!.endedAt).not.toBeNull());
+      db.$client.prepare("UPDATE runs SET ended_at = NULL WHERE id = ?").run(runId);
+      const scope = { userId: f.users.owner.id, conversationId: conv.id, runId };
+      expect((await app.media!.tools.run("speech", scope, { text: "안녕하세요." })).ok).toBe(true);
+      const row = () =>
+        db.$client
+          .prepare(
+            "SELECT created_at, updated_at, media_settlement, cost_usd FROM usage_records WHERE purpose = 'media'",
+          )
+          .get() as {
+          created_at: number;
+          updated_at: number;
+          media_settlement: string;
+          cost_usd: number | null;
+        };
+      // Answered without a cost: waits for it, on the injected clock.
+      expect(row()).toMatchObject({
+        created_at: clock,
+        updated_at: clock,
+        media_settlement: "awaiting_cost",
+      });
+      const tried = lookups.length;
+      // Before the backoff (1 min) nothing is looked up; the row is not given up as "too old" either.
+      clock += 30_000;
+      await app.media!.settler.runOnce();
+      expect(lookups).toHaveLength(tried);
+      expect(row().media_settlement).toBe("awaiting_cost");
+      // After it: looked up and settled.
+      record = true;
+      clock += 31_000;
+      await app.media!.settler.runOnce();
+      expect(lookups).toHaveLength(tried + 1);
+      expect(row()).toMatchObject({ media_settlement: "settled", cost_usd: PIECE_COST });
+    });
 });
 
 // ---------------------------------------------------------------- the real ffprobe/ffmpeg (macOS with ffmpeg)

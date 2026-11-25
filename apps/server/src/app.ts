@@ -103,7 +103,7 @@ import { MediaSettingsStore } from "./media/settings.js";
 import { MediaBudget } from "./media/budget.js";
 import { MediaAdminService } from "./media/service.js";
 import { registerMediaRoutes } from "./media/routes.js";
-import { fixtureOpenRouterFetch } from "./media/fixture.js";
+import { fixtureOpenRouterFetch, fixtureSpeechAudio } from "./media/fixture.js";
 import { MediaGenerator } from "./media/generate.js";
 import { MediaRecovery, MediaSettler } from "./media/settle.js";
 import { sandboxedSpeechAudio, sweepSpeechScratch, type SpeechAudio } from "./media/speech-audio.js";
@@ -637,8 +637,12 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       app.log,
       { timeZone: DEFAULT_TIME_ZONE, ...opts.usage },
     );
+    // One media clock (#251 r3): the media rows (reserve, update, recovery), the budget, the generator and the
+    // late-cost settler all read it — whichever of `media.now` / `usage.now` a test gives.
+    const mediaNow = opts.media?.now ?? opts.usage?.now ?? Date.now;
     const usage = new UsageStore(opts.db!, opts.usage?.now ?? Date.now, {
       onRecorded: (at) => usageService.checkDailyCost(at),
+      mediaNow,
     });
     app.decorate("usageStore", usage);
     // 미디어 생성 (#238 stage 1): the admin's OpenRouter key (else .env's), models, limits and the daily budget.
@@ -660,12 +664,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       store: mediaSettings,
       ...mediaFetch,
     });
-    const mediaBudget = new MediaBudget(
-      opts.db!,
-      () => mediaSettings.get(),
-      usageService.timeZone,
-      opts.media?.now ?? opts.usage?.now ?? Date.now,
-    );
+    const mediaBudget = new MediaBudget(opts.db!, () => mediaSettings.get(), usageService.timeZone, mediaNow);
     // The previous process's media reservations (#238 review r4–r5): only on the lock-holding server start
     // (`dataLock` — no other server uses this database), while the app is built, before any request: all `reserved`
     // rows are taken up in one transaction. If that fails the server still starts (chat wins over media
@@ -699,10 +698,12 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         opts.media?.speechAudio ??
         (config.env === "test"
           ? () => undefined
-          : () => sandboxedSpeechAudio({ dataDir: config.dataDir, ffmpegPath: config.audioFfmpeg })),
+          : config.fakeRuntime
+            ? // The e2e server: a scripted ffprobe/ffmpeg beside its scripted OpenRouter (no program runs).
+              () => fixtureSpeechAudio(config.dataDir)
+            : () => sandboxedSpeechAudio({ dataDir: config.dataDir, ffmpegPath: config.audioFfmpeg })),
       ...(opts.media?.split ? { split: opts.media.split } : {}),
-      // The same clock as the budget's (and the usage rows'): every reservation step reads it once (#251 r2).
-      now: opts.media?.now ?? opts.usage?.now ?? Date.now,
+      now: mediaNow,
     });
     // Late cost settlement (#238 review r2): generations still waiting for their cost are looked up again with a
     // backoff, also after a restart. Not in tests (they drive `runOnce`).
@@ -710,7 +711,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       usage,
       keys: openRouterKeys,
       fetchImpl: mediaFetchImpl,
-      ...(opts.media?.now ? { now: opts.media.now } : {}),
+      now: mediaNow,
       log: app.log,
     });
     if (config.env !== "test") app.addHook("onReady", async () => mediaSettler.start());

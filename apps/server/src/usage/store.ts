@@ -49,6 +49,8 @@ export type UsageStoreOptions = {
    * change or stop the run that reported the usage.
    */
   onRecorded?: (at: number) => void;
+  /** The media rows' clock (#251 r3, default: `now`). */
+  mediaNow?: () => number;
 };
 
 /**
@@ -71,7 +73,14 @@ export class UsageStore {
   ) {
     this.prices = opts.prices ?? new PriceStore(db, now);
     this.onRecorded = opts.onRecorded;
+    this.mediaNow = opts.mediaNow ?? now;
   }
+
+  /**
+   * The media rows' clock (#251 r3): the same one the media budget, the generator, the recovery and the late-cost
+   * settler use, so a reservation, its updates and the settler's backoff are measured on one clock.
+   */
+  private readonly mediaNow: () => number;
 
   record(a: UsageAttempt, u: UsageReport): void {
     const at = this.now();
@@ -147,7 +156,7 @@ export class UsageStore {
     model: string;
     costUsd: number | null;
   }): void {
-    const at = this.now();
+    const at = this.mediaNow();
     const usd = cost(m.costUsd ?? undefined);
     const micros = usd === null ? null : Math.round(usd * 1_000_000);
     this.db
@@ -217,7 +226,7 @@ export class UsageStore {
     const micros =
       m.estimateMicros !== undefined ? m.estimateMicros : Math.ceil((m.estimateUsd ?? NaN) * 1_000_000);
     if (!Number.isSafeInteger(micros) || micros < 0) throw new Error("bad estimate");
-    const at = m.at ?? this.now();
+    const at = m.at ?? this.mediaNow();
     const unsent = m.state === "pending_send";
     this.db
       .insert(usageRecords)
@@ -251,21 +260,14 @@ export class UsageStore {
 
   /**
    * #248: a reserved speech piece whose request goes out now (`pending_send` → `reserved`, and now one request).
-   * `o.at`: the moment the caller checked at (default now); `o.move`: the service day changed since the piece was
-   * reserved — the row moves to `o.at`, the day whose budget was checked. False when there is no such unsent row
-   * (nothing may be sent then).
+   * Its day does not change: a call's costs count for the day it started (#251 r3). False when there is no such
+   * unsent row (nothing may be sent then).
    */
-  sendingMedia(runKey: string, o: { at?: number; move?: boolean } = {}): boolean {
-    const at = o.at ?? this.now();
+  sendingMedia(runKey: string): boolean {
     return (
       this.db
         .update(usageRecords)
-        .set({
-          mediaSettlement: "reserved",
-          requestCount: 1,
-          updatedAt: at,
-          ...(o.move ? { createdAt: at } : {}),
-        })
+        .set({ mediaSettlement: "reserved", requestCount: 1, updatedAt: this.mediaNow() })
         .where(
           and(
             eq(usageRecords.runId, runKey),
@@ -291,7 +293,7 @@ export class UsageStore {
         costUsd: usd,
         pricedCostMicros: Math.round(usd * 1_000_000),
         mediaSettlement: "settled",
-        updatedAt: this.now(),
+        updatedAt: this.mediaNow(),
       })
       .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
       .returning({ createdAt: usageRecords.createdAt })
@@ -309,7 +311,7 @@ export class UsageStore {
       .set({
         mediaGenerationId: generationId,
         mediaSettlement: generationId ? "awaiting_cost" : "unconfirmed",
-        updatedAt: this.now(),
+        updatedAt: this.mediaNow(),
       })
       .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
       .run();
@@ -319,7 +321,7 @@ export class UsageStore {
   unconfirmMedia(runKey: string): void {
     this.db
       .update(usageRecords)
-      .set({ mediaSettlement: "unconfirmed", updatedAt: this.now() })
+      .set({ mediaSettlement: "unconfirmed", updatedAt: this.mediaNow() })
       .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
       .run();
   }
@@ -328,7 +330,7 @@ export class UsageStore {
   triedMedia(runKey: string, tries: number): void {
     this.db
       .update(usageRecords)
-      .set({ mediaSettleTries: tries, updatedAt: this.now() })
+      .set({ mediaSettleTries: tries, updatedAt: this.mediaNow() })
       .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
       .run();
   }
@@ -340,7 +342,7 @@ export class UsageStore {
   generationMedia(runKey: string, generationId: string): void {
     this.db
       .update(usageRecords)
-      .set({ mediaGenerationId: generationId, updatedAt: this.now() })
+      .set({ mediaGenerationId: generationId, updatedAt: this.mediaNow() })
       .where(
         and(
           eq(usageRecords.runId, runKey),
@@ -359,7 +361,7 @@ export class UsageStore {
    * was never sent) is removed — it cost nothing. One transaction: all of it, or none. Returns the count.
    */
   recoverReservedMedia(o: { noWait?: boolean } = {}): number {
-    const at = this.now();
+    const at = this.mediaNow();
     const reserved = and(eq(usageRecords.purpose, "media"), eq(usageRecords.mediaSettlement, "reserved"));
     const sqlite = this.db.$client;
     const move = sqlite.transaction(() => {

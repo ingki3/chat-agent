@@ -32,6 +32,7 @@ import {
   FIXTURE_OPENROUTER_KEY_PREFIX,
   FIXTURE_SPEECH_COST,
   fixtureOpenRouterFetch,
+  fixtureSpeechAudio,
   silentMp3,
   solidPng,
 } from "../src/media/fixture.js";
@@ -123,7 +124,12 @@ async function start(o: { fetchImpl?: typeof fetch; key?: string | null } = {}) 
       db,
       runtimes: registry,
       runs: { flushMs: 0 },
-      media: { fetchImpl: rec.fetchImpl, sleep: async () => {} },
+      // Speech is made only where its length can be measured (#251 r3): the scripted ffprobe/ffmpeg.
+      media: {
+        fetchImpl: rec.fetchImpl,
+        sleep: async () => {},
+        speechAudio: () => fixtureSpeechAudio(dataDir),
+      },
     },
   );
   closers.push(() => app.close());

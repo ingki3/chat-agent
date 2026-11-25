@@ -114,9 +114,12 @@ function sentenceEnd(text: string, at: number, match: string): boolean {
   const word = text.slice(from, at);
   if (!word) return true;
   if (ADDRESS.test(word)) return false;
-  // The rest of the same token after the period (no space): an address goes on ("Example.COM/path").
-  const rest = /^\S*/u.exec(text.slice(at + match.length))![0];
-  if (/[/@]|\.\p{L}/u.test(rest) && /\./u.test(word + match)) return false;
+  // The rest of the same token right after the period (no space between — a word after whitespace is the next
+  // sentence's, #251 r3): an address goes on ("Example.COM/path").
+  if (!/\s$/u.test(match)) {
+    const rest = /^\S*/u.exec(text.slice(at + match.length))![0];
+    if (/[/@]|\.\p{L}/u.test(rest)) return false;
+  }
   if (INITIALS.test(word)) return false;
   return !HONORIFICS.has(word.toLowerCase().replace(/^["'“‘([]+/u, ""));
 }
