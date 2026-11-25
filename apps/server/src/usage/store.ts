@@ -208,11 +208,17 @@ export class UsageStore {
      * before the request). Default `reserved` (the request follows at once).
      */
     state?: "pending_send" | "reserved";
+    /**
+     * The moment of the reservation — the one the caller checked the budget at (#251 r2: the row counts for the
+     * day that was checked, even when midnight passes before the insert). Default: now.
+     */
+    at?: number;
   }): void {
     const micros =
       m.estimateMicros !== undefined ? m.estimateMicros : Math.ceil((m.estimateUsd ?? NaN) * 1_000_000);
     if (!Number.isSafeInteger(micros) || micros < 0) throw new Error("bad estimate");
-    const at = this.now();
+    const at = m.at ?? this.now();
+    const unsent = m.state === "pending_send";
     this.db
       .insert(usageRecords)
       .values({
@@ -236,26 +242,29 @@ export class UsageStore {
         cacheReadTokens: null,
         cacheWriteTokens: null,
         costUsd: null,
-        requestCount: 1,
+        // A piece not sent yet is no request (yet): counted when `sendingMedia` marks it sent (#251 r2).
+        requestCount: unsent ? 0 : 1,
         updatedAt: at,
       })
       .run();
   }
 
   /**
-   * #248: a reserved speech piece whose request goes out now (`pending_send` → `reserved`). `at` (when the service
-   * day changed since it was reserved): the row moves to that moment, so it counts for the day it is really sent.
-   * False when there is no such unsent row (nothing may be sent then).
+   * #248: a reserved speech piece whose request goes out now (`pending_send` → `reserved`, and now one request).
+   * `o.at`: the moment the caller checked at (default now); `o.move`: the service day changed since the piece was
+   * reserved — the row moves to `o.at`, the day whose budget was checked. False when there is no such unsent row
+   * (nothing may be sent then).
    */
-  sendingMedia(runKey: string, at?: number): boolean {
-    const now = this.now();
+  sendingMedia(runKey: string, o: { at?: number; move?: boolean } = {}): boolean {
+    const at = o.at ?? this.now();
     return (
       this.db
         .update(usageRecords)
         .set({
           mediaSettlement: "reserved",
-          updatedAt: now,
-          ...(at !== undefined ? { createdAt: at } : {}),
+          requestCount: 1,
+          updatedAt: at,
+          ...(o.move ? { createdAt: at } : {}),
         })
         .where(
           and(

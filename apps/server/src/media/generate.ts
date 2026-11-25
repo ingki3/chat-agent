@@ -406,12 +406,14 @@ export class MediaGenerator {
         const pieces = this.reserve(ctx, plan.pieces!, plan.checkMicros!);
         return await this.speech(ctx, plan, pieces);
       }
-      // The budget check and the reserving row in one synchronous step.
+      // The budget check and the reserving row in one synchronous step, at one moment (the row counts for the day
+      // that was checked — #251 r2).
       const callId = crypto.randomUUID();
-      if (!this.o.budget.allows(scope.userId, plan.bound)) throw new MediaToolError("media_budget");
+      const at = this.now();
+      if (!this.o.budget.allows(scope.userId, plan.bound, at)) throw new MediaToolError("media_budget");
       if (
         !this.write(ctx, "reserve", () =>
-          this.o.usage?.reserveMedia({ ...this.row(ctx, callId), estimateUsd: plan.bound! }),
+          this.o.usage?.reserveMedia({ ...this.row(ctx, callId), estimateUsd: plan.bound!, at }),
         )
       )
         throw new MediaToolError("media_failed");
@@ -428,8 +430,10 @@ export class MediaGenerator {
   /**
    * Speech pieces' reservations (#248), synchronous: the budget must allow `checkMicros` (the pieces' bounds, plus
    * the headroom asked for — integer micro-USD, the same integers the rows get), then every piece gets its
-   * reserving row, `pending_send` until its request goes out. A row that cannot be written undoes the ones written
-   * (nothing is sent).
+   * reserving row, `pending_send` until its request goes out. **One moment** (`at`) for the whole step: the budget
+   * is checked for its day and every row is written with it (#251 r2 — midnight between the check and the inserts
+   * would otherwise count the call's own rows twice). A row that cannot be written undoes the ones written (nothing
+   * is sent).
    */
   private reserve(ctx: CallCtx, pieces: readonly PlannedPiece[], checkMicros: number): Piece[] {
     const at = this.now();
@@ -445,6 +449,7 @@ export class MediaGenerator {
             ...this.row(ctx, callId),
             estimateMicros: p.micros,
             state: "pending_send",
+            at,
           }),
         )
       ) {
@@ -459,8 +464,8 @@ export class MediaGenerator {
   /**
    * Right before a piece's request (#248), synchronous: its fields pass the egress check again (a secret may have
    * been registered since the call started); if the service day changed since it was reserved, the new day's budget
-   * must still hold its bound and the row moves to now; then the row is `reserved` (sent). Throws — the row still
-   * unsent, released by the caller — when any of it fails.
+   * must still hold its bound and the row moves to now; then the row is `reserved` (sent). One moment (`at`) for the
+   * day, the budget check and the row. Throws — the row still unsent, released by the caller — when any of it fails.
    */
   private sending(ctx: CallCtx, plan: Plan, p: Piece): void {
     if (this.secret([p.text, ...(plan.sentTexts ?? [])])) throw new MediaToolError("media_secret_blocked");
@@ -471,7 +476,7 @@ export class MediaGenerator {
       throw new MediaToolError("media_budget");
     let ok = true;
     const wrote = this.write(ctx, "reserve", () => {
-      ok = this.o.usage?.sendingMedia(mediaRunKey(ctx.scope.runId, p.callId), moved ? at : undefined) ?? true;
+      ok = this.o.usage?.sendingMedia(mediaRunKey(ctx.scope.runId, p.callId), { at, move: moved }) ?? true;
     });
     if (!wrote || !ok) throw new MediaToolError("media_failed");
     p.day = today;

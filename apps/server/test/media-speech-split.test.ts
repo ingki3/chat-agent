@@ -42,6 +42,7 @@ import {
 import { codexRunConfig, speechCallBudgetMs } from "../src/runtime/lockdown.js";
 import { boundMicros, speechCostBound } from "../src/media/cost.js";
 import { knownSecrets } from "../src/secrets/known.js";
+import { McpTokens } from "../src/isolation/tokens.js";
 import { RuntimeRegistry } from "../src/runtime/adapter.js";
 import { FakeRuntime } from "../src/runtime/fake.js";
 import { storagePaths } from "../src/storage/paths.js";
@@ -938,6 +939,120 @@ describe("speech_generate: review round 1 regressions (#251)", () => {
     }
     whole(`  ${LONG}\n\n  ${glued}  `);
     whole(SENTENCES.join("\n\n\n"));
+  });
+});
+
+// ---------------------------------------------------------------- review round 2 (#251)
+
+describe("speech_generate: review round 2 regressions (#251)", () => {
+  it("P2: midnight between the budget check and the inserts — the rows count for the day that was checked", async () => {
+    // A text of one piece (no ffmpeg: no retry headroom) whose bound is over half of a $0.01 day.
+    const split = { ...LIMITS, targetSeconds: 100 };
+    const text = SENTENCES.join(" ");
+    const bound = microsOf(text);
+    expect(bound).toBeGreaterThan(5_000);
+    expect(bound).toBeLessThanOrEqual(10_000);
+    const before = Date.parse("2026-11-25T14:59:59.999Z");
+    const after = before + 1;
+    let clock = before;
+    const t = await start({ audio: "none", split, settings: { dailyCostLimitUsd: 0.01 }, now: () => clock });
+    // The clock passes midnight right after the up-front budget check, before any row is written.
+    const budget = t.app.media!.budget;
+    const check = budget.allowsMicros.bind(budget);
+    let checks = 0;
+    vi.spyOn(budget, "allowsMicros").mockImplementation((u, m, at) => {
+      const r = check(u, m, at);
+      if (checks++ === 0) clock = after;
+      return r;
+    });
+    const r = await t.speak({ text });
+    expect(r.ok).toBe(true);
+    expect(t.posts).toHaveLength(1);
+    // Written for the checked day, then moved — with the new day's check, counted once — to the day it was sent.
+    expect(t.rows()).toEqual([expect.objectContaining({ created_at: after, cost_usd: PIECE_COST })]);
+    expect(checks).toBe(2);
+  });
+
+  it("P3: a run revoked, given a token again and watched again keeps its new watcher when the old call ends", () => {
+    let clock = 1_000;
+    const tokens = new McpTokens(() => clock);
+    const scope = { userId: "u1", conversationId: "c1", runId: "r1" };
+    tokens.issue(scope);
+    const first = vi.fn();
+    const unsubFirst = tokens.onRevoke("r1", first);
+    tokens.revokeRun("r1");
+    expect(first).toHaveBeenCalledTimes(1);
+    // The same run gets a token again; a new call watches it; then the old call ends (its unsubscribe runs last).
+    tokens.issue(scope);
+    const second = vi.fn();
+    const unsubSecond = tokens.onRevoke("r1", second);
+    expect(second).not.toHaveBeenCalled();
+    unsubFirst();
+    tokens.revokeRun("r1");
+    expect(second).toHaveBeenCalledTimes(1);
+    unsubSecond();
+    // And the other order: the new call ends first, the old one after — nothing left behind, nothing thrown.
+    tokens.issue(scope);
+    const third = vi.fn();
+    const unsubThird = tokens.onRevoke("r1", third);
+    unsubThird();
+    unsubFirst();
+    tokens.revokeRun("r1");
+    expect(third).not.toHaveBeenCalled();
+    clock += 1;
+  });
+
+  it("P3: a piece not sent yet is no request in the usage records; it becomes one when sent", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    const t = await start({
+      answer: async (input, n) => {
+        if (n === 0) await gate;
+        return fakeMp3(speechSeconds(input, LIMITS.typical));
+      },
+    });
+    const pieces = splitSpeech(LONG, LIMITS);
+    const counts = () =>
+      (
+        t.db.$client
+          .prepare("SELECT request_count FROM usage_records WHERE purpose = 'media' ORDER BY id")
+          .all() as { request_count: number }[]
+      ).map((x) => x.request_count);
+    const call = t.speak({ text: LONG });
+    await vi.waitFor(() => expect(t.posts).toHaveLength(1));
+    expect(counts()).toEqual([1, ...pieces.slice(1).map(() => 0)]);
+    // Still counted as pending (their bounds hold the budget).
+    expect(t.app.media!.budget.remaining(t.f.users.owner.id).pendingUsd).toBeGreaterThan(0);
+    release();
+    expect((await call).ok).toBe(true);
+    expect(counts()).toEqual(pieces.map(() => 1));
+  });
+
+  it("P3: addresses, dotted initials and titles are not sentence ends — not even on a piece boundary", () => {
+    const sentences = [
+      "Dr. Smith went to the U.S. Army base today.",
+      "He visited the U.S.A. office after lunch.",
+      "He read https://www.Example.COM/path at home.",
+      "Then he wrote to mr.Kim@Example.COM again.",
+      "Later he met Prof. Lee and Mrs. Park there.",
+    ];
+    const text = sentences.join(" ");
+    // A target each sentence fits and no two do: every sentence end is a piece boundary, and nothing else is.
+    const target = Math.max(...sentences.map((x) => speechSeconds(x, LIMITS.slow))) + 0.1;
+    for (let i = 1; i < sentences.length; i++)
+      expect(speechSeconds(`${sentences[i - 1]} ${sentences[i]}`, LIMITS.slow)).toBeGreaterThan(target);
+    expect(splitSpeech(text, LIMITS, target)).toEqual(sentences);
+    // Without spaces too: the URL's own periods and initials are not cut.
+    const glued = "He read https://www.Example.COM/path.Then the U.S.A.Army came.";
+    for (const p of splitSpeech(glued, LIMITS, 3)) {
+      expect(p.endsWith("www.")).toBe(false);
+      expect(p.endsWith("Example.")).toBe(false);
+      expect(p.endsWith("U.S.")).toBe(false);
+    }
+    // A real sentence end typed without a space still is one.
+    expect(splitSpans("오늘은 정말 맑고 좋았어요.Then we all went home.", LIMITS, 3).length).toBeGreaterThan(
+      1,
+    );
   });
 });
 

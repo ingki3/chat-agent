@@ -55,12 +55,72 @@ const CLOSE = String.raw`["'”’)\]」』]*`;
 /**
  * Where a sentence (unit) ends: terminal punctuation and its closers followed by whitespace — or, typed without a
  * space ("했어요.그리고"), followed by a Hangul, CJK or kana letter or a capital; full-width terminals (。！？)
- * anywhere; a line break with the whitespace after it. A decimal point ("3.14") is not an end.
+ * anywhere; a line break with the whitespace after it. A decimal point ("3.14") is not an end, nor a period of an
+ * address, of dotted initials or of a title (`sentenceEnd`).
  */
 const SENTENCE = new RegExp(
   String.raw`(?:[.!?…]+${CLOSE}(?:\s+|(?=[\p{Script=Hangul}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Lu}]))|[。！？]+${CLOSE}\s*|\n\s*)`,
   "gu",
 );
+/** Titles that end in a period without ending a sentence ("Dr. Smith"), compared without case. */
+const HONORIFICS = new Set([
+  "mr",
+  "mrs",
+  "ms",
+  "mx",
+  "dr",
+  "prof",
+  "sr",
+  "jr",
+  "st",
+  "mt",
+  "no",
+  "vs",
+  "etc",
+  "e.g",
+  "i.e",
+  "inc",
+  "ltd",
+  "co",
+  "corp",
+  "gen",
+  "gov",
+  "sen",
+  "rep",
+  "rev",
+  "capt",
+  "lt",
+  "col",
+  "sgt",
+  "fig",
+  "vol",
+  "p",
+  "pp",
+]);
+/** Dotted initials before the period: "U.S", "J.R.R", "A" (a single letter). */
+const INITIALS = /^(?:\p{L}\.)*\p{L}$/u;
+/** A web address or mail address around the period: "https://www.example", "www.example", "a@b". */
+const ADDRESS = /:\/\/|^www\.|@/iu;
+
+/**
+ * Whether a period match is a sentence end (#251 r2): not when the word before it is a web or mail address, dotted
+ * initials or a common title — "U.S. Army", "U.S.A.", "Dr. Smith", "https://www.Example.COM/path" stay together.
+ * Other terminals (! ? … 。 line breaks) always end a sentence.
+ */
+function sentenceEnd(text: string, at: number, match: string): boolean {
+  if (!match.startsWith(".") || match.startsWith("..")) return true;
+  let from = at;
+  while (from > 0 && !/\s/u.test(text[from - 1]!)) from--;
+  const word = text.slice(from, at);
+  if (!word) return true;
+  if (ADDRESS.test(word)) return false;
+  // The rest of the same token after the period (no space): an address goes on ("Example.COM/path").
+  const rest = /^\S*/u.exec(text.slice(at + match.length))![0];
+  if (/[/@]|\.\p{L}/u.test(rest) && /\./u.test(word + match)) return false;
+  if (INITIALS.test(word)) return false;
+  return !HONORIFICS.has(word.toLowerCase().replace(/^["'“‘([]+/u, ""));
+}
+
 const CLAUSE = /[,;:，、；：]\s*/gu;
 const SPACE = /\s+/gu;
 
@@ -87,13 +147,22 @@ function graphemeEnds(text: string): number[] {
   return out;
 }
 
-/** The span cut after every match of `re` that ends on a grapheme boundary (each part keeps its separator). */
-function cutAfter(text: string, span: Span, re: RegExp, ok: ReadonlySet<number>): Span[] {
+/**
+ * The span cut after every match of `re` that ends on a grapheme boundary (each part keeps its separator) and that
+ * `accept` takes (given the match's start in the text and its text).
+ */
+function cutAfter(
+  text: string,
+  span: Span,
+  re: RegExp,
+  ok: ReadonlySet<number>,
+  accept: (start: number, match: string) => boolean = () => true,
+): Span[] {
   const out: Span[] = [];
   let at = span.start;
   for (const m of text.slice(span.start, span.end).matchAll(re)) {
     const end = span.start + m.index + m[0].length;
-    if (end > at && end < span.end && ok.has(end)) {
+    if (end > at && end < span.end && ok.has(end) && accept(span.start + m.index, m[0])) {
       out.push({ start: at, end });
       at = end;
     }
@@ -130,7 +199,8 @@ function units(text: string, target: number, rates: Rates): Span[] {
   const ok = new Set(ends);
   const fits = (sp: Span) => speechSeconds(text.slice(sp.start, sp.end), rates) <= target;
   const out: Span[] = [];
-  for (const s of cutAfter(text, { start: 0, end: text.length }, SENTENCE, ok)) {
+  const isEnd = (start: number, match: string) => sentenceEnd(text, start, match);
+  for (const s of cutAfter(text, { start: 0, end: text.length }, SENTENCE, ok, isEnd)) {
     if (fits(s)) {
       out.push(s);
       continue;

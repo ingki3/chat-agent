@@ -120,7 +120,8 @@ export class McpTokens {
     set.add(fn);
     return () => {
       set.delete(fn);
-      if (!set.size) this.stopWatchers.delete(runId);
+      // Only this set: after a revocation and a new token the run may have a new set (#251 r2) — never remove it.
+      if (!set.size && this.stopWatchers.get(runId) === set) this.stopWatchers.delete(runId);
     };
   }
 

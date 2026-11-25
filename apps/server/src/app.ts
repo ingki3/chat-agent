@@ -701,7 +701,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
           ? () => undefined
           : () => sandboxedSpeechAudio({ dataDir: config.dataDir, ffmpegPath: config.audioFfmpeg })),
       ...(opts.media?.split ? { split: opts.media.split } : {}),
-      ...(opts.media?.now ? { now: opts.media.now } : {}),
+      // The same clock as the budget's (and the usage rows'): every reservation step reads it once (#251 r2).
+      now: opts.media?.now ?? opts.usage?.now ?? Date.now,
     });
     // Late cost settlement (#238 review r2): generations still waiting for their cost are looked up again with a
     // backoff, also after a restart. Not in tests (they drive `runOnce`).
