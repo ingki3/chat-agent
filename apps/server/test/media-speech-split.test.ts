@@ -40,6 +40,7 @@ import {
   sweepSpeechScratch,
   type SpeechAudio,
 } from "../src/media/speech-audio.js";
+import { headerSeconds } from "../src/media/mp3-length.js";
 import {
   looksCut,
   resplitSpeech,
@@ -1684,6 +1685,36 @@ describe("speech_generate: review rounds 5–6 re-plans — one form, exact deco
     expect(t.scratch()).toEqual([]);
   });
 
+  it("#251 r12: the frame headers' own length — every frame at its own rate; tags and frame data not read", () => {
+    const frames = (n: number) => Array.from({ length: n }, () => mp3Frame(9));
+    // 200 frames at 22.05 kHz then 100 at 44.1 kHz: each at its own rate.
+    const mixed = Buffer.concat([...Array.from({ length: 200 }, () => mp3Frame22(8)), ...frames(100)]);
+    expect(headerSeconds(mixed)).toBeCloseTo((200 * 576) / 22050 + (100 * 1152) / 44100, 9);
+    // Tags around the frames (ID3v2 skipped by its size; APEv2, ID3v1, junk) add nothing.
+    const cbr = Buffer.concat(frames(30));
+    const want = (30 * 1152) / 44100;
+    const ape = Buffer.concat([
+      Buffer.from("APETAGEX", "latin1"),
+      Buffer.alloc(24),
+      Buffer.from("Title\0x", "latin1"),
+    ]);
+    const id3v1 = Buffer.alloc(128);
+    id3v1.write("TAG", 0, "latin1");
+    for (const tail of [ape, Buffer.concat([ape, id3v1]), id3v1, Buffer.from("junk")])
+      expect(headerSeconds(Buffer.concat([cbr, tail]))).toBeCloseTo(want, 9);
+    expect(headerSeconds(Buffer.concat([ape, cbr]))).toBeCloseTo(want, 9);
+    expect(headerSeconds(silentMp3(30))).toBeCloseTo(want, 9);
+    // Header-like bytes inside a frame's data are never read as a frame.
+    const trap = mp3Frame(9);
+    trap.set([0xff, 0xfb, 0x90, 0x64], 100);
+    expect(headerSeconds(Buffer.concat([...frames(3), trap, ...frames(3)]))).toBeCloseTo(
+      (7 * 1152) / 44100,
+      9,
+    );
+    // A walk that cannot follow (no frames at all) counts nothing — it can only make a file look longer decoded.
+    expect(headerSeconds(Buffer.from("not audio"))).toBe(0);
+  });
+
   it("estimates and limits compare in whole microseconds: 20 s exactly is 20 s, whatever the classes", () => {
     const text = "a".repeat(300);
     expect(speechSeconds(text, SPEECH_SPLIT.typical)).toBe(20);
@@ -2407,6 +2438,89 @@ describe("speech_generate: the real sandboxed ffmpeg (#248, macOS)", () => {
       const clean = await audio.measure(put(at(8000, 20)), M);
       // (No length header here: the encoder's delay and padding stay in, ~0.16 s.)
       expect(clean.ok && Math.abs(clean.seconds - 20)).toBeLessThan(0.3);
+    },
+  );
+
+  realIt(
+    "#251 r12: a 48 kHz start then frames alternating 8/16 kHz: both decodes lose the same audio — unsupported",
+    async () => {
+      const { audio, put } = bench();
+      // One self-contained frame (no bit reservoir) of a tone at `rate`, 64 kbit/s.
+      const frameOf = (rate: number) => {
+        const b = encode([
+          "-f",
+          "lavfi",
+          "-i",
+          `sine=r=${rate}:f=440:d=2`,
+          "-c:a",
+          "libmp3lame",
+          "-b:a",
+          "64k",
+          "-reservoir",
+          "0",
+          "-write_xing",
+          "0",
+          "-id3v2_version",
+          "0",
+          "-f",
+          "mp3",
+        ]);
+        const f = fixtureMp3Frames(b)[19]!;
+        return b.subarray(f.start, f.end);
+      };
+      const prefix = encode([
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=r=48000:f=300:d=2",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "64k",
+        "-reservoir",
+        "0",
+        "-write_xing",
+        "0",
+        "-id3v2_version",
+        "0",
+        "-f",
+        "mp3",
+      ]);
+      const n = Math.round(288 / (576 / 8000 + 576 / 16000));
+      const pair = Buffer.concat([frameOf(8000), frameOf(16000)]);
+      const lossy = Buffer.concat([prefix, ...Array.from({ length: n }, () => pair)]);
+      // Its headers hold ~290 s; decoding (at any rate) plays several seconds less.
+      expect(headerSeconds(lossy)).toBeGreaterThan(285);
+      expect(await audio.measure(put(lossy), M)).toEqual({ ok: false, reason: "unsupported" });
+    },
+  );
+
+  realIt(
+    "#251 r12: fixed-rate answers at every MPEG rate, in calls at every rate, are all taken (81 combinations)",
+    async () => {
+      const { audio, put } = bench();
+      const rates = [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000];
+      const files = rates.map((r) =>
+        encode([
+          "-f",
+          "lavfi",
+          "-i",
+          `sine=frequency=300:duration=3:sample_rate=${r}`,
+          "-ac",
+          "1",
+          "-c:a",
+          "libmp3lame",
+        ]),
+      );
+      const refused: string[] = [];
+      for (const [i, f] of files.entries())
+        for (const call of rates) {
+          const m = await audio.measure(put(f), { ...M, sampleRate: call });
+          if (!m.ok || Math.abs(m.seconds - 3) > 0.1)
+            refused.push(`${rates[i]}→${call}: ${JSON.stringify(m)}`);
+          if (m.ok) fs.rmSync(m.pcm, { force: true });
+        }
+      expect(refused).toEqual([]);
     },
   );
 

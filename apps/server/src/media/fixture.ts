@@ -293,7 +293,8 @@ function silentFrame(rate: number): Buffer {
  * `unsupported` when there is no Layer III frame at all, or another layer among the frames it follows; the "decode" converts every frame's samples to the call's
  * rate (the first answer's) and writes that many PCM samples (silence) into `out/`; `too_long` over the cap. The
  * "encode" writes silent frames for the PCM files' samples. It does not model the decoder's delay/padding trimming
- * or Xing/Info frames — boundary tests use counts the real decoder confirmed. No program runs.
+ * or Xing/Info frames — boundary tests use counts the real decoder confirmed. Its "decode" plays exactly what the
+ * frames hold, so the real one's header cross-check (`HEADER_LOSS_S`) has nothing to find here. No program runs.
  */
 export function fixtureSpeechAudio(dataDir: string): SpeechAudio {
   let n = 0;
