@@ -36,7 +36,7 @@ export function RuntimeChip(props: {
     const onKey = (e: globalThis.KeyboardEvent) => {
       if (e.key !== "Escape") return;
       setOpen(false);
-      document.getElementById("runtime-chip")?.focus();
+      document.getElementById("runtime-chip")?.focus({ preventScroll: true });
     };
     document.addEventListener("pointerdown", onDown);
     document.addEventListener("keydown", onKey);

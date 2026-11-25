@@ -81,6 +81,21 @@ body,
   margin: 0;
   height: 100%;
 }
+/*
+ * The app shell never scrolls the document (#247): the sidebar, the main column and their own scrollers do. Set by
+ * Shell (`html.app-shell`); the sign-in screens keep an ordinary scrolling page. body clips whatever would stick out
+ * below it — a positioned leftover, an element another script appends — so the document is never taller than the
+ * window and nothing (a focus, a scrollIntoView, the wheel, the caret) can move the whole app up. `clip`, not just
+ * `hidden`: a hidden box can still be scrolled by a script; `hidden` stays as the fallback for older browsers.
+ */
+html.app-shell {
+  overflow: hidden;
+}
+html.app-shell body {
+  position: relative;
+  overflow: hidden;
+  overflow: clip;
+}
 body {
   background: var(--bg);
   color: var(--fg);
@@ -338,6 +353,9 @@ h2 {
   flex-direction: column;
   min-width: 0;
   min-height: 0;
+  /* Normally its children fit (the chat thread and pages scroll inside). A screen taller than a short window — an
+     artifact frame's minimum height — scrolls here, not the document (#247). */
+  overflow: auto;
   background: var(--bg);
 }
 .topbar {
@@ -381,6 +399,9 @@ h2 {
   padding: 30px 18px;
 }
 .segmented {
+  /* The hidden radios below are placed in here: without it they hang off .app, outside every scroller, and make the
+     document taller than the window (#247). */
+  position: relative;
   display: inline-flex;
   border: 1px solid var(--line);
   border-radius: 10px;

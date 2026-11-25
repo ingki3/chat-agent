@@ -1,4 +1,12 @@
-import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Outlet } from "react-router";
 import type { AuthState, AuthUser } from "@agentlee/shared";
@@ -21,6 +29,7 @@ const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), [tabi
 export function Shell({ user, onSignedOut }: { user: AuthUser; onSignedOut: (s: AuthState) => void }) {
   const [drawer, setDrawer] = useState(false);
   usePushMessages();
+  useFixedDocument();
   // The drawer exists only at 900px and below: widening the window closes it (and with it the modal state).
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 900px)");
@@ -42,7 +51,7 @@ export function Shell({ user, onSignedOut }: { user: AuthUser; onSignedOut: (s: 
   useEffect(() => {
     if (drawer || !restoreFocus.current) return;
     restoreFocus.current = false;
-    trigger.current?.focus();
+    trigger.current?.focus({ preventScroll: true });
   }, [drawer]);
 
   useEffect(() => {
@@ -102,6 +111,19 @@ export function Shell({ user, onSignedOut }: { user: AuthUser; onSignedOut: (s: 
       </div>
     </Ctx.Provider>
   );
+}
+
+/**
+ * While the app shell is up, the document itself never scrolls (#247, `html.app-shell` in styles.css): only the
+ * sidebar, the main column and their own scrollers do. Before the first paint, so no frame of the shell is ever a
+ * scrollable page; taken off again when the shell goes (the sign-in screens scroll as ordinary pages).
+ */
+function useFixedDocument() {
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    root.classList.add("app-shell");
+    return () => root.classList.remove("app-shell");
+  }, []);
 }
 
 /** Top bar of a screen: ☰ (narrow screens), title, actions. */
