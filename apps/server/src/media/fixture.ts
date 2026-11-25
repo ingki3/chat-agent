@@ -9,7 +9,7 @@ import {
   OPENROUTER_SPEECH_URL,
   SPEECH_PRICING_URL,
 } from "./openrouter.js";
-import { makeSpeechWorkdir, type Mp3Info, type SpeechAudio } from "./speech-audio.js";
+import { makeSpeechWorkdir, type Measured, type SpeechAudio } from "./speech-audio.js";
 
 /**
  * A scripted OpenRouter for the e2e run and manual testing with FAKE_RUNTIME=1 (#238): the server never reaches
@@ -240,6 +240,8 @@ const MP3_RATES: Record<number, number[]> = {
 export function mp3Frames(b: Buffer):
   | {
       frames: { start: number; end: number }[];
+      /** Each frame at its own rate (the rate may change inside a file): what decoding it would play. */
+      seconds: number;
       samplesPerFrame: number;
       sampleRate: number;
       channels: number;
@@ -252,6 +254,7 @@ export function mp3Frames(b: Buffer):
   let sampleRate = 0;
   let channels = 0;
   let samplesPerFrame = 1152;
+  let seconds = 0;
   while (p + 4 <= b.length) {
     if (b[p] !== 0xff || (b[p + 1]! & 0xe0) !== 0xe0) break;
     const version = (b[p + 1]! >> 3) & 3;
@@ -267,30 +270,34 @@ export function mp3Frames(b: Buffer):
     const len = Math.floor(((v1 ? 144 : 72) * kbps * 1000) / sampleRate) + ((b[p + 2]! >> 1) & 1);
     if (p + len > b.length) break;
     const head = b.toString("latin1", p, Math.min(p + len, p + 64));
-    if (!(frames.length === 0 && /Xing|Info/.test(head))) frames.push({ start: p, end: p + len });
+    if (!(frames.length === 0 && /Xing|Info/.test(head))) {
+      frames.push({ start: p, end: p + len });
+      seconds += samplesPerFrame / sampleRate;
+    }
     p += len;
   }
-  return frames.length ? { frames, samplesPerFrame, sampleRate, channels } : undefined;
+  return frames.length ? { frames, seconds, samplesPerFrame, sampleRate, channels } : undefined;
 }
 
+/** In a scripted answer: makes the scripted decoder fail on it (a corrupt MP3, as `-xerror` would stop on). */
+export const FIXTURE_CORRUPT_MARK = "FIXTURE-CORRUPT";
+
 /**
- * A scripted ffprobe/ffmpeg for the FAKE_RUNTIME (e2e) server and tests (#251 r3: speech is made only where its
- * length can be measured): the length from the MP3's frame headers (1152 samples each), the join as the pieces'
- * frames one after another. No program runs. Working folders as the real one's (`speech-scratch/<uuid>`).
+ * A scripted ffmpeg (measure, join) for the FAKE_RUNTIME (e2e) server and tests, with the real one's semantics
+ * (#251 re-plan 2): the length is what decoding would play — every frame walked at its own rate — and a file that
+ * would not decode cleanly is `corrupt` (no MPEG frames, bytes after the last frame, or `FIXTURE_CORRUPT_MARK`).
+ * The join is the pieces' frames one after another. No program runs. Working folders as the real one's.
  */
 export function fixtureSpeechAudio(dataDir: string): SpeechAudio {
   let joins = 0;
   return {
     workdir: () => makeSpeechWorkdir(dataDir),
-    async probe(file) {
-      const f = mp3Frames(fs.readFileSync(file));
-      if (!f) return undefined;
-      return {
-        seconds: (f.frames.length * f.samplesPerFrame) / f.sampleRate,
-        codec: "mp3",
-        sampleRate: f.sampleRate,
-        channels: f.channels,
-      } satisfies Mp3Info;
+    async measure(file): Promise<Measured> {
+      const b = fs.readFileSync(file);
+      const f = mp3Frames(b);
+      if (!f || b.includes(FIXTURE_CORRUPT_MARK, 0, "latin1") || f.frames.at(-1)!.end !== b.length)
+        return { ok: false, corrupt: true };
+      return { ok: true, seconds: Math.floor(f.seconds * 1000) / 1000 };
     },
     async join(job) {
       const parts: Buffer[] = [];

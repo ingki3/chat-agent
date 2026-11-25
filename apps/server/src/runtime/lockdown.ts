@@ -13,9 +13,9 @@ export function speechCallBudgetMs(): number {
   return (
     l.speechCallTimeoutMs +
     l.speechTimeoutMs +
-    l.speechProbeTimeoutMs +
+    l.speechMeasureTimeoutMs +
     2 * l.speechJoinTimeoutMs +
-    l.speechProbeTimeoutMs +
+    l.speechMeasureTimeoutMs +
     l.costTries * (l.costWaitMs + 15_000)
   );
 }

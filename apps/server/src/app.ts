@@ -377,7 +377,7 @@ export type BuildOptions = {
     /** Tests: whether the recovery retries in the background. */
     recovery?: { background?: boolean };
     /**
-     * Long speech (#248): ffprobe/ffmpeg that measure and join the pieces (default: the sandboxed ones beside
+     * Long speech (#248): the ffmpeg that measures (decodes) and joins the pieces (default: the sandboxed ones beside
      * AUDIO_FFMPEG; in tests none, unless given) and the piece sizing (tests: short pieces).
      */
     speechAudio?: () => SpeechAudio | undefined;
@@ -699,7 +699,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         (config.env === "test"
           ? () => undefined
           : config.fakeRuntime
-            ? // The e2e server: a scripted ffprobe/ffmpeg beside its scripted OpenRouter (no program runs).
+            ? // The e2e server: a scripted ffmpeg (measure, join) beside its scripted OpenRouter (no program runs).
               () => fixtureSpeechAudio(config.dataDir)
             : () => sandboxedSpeechAudio({ dataDir: config.dataDir, ffmpegPath: config.audioFfmpeg })),
       ...(opts.media?.split ? { split: opts.media.split } : {}),

@@ -2,7 +2,7 @@
  * Long scripts for `speech_generate` (#248): the production TTS model (`elevenlabs/eleven-v4` through OpenRouter)
  * stops its audio at about 290 s **without an error**. So a text is cut into pieces at paragraph and sentence
  * boundaries, each estimated at most `targetSeconds` long at a slow reading rate, synthesized one by one with the same
- * model, voice and instructions, measured (ffprobe) and joined into one MP3 (`speech-audio.ts`).
+ * model, voice and instructions, measured (decoded by ffmpeg) and joined into one MP3 (`speech-audio.ts`).
  *
  * The estimate is a reading-rate model, not a promise: Hangul (and other CJK) characters at a syllable rate, digits
  * at a slower rate (a number is read as several syllables), everything else (Latin letters, spaces, punctuation) at
@@ -139,14 +139,20 @@ const SPACE = /\s+/gu;
 
 /** Seconds of speech this text is estimated at, at these rates. */
 export function speechSeconds(text: string, rates: Rates): number {
-  let s = 0;
+  // Counted per class as integers and divided once per class (#251 r5: adding 1/15 three hundred times gives
+  // 19.99999999999995, not 20 — and a threshold compare then goes the wrong way).
+  let syllables = 0;
+  let digits = 0;
+  let chars = 0;
   for (const ch of text) {
-    if (SYLLABLE.test(ch)) s += 1 / rates.syllables;
-    else if (DIGIT.test(ch)) s += 1 / rates.digits;
-    else s += 1 / rates.chars;
+    if (SYLLABLE.test(ch)) syllables++;
+    else if (DIGIT.test(ch)) digits++;
+    else chars++;
   }
   const ends = text.match(SENTENCE_END)?.length ?? 0;
-  return s + ends * rates.sentencePause;
+  return (
+    syllables / rates.syllables + digits / rates.digits + chars / rates.chars + ends * rates.sentencePause
+  );
 }
 
 /** A part of the source text: `[start, end)` in UTF-16 offsets. */

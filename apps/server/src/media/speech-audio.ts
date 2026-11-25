@@ -1,7 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { z } from "zod";
 import { FILE_LIMITS, MEDIA_TOOL_LIMITS } from "@agentlee/shared";
 import { ffmpegOf, type Ffmpeg } from "../audio/packages.js";
 import { runIsolated, type RunIsolatedOptions, type RunResult } from "../isolation/sandbox.js";
@@ -9,38 +8,47 @@ import { removeTree } from "../python/service.js";
 import { storagePaths } from "../storage/paths.js";
 
 /**
- * The audio side of a long `speech_generate` (#248): every piece's MP3 is measured (ffprobe) and the pieces are
- * joined into one MP3 (ffmpeg). The programs are `audio_transcribe`'s ffmpeg (`AUDIO_FFMPEG`, default Homebrew's —
- * `ffmpegOf`, ops §46) and the ffprobe beside it, each run as its own sandboxed process group (`runIsolated`, #42):
- * no network, no child processes, a fixed environment, a time, memory and output limit; it reads only the call's
- * `in/` folder and writes only its `out/`. Without them (not macOS, no ffmpeg/ffprobe) there is no `SpeechAudio`,
- * and no speech is made at all — every piece must be measured (`media_audio_unavailable`, before anything is paid).
- * A length is always counted from the audio frames (`mp3PacketSeconds`), never taken from the container's header.
+ * The audio side of a long `speech_generate` (#248): every piece's MP3 is measured and the pieces are joined into one
+ * MP3, both by `audio_transcribe`'s ffmpeg (`AUDIO_FFMPEG`, default Homebrew's — `ffmpegOf`, ops §46), each run as its
+ * own sandboxed process group (`runIsolated`, #42): no network, no child processes, a fixed environment, a time,
+ * memory and output limit; it reads only the folder of its input and writes only the call's `out/`. Without it (not
+ * macOS, no ffmpeg) there is no `SpeechAudio`, and no speech is made at all — every piece must be measured
+ * (`media_audio_unavailable`, before anything is paid).
+ *
+ * **Measuring is decoding (#251 re-plan 2):** a file is decoded to its end, strictly (`-xerror`, `-err_detect
+ * explode`: the first decoding error stops it), into 1 kHz mono 8-bit PCM — one byte per millisecond of audio,
+ * whatever its rate (also when the rate changes inside the file) — and its length is the output's size. No header,
+ * container `duration` or packet count is used. A decoding error is `corrupt` (the caller stores nothing). The
+ * encoder's delay and padding (≈ 0.1–0.2 s) are in the count where the file does not say how to trim them.
  *
  * Working folders: `<DATA_DIR>/speech-scratch/<uuid>/{in,out}`, removed when the call ends (and at server start).
  */
-export type Mp3Info = { seconds: number; codec: string; sampleRate: number; channels: number };
-export type Reencode = { bitrateK: number; sampleRate: number; channels: number };
+/** A measurement: the decoded length, or why there is none — `corrupt` (a decoding error) or it could not run. */
+export type Measured = { ok: true; seconds: number } | { ok: false; corrupt: boolean };
 
 export type SpeechAudio = {
   /** A fresh, owner-only working folder with `in/` and `out/` (the caller removes it: `removeSpeechWorkdir`). */
   workdir(): string;
-  /** The length and stream of one MP3 in the folder (`in/` or `out/`); undefined when it does not read as audio. */
-  probe(file: string, signal?: AbortSignal): Promise<Mp3Info | undefined>;
+  /** One MP3 of the working folder (`in/` or `out/`) decoded to its end; its length from the decoded samples. */
+  measure(file: string, signal?: AbortSignal): Promise<Measured>;
   /**
-   * The files (in `in/`, in this order) joined into one MP3 in `out/`: stream copy (same codec, rate and channels
-   * throughout), or re-encoded. Its path, or undefined when ffmpeg failed.
+   * The files (in `in/`, in this order) joined into one MP3 in `out/`, always re-encoded (`bitrateK`, mono, 44.1 kHz
+   * — a piece's own stream may even change inside it). Its path, or undefined when ffmpeg failed.
    */
   join(
-    job: { workdir: string; files: string[]; reencode?: Reencode | undefined },
+    job: { workdir: string; files: string[]; bitrateK: number },
     signal?: AbortSignal,
   ): Promise<string | undefined>;
 };
 
 export const SPEECH_AUDIO_LIMITS = {
-  probeTimeoutMs: MEDIA_TOOL_LIMITS.speechProbeTimeoutMs,
+  measureTimeoutMs: MEDIA_TOOL_LIMITS.speechMeasureTimeoutMs,
   joinTimeoutMs: MEDIA_TOOL_LIMITS.speechJoinTimeoutMs,
   memoryBytes: 1024 * 1024 * 1024,
+  /** The measuring output's rate: one byte (u8 sample) per millisecond. */
+  measureRate: 1000,
+  /** The longest audio a measurement decodes (4 h — more than any 50MB MP3 a call can store): 14.4MB of PCM. */
+  measureMaxSeconds: 4 * 3600,
 } as const;
 
 /**
@@ -123,132 +131,106 @@ export function sweepSpeechScratch(dataDir: string): boolean {
   return ok;
 }
 
-/** ffmpeg (as `audio_transcribe` finds it) and the ffprobe in the same folder; undefined when either is missing. */
+/** ffmpeg as `audio_transcribe` finds it (macOS only — the sandbox); undefined without it. */
 export function speechTools(
   configured: string | undefined,
   dataDir: string,
   platform: NodeJS.Platform = process.platform,
-): { ffmpeg: Ffmpeg; ffprobe: string } | undefined {
+): { ffmpeg: Ffmpeg } | undefined {
   // The sandbox is macOS only (runIsolated fails closed elsewhere).
   if (platform !== "darwin") return undefined;
   const ff = ffmpegOf(configured, dataDir);
-  if (!ff.ok) return undefined;
-  let probe: string;
-  try {
-    probe = fs.realpathSync.native(path.join(path.dirname(ff.ffmpeg.exe), "ffprobe"));
-  } catch {
-    return undefined;
-  }
-  const st = fs.statSync(probe, { throwIfNoEntry: false });
-  if (!st?.isFile() || (st.mode & 0o111) === 0) return undefined;
-  // It must load its libraries from the same read-only program folders.
-  if (!ff.ffmpeg.trusted.some((t) => probe.startsWith(t + path.sep))) return undefined;
-  return { ffmpeg: ff.ffmpeg, ffprobe: probe };
-}
-
-const Probe = z.object({
-  streams: z
-    .array(
-      z.object({
-        codec_name: z.string().max(40),
-        sample_rate: z.coerce.number().int().positive(),
-        channels: z.number().int().min(1).max(8),
-        nb_read_packets: z.coerce.number().int().positive(),
-      }),
-    )
-    .min(1),
-});
-
-/**
- * Seconds of MP3 audio from its frames (#251 r4): every packet the demuxer reads is one MPEG audio frame, 1152
- * samples at MPEG-1 rates (32–48 kHz), 576 at MPEG-2/2.5 rates. Never the container's `duration` — for a VBR file
- * without a Xing/Info header that is an estimate from the first frames' bit rate (a 290 s file read as 108 s).
- */
-export function mp3PacketSeconds(packets: number, sampleRate: number): number {
-  return (packets * (sampleRate >= 32_000 ? 1152 : 576)) / sampleRate;
+  return ff.ok ? { ffmpeg: ff.ffmpeg } : undefined;
 }
 
 const PIECE = /^piece-\d{3}\.mp3$/;
 
-/** The ffprobe run of one file (exported for the profile tests). */
-export function probeOptions(tools: { ffmpeg: Ffmpeg; ffprobe: string }, file: string): RunIsolatedOptions {
+/** The ffmpeg run that decodes one file to measure it (exported for the profile tests). */
+export function measureOptions(tools: { ffmpeg: Ffmpeg }, file: string, out: string): RunIsolatedOptions {
   const dir = path.dirname(file);
+  const outDir = path.dirname(out);
+  const L = SPEECH_AUDIO_LIMITS;
   return {
-    command: tools.ffprobe,
+    command: tools.ffmpeg.exe,
     args: [
+      "-nostdin",
+      "-hide_banner",
       "-v",
       "error",
-      "-hide_banner",
-      "-select_streams",
-      "a:0",
-      // Every packet read and counted (no decoding; one aggregate number, not a packet list).
-      "-count_packets",
-      "-show_entries",
-      "stream=codec_name,sample_rate,channels,nb_read_packets",
-      "-of",
-      "json",
+      // The first decoding error stops the run (exit ≠ 0, a line on stderr): the file is corrupt.
+      "-xerror",
+      "-err_detect",
+      "explode",
+      "-i",
       file,
+      "-map",
+      "0:a:0",
+      "-vn",
+      "-sn",
+      "-dn",
+      "-ac",
+      "1",
+      "-ar",
+      String(L.measureRate),
+      "-c:a",
+      "pcm_u8",
+      "-t",
+      String(L.measureMaxSeconds),
+      "-f",
+      "u8",
+      out,
     ],
-    cwd: dir,
-    env: { HOME: dir, LANG: "en_US.UTF-8" },
-    read: [dir],
-    write: [],
+    cwd: outDir,
+    env: { HOME: outDir, LANG: "en_US.UTF-8" },
+    read: dir === outDir ? [] : [dir],
+    write: [outDir],
     trusted: tools.ffmpeg.trusted,
     network: "none",
     noFlagChanges: true,
-    timeoutMs: SPEECH_AUDIO_LIMITS.probeTimeoutMs,
-    maxRssBytes: SPEECH_AUDIO_LIMITS.memoryBytes,
+    timeoutMs: L.measureTimeoutMs,
+    maxRssBytes: L.memoryBytes,
     maxOutputBytes: 64 * 1024,
   };
 }
 
-/** The ffmpeg run that joins the pieces (exported for the profile tests). */
+/** The ffmpeg run that joins the pieces, re-encoded (exported for the profile tests). */
 export function joinOptions(
   tools: { ffmpeg: Ffmpeg },
-  job: { workdir: string; files: string[]; reencode?: Reencode | undefined; out: string },
+  job: { workdir: string; files: string[]; bitrateK: number; out: string },
 ): RunIsolatedOptions {
   const inDir = path.join(job.workdir, "in");
   const outDir = path.join(job.workdir, "out");
   const names = job.files.map((f) => path.basename(f));
-  const head = ["-nostdin", "-hide_banner", "-loglevel", "error"];
-  // The 50MB file cap as ffmpeg's own output limit (a bigger result is refused by the caller).
-  const tail = ["-map_metadata", "-1", "-fs", String(FILE_LIMITS.bytes + 1), "-f", "mp3", job.out];
-  const args = job.reencode
-    ? [
-        ...head,
-        ...names.flatMap((n) => ["-i", path.join(inDir, n)]),
-        "-filter_complex",
-        `${names.map((_, i) => `[${i}:a:0]`).join("")}concat=n=${names.length}:v=0:a=1[a]`,
-        "-map",
-        "[a]",
-        "-c:a",
-        "libmp3lame",
-        "-b:a",
-        `${job.reencode.bitrateK}k`,
-        "-ar",
-        String(job.reencode.sampleRate),
-        "-ac",
-        String(job.reencode.channels),
-        ...tail,
-      ]
-    : [
-        ...head,
-        // The concat demuxer with its safe mode on: the list names plain relative files of `in/` only.
-        "-f",
-        "concat",
-        "-safe",
-        "1",
-        "-i",
-        path.join(inDir, "list.txt"),
-        "-map",
-        "0:a:0",
-        "-c:a",
-        "copy",
-        ...tail,
-      ];
   return {
     command: tools.ffmpeg.exe,
-    args,
+    args: [
+      "-nostdin",
+      "-hide_banner",
+      "-v",
+      "error",
+      "-xerror",
+      ...names.flatMap((n) => ["-i", path.join(inDir, n)]),
+      "-filter_complex",
+      `${names.map((_, i) => `[${i}:a:0]`).join("")}concat=n=${names.length}:v=0:a=1[a]`,
+      "-map",
+      "[a]",
+      "-c:a",
+      "libmp3lame",
+      "-b:a",
+      `${job.bitrateK}k`,
+      "-ar",
+      "44100",
+      "-ac",
+      "1",
+      "-map_metadata",
+      "-1",
+      // The 50MB file cap as ffmpeg's own output limit (a bigger result is refused by the caller).
+      "-fs",
+      String(FILE_LIMITS.bytes + 1),
+      "-f",
+      "mp3",
+      job.out,
+    ],
     cwd: outDir,
     env: { HOME: outDir, LANG: "en_US.UTF-8" },
     read: [inDir],
@@ -268,7 +250,7 @@ function plainSize(file: string): number | undefined {
   return st?.isFile() && st.nlink === 1 ? st.size : undefined;
 }
 
-/** The `SpeechAudio` the app uses: the sandboxed ffprobe and ffmpeg (undefined without them). */
+/** The `SpeechAudio` the app uses: the sandboxed ffmpeg (undefined without it). */
 export function sandboxedSpeechAudio(o: {
   dataDir: string;
   ffmpegPath?: string | undefined;
@@ -286,27 +268,24 @@ export function sandboxedSpeechAudio(o: {
       return undefined;
     }
   };
-  let joins = 0;
+  let n = 0;
   return {
     workdir: () => makeSpeechWorkdir(o.dataDir),
-    async probe(file, signal) {
-      if (plainSize(file) === undefined) return undefined;
-      const r = await attempt(probeOptions(tools, file), signal);
-      if (!r || r.killed || r.code !== 0) return undefined;
+    async measure(file, signal) {
+      const dir = path.dirname(path.dirname(file));
+      if (plainSize(file) === undefined) return { ok: false, corrupt: false };
+      const out = path.join(dir, "out", `measure-${++n}.u8`);
       try {
-        const p = Probe.safeParse(JSON.parse(r.stdout));
-        if (!p.success) return undefined;
-        const s = p.data.streams[0]!;
-        // MP3 only: its frame length is what the count is turned into seconds with.
-        if (s.codec_name !== "mp3") return undefined;
-        return {
-          seconds: mp3PacketSeconds(s.nb_read_packets, s.sample_rate),
-          codec: s.codec_name,
-          sampleRate: s.sample_rate,
-          channels: s.channels,
-        };
-      } catch {
-        return undefined;
+        const r = await attempt(measureOptions(tools, file, out), signal);
+        // Not run, or stopped by a limit or the caller: no verdict about the file.
+        if (!r || r.killed) return { ok: false, corrupt: false };
+        // A decoding error (or anything the strict decoder had to say): corrupt.
+        if (r.code !== 0 || r.stderr.trim()) return { ok: false, corrupt: true };
+        const size = plainSize(out);
+        if (size === undefined) return { ok: false, corrupt: true };
+        return { ok: true, seconds: size / SPEECH_AUDIO_LIMITS.measureRate };
+      } finally {
+        fs.rmSync(out, { force: true });
       }
     },
     async join(job, signal) {
@@ -315,13 +294,7 @@ export function sandboxedSpeechAudio(o: {
       for (const f of job.files)
         if (path.dirname(f) !== inDir || !PIECE.test(path.basename(f)) || plainSize(f) === undefined)
           return undefined;
-      if (!job.reencode)
-        fs.writeFileSync(
-          path.join(inDir, "list.txt"),
-          job.files.map((f) => `file '${path.basename(f)}'\n`).join(""),
-          { mode: 0o600 },
-        );
-      const out = path.join(job.workdir, "out", `speech-${++joins}.mp3`);
+      const out = path.join(job.workdir, "out", `speech-${++n}.mp3`);
       const r = await attempt(joinOptions(tools, { ...job, out }), signal);
       if (!r || r.killed || r.code !== 0) return undefined;
       return plainSize(out) === undefined ? undefined : out;
