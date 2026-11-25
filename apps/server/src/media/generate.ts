@@ -980,7 +980,12 @@ export class MediaGenerator {
         // byte sniffing of our own: a WAV or MP2 answer, or a leading tag, is for the decoder to report).
         if (!r.bytes.length) throw new MediaToolError("media_audio_unsupported");
         const file = path.join(workdir, "in", `piece-${String(n++).padStart(3, "0")}.mp3`);
-        fs.writeFileSync(file, r.bytes, { flag: "wx", mode: 0o600 });
+        try {
+          fs.writeFileSync(file, r.bytes, { flag: "wx", mode: 0o600 });
+        } catch {
+          // The working folder could not take it (full disk, a limit): not measured — no path in what is told.
+          throw new MediaToolError("media_measure_failed");
+        }
         // Gated, then decoded to its end into PCM at the call's rate (#251 re-plan 5): a corrupt, unsupported or
         // abnormally long answer, or one that could not be measured, ends the call — no file, no retry (the cost
         // stays recorded); a clean but short one goes to the re-split below. The first answer decoded fixes the

@@ -1500,7 +1500,9 @@ describe("speech_generate: review rounds 5–6 re-plans — one form, exact deco
             fs.writeFileSync(
               o.args.at(-1)!,
               Buffer.alloc(
-                (r.samplesAt?.[Number(o.args[o.args.indexOf("-ar") + 1])] ?? r.samples ?? 576) * 2,
+                // `samples` are at 8 kHz (the gate's rate); every other rate gets the same length.
+                (r.samplesAt?.[Number(o.args[o.args.indexOf("-ar") + 1])] ??
+                  Math.round(((r.samples ?? 576) * Number(o.args[o.args.indexOf("-ar") + 1])) / 8000)) * 2,
               ),
             );
           return { stdout: "", stderr: "", killed: null, signal: null, ...r };
@@ -1660,6 +1662,26 @@ describe("speech_generate: review rounds 5–6 re-plans — one form, exact deco
       ok: false,
       reason: "unsupported",
     });
+  });
+
+  it("#251 r11: an answer the working folder cannot take is media_measure_failed — no path in what is told", async () => {
+    let dataDir = "";
+    const fake = fakeAudio(() => dataDir);
+    const full: SpeechAudio = {
+      ...fake.audio,
+      workdir: () => {
+        const w = makeSpeechWorkdir(dataDir);
+        fs.chmodSync(path.join(w, "in"), 0o500);
+        return w;
+      },
+    };
+    const t = await start({ audio: full });
+    dataDir = t.dataDir;
+    const r = await t.speak({ text: SENTENCES[0]! });
+    expect(r).toMatchObject({ ok: false, code: "media_measure_failed" });
+    expect(JSON.stringify(r)).not.toContain(dataDir);
+    expect(t.rows()).toEqual([expect.objectContaining({ cost_usd: PIECE_COST })]);
+    expect(t.scratch()).toEqual([]);
   });
 
   it("estimates and limits compare in whole microseconds: 20 s exactly is 20 s, whatever the classes", () => {
@@ -2345,6 +2367,46 @@ describe("speech_generate: the real sandboxed ffmpeg (#248, macOS)", () => {
         ok: false,
         reason: "unsupported",
       });
+    },
+  );
+
+  realIt(
+    "#251 r11: an 8 kHz start then 290 rate changes: unsupported in an 8 kHz call, never judged shortened",
+    async () => {
+      const { audio, put } = bench();
+      const at = (rate: number, d = 1) =>
+        encode([
+          "-f",
+          "lavfi",
+          "-i",
+          `sine=frequency=300:duration=${d}:sample_rate=${rate}`,
+          "-ac",
+          "1",
+          "-c:a",
+          "libmp3lame",
+          "-b:a",
+          "64k",
+          "-write_xing",
+          "0",
+          "-id3v2_version",
+          "0",
+        ]);
+      const a = at(44100);
+      const b = at(48000);
+      const prefixed = Buffer.concat([at(8000), ...Array.from({ length: 145 }, () => [a, b]).flat()]);
+      // In an 8 kHz call: compared with an independent decode, the loss converting across its rate changes shows.
+      expect(await audio.measure(put(prefixed), { ...M, sampleRate: 8000 })).toEqual({
+        ok: false,
+        reason: "unsupported",
+      });
+      // As a call's first answer (its stream rate is the call's): two decodes agree and its full length is judged —
+      // past the mark (re-split in a call), never the shortened one.
+      const own = await audio.measure(put(prefixed), M);
+      expect(own.ok && own.seconds).toBeGreaterThan(300);
+      // A clean 8 kHz answer is not refused by that comparison.
+      const clean = await audio.measure(put(at(8000, 20)), M);
+      // (No length header here: the encoder's delay and padding stay in, ~0.16 s.)
+      expect(clean.ok && Math.abs(clean.seconds - 20)).toBeLessThan(0.3);
     },
   );
 

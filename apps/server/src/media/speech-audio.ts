@@ -425,22 +425,25 @@ export function sandboxedSpeechAudio(o: {
       const d = await decode(sampleRate);
       if (!d.ok) return d;
       let seconds = d.samples / sampleRate;
-      // Converted from another rate (#251 r10): ffmpeg can lose audio converting across rate changes inside an
-      // answer. Its length at its own rate is decoded too and is the one judged; the two must agree.
-      if (sampleRate !== gate.sampleRate) {
-        const own = await decode(gate.sampleRate);
-        if (!own.ok) {
-          fs.rmSync(d.pcm, { force: true });
-          return own;
-        }
-        fs.rmSync(own.pcm, { force: true });
-        const native = own.samples / gate.sampleRate;
-        if (Math.abs(native - seconds) > CONVERSION_TOLERANCE_S) {
-          fs.rmSync(d.pcm, { force: true });
-          return { ok: false, reason: "unsupported" };
-        }
-        seconds = native;
+      // Always a second, independent decode (#251 r10–r11): ffmpeg can lose audio converting across rate changes
+      // inside an answer — also when its first frames are at the call's rate. At its own (first) rate when that is
+      // another, else at another rate; the two lengths must agree, and an answer converted from its own rate is
+      // judged on its own length. (ffprobe's packet durations were checked as a cheaper source and are not exact
+      // per frame: one rate is assumed for all of them.)
+      const reference =
+        sampleRate !== gate.sampleRate ? gate.sampleRate : sampleRate === 48000 ? 44100 : 48000;
+      const other = await decode(reference);
+      if (!other.ok) {
+        fs.rmSync(d.pcm, { force: true });
+        return other;
       }
+      fs.rmSync(other.pcm, { force: true });
+      const otherSeconds = other.samples / reference;
+      if (Math.abs(otherSeconds - seconds) > CONVERSION_TOLERANCE_S) {
+        fs.rmSync(d.pcm, { force: true });
+        return { ok: false, reason: "unsupported" };
+      }
+      if (sampleRate !== gate.sampleRate) seconds = otherSeconds;
       if (seconds > m.maxSeconds) {
         fs.rmSync(d.pcm, { force: true });
         return { ok: false, reason: "too_long" };

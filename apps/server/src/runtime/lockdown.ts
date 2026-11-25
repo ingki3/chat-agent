@@ -13,11 +13,11 @@ export function speechCallBudgetMs(): number {
   return (
     l.speechCallTimeoutMs +
     l.speechTimeoutMs +
-    // The last piece's measurement: ffprobe's stream probe and up to two PCM decodes (at the call's rate and, when
-    // converted, at its own) — 60 s each; then up to two encodes and the result's measurement (probe + one decode).
+    // A measurement is ffprobe's stream probe and two PCM decodes (at the call's rate and a second, independent one)
+    // — 60 s each: the last piece's, then up to two encodes and the stored file's.
     3 * l.speechMeasureTimeoutMs +
     2 * l.speechJoinTimeoutMs +
-    2 * l.speechMeasureTimeoutMs +
+    3 * l.speechMeasureTimeoutMs +
     l.costTries * (l.costWaitMs + 15_000)
   );
 }
