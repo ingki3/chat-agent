@@ -104,9 +104,9 @@ import {
  * joins the pieces into one MP3 (stream copy; re-encoded when their streams differ, or at a lower rate when the
  * result passes 50MB), its length is checked against the pieces' sum, and it is stored as one file. Any stop on
  * the way (a failed or refused piece, cancel, a settings change, the call's time budget) stores nothing: the pieces
- * already sent keep their rows (their cost is recorded), the reserved rows of pieces never sent are removed. Without
- * ffmpeg/ffprobe a text of one piece is made unmeasured as before; a longer one is `media_audio_unavailable` before
- * anything is paid. One tool call is one use of the run's speech limit, one file place, one slot.
+ * already sent keep their rows (their cost is recorded), the reserved rows of pieces never sent are removed. Every
+ * piece is measured (its length counted from its audio frames): without ffmpeg/ffprobe no speech is made at all —
+ * `media_audio_unavailable` before anything is paid (#251 r3). One tool call is one use of the run's speech limit, one file place, one slot.
  */
 export type MediaGeneratorOptions = {
   db: Db;
@@ -150,7 +150,7 @@ export type MediaGeneratorOptions = {
   errors?: Pick<ErrorLog, "record"> | undefined;
   /**
    * #248: ffprobe/ffmpeg for measuring and joining speech pieces, resolved per call; undefined = not on this server
-   * (a speech text of one piece is still made, unmeasured).
+   * (then no speech is made: `media_audio_unavailable`).
    */
   speechAudio?: () => SpeechAudio | undefined;
   /** #248: the piece sizing and cut detection (tests use short pieces). */
@@ -168,8 +168,8 @@ export type MediaToolOutput = {
   voice?: string;
   /** OpenRouter's reported cost (USD); null when it reported none (speech: of all its pieces, null if any is missing). */
   costUsd: number | null;
-  /** Speech (#248): the stored audio's length in seconds (null: not measured — no ffprobe on this server). */
-  durationSeconds?: number | null;
+  /** Speech (#248): the stored audio's length in seconds, counted from its audio frames (always measured). */
+  durationSeconds?: number;
   /** Speech (#248): the pieces the stored audio was read in. */
   chunks?: number;
   note: string;
@@ -965,7 +965,7 @@ export class MediaGenerator {
         }
         const left = FILE_LIMITS.bytes - bytesSoFar;
         if (left <= 0) throw new MediaToolError("media_failed");
-        // Synchronously from here to the request: egress check, a new day's budget, the row marked sent.
+        // Synchronously from here to the request: egress check, the row marked sent (its day: the call's start day).
         this.sending(ctx, plan, p);
         unsent.delete(p.callId);
         const r = await this.piece(ctx, p, plan.body, left);
@@ -1036,7 +1036,7 @@ export class MediaGenerator {
     ctx: CallCtx,
     made: Made[],
     workdir: string | undefined,
-  ): Promise<{ bytes: Buffer; seconds: number | null }> {
+  ): Promise<{ bytes: Buffer; seconds: number }> {
     const audio = ctx.audio;
     const first = made[0];
     if (!first) throw new MediaToolError("media_failed");

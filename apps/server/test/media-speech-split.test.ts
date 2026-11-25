@@ -20,6 +20,7 @@ import {
   FIXTURE_OPENROUTER_KEY_PREFIX,
   fixtureOpenRouterFetch,
   fixtureSpeechAudio,
+  mp3Frames,
   silentMp3,
 } from "../src/media/fixture.js";
 import { isMp3 } from "../src/media/generate.js";
@@ -27,6 +28,7 @@ import { OPENROUTER_SPEECH_URL } from "../src/media/openrouter.js";
 import {
   joinOptions,
   makeSpeechWorkdir,
+  mp3PacketSeconds,
   probeOptions,
   removeSpeechWorkdir,
   sandboxedSpeechAudio,
@@ -1200,6 +1202,87 @@ describe("speech_generate: review round 3 regressions (#251)", () => {
     });
 });
 
+// ---------------------------------------------------------------- review round 4 (#251)
+
+/** One MPEG-1 Layer III frame header (44.1 kHz, joint stereo) at this bit-rate index, padded to its length. */
+function mp3Frame(bitrateIndex: number): Buffer {
+  const kbps = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320][bitrateIndex]!;
+  const frame = Buffer.alloc(Math.floor((144 * kbps * 1000) / 44100));
+  frame.set([0xff, 0xfb, (bitrateIndex << 4) | 0, 0x64]);
+  return frame;
+}
+
+/** A VBR MP3 without a Xing/Info length header: a few dear frames first, then many cheap ones. */
+function vbrWithoutHeader(seconds: number): Buffer {
+  const frames = Math.ceil((seconds * 44100) / 1152);
+  return Buffer.concat(Array.from({ length: frames }, (_, i) => mp3Frame(i < 20 ? 14 : 1)));
+}
+
+describe("speech_generate: review round 4 regressions (#251)", () => {
+  it("P2: a length is counted from the audio frames, never the container's estimate", () => {
+    // ffprobe: `-count_packets` and the packet count — no `format=duration` asked for at all.
+    const o = probeOptions(
+      { ffmpeg: { exe: "/opt/x/bin/ffmpeg", trusted: ["/opt/x/bin"] }, ffprobe: "/opt/x/bin/ffprobe" },
+      "/d/in/piece-000.mp3",
+    );
+    expect(o.args).toContain("-count_packets");
+    expect(o.args.join(" ")).toContain("nb_read_packets");
+    expect(o.args.join(" ")).not.toContain("format=duration");
+    expect(mp3PacketSeconds(11_330, 44_100)).toBeCloseTo(295.97, 2);
+    expect(mp3PacketSeconds(100, 22_050)).toBeCloseTo((100 * 576) / 22_050, 6);
+    // The scripted ffprobe walks every frame by its own header (VBR), and skips a leading Xing/Info frame.
+    const vbr = vbrWithoutHeader(14.6);
+    const f = mp3Frames(vbr)!;
+    expect((f.frames.length * f.samplesPerFrame) / f.sampleRate).toBeCloseTo(14.6, 1);
+    const xing = mp3Frame(9);
+    xing.write("Xing", 36, "latin1");
+    expect(mp3Frames(Buffer.concat([xing, vbr]))!.frames).toHaveLength(f.frames.length);
+  });
+
+  it("P2: a header-less VBR piece near the provider's mark is caught (measured by frames) and re-split", async () => {
+    const pieces = splitSpeech(LONG, LIMITS);
+    const again = resplitSpeech(pieces[0]!, LIMITS);
+    // Its typical-rate estimate is under 10 s; a size-based estimate of this file would be far shorter than 14.6 s.
+    const t = await start({
+      audio: "fixture",
+      answer: (input, n) => {
+        if (n === 0) return vbrWithoutHeader(14.6);
+        const sec = speechSeconds(input, LIMITS.typical);
+        return Buffer.concat(Array.from({ length: Math.ceil((sec * 44100) / 1152) }, () => mp3Frame(9)));
+      },
+    });
+    const r = await t.speak({ text: LONG });
+    expect(r.ok).toBe(true);
+    expect(t.posts.map((p) => p.input)).toEqual([pieces[0], ...again, ...pieces.slice(1)]);
+  });
+
+  it("P3: a paragraph that ends with an address is still a paragraph — never cut inside the address", () => {
+    const first = "All the notes for today are on our new page at https://example.com.";
+    const second = "Tomorrow we will meet again at the library and read the next chapter together.";
+    for (const gap of ["\n\n", "\n", "\n \n  "]) {
+      const text = `${first}${gap}${second}`;
+      const target = Math.max(speechSeconds(first, LIMITS.slow), speechSeconds(second, LIMITS.slow)) + 0.1;
+      expect(speechSeconds(text, LIMITS.slow)).toBeGreaterThan(target);
+      const pieces = splitSpeech(text, LIMITS, target);
+      expect(pieces).toEqual([first, second]);
+      expect(pieces.some((p) => p.endsWith("https:") || p.startsWith("//"))).toBe(false);
+    }
+  });
+
+  it("P3: a cost corrected after midnight is checked for the day of the call (recordMedia)", async () => {
+    const day1 = Date.parse("2026-11-30T14:00:00.000Z");
+    const day2 = Date.parse("2026-11-30T15:30:00.000Z");
+    let clock = day1;
+    const t = await start({ now: () => clock });
+    const checked = vi.spyOn(t.app.usage!, "checkDailyCost");
+    const row = { userId: t.f.users.owner.id, conversationId: null, runId: "r1", callId: "c1", model: "m" };
+    t.app.usageStore!.recordMedia({ ...row, costUsd: null });
+    clock = day2;
+    t.app.usageStore!.recordMedia({ ...row, costUsd: 0.04 });
+    expect(checked.mock.calls.map((c) => c[0])).toEqual([day1, day1]);
+  });
+});
+
 // ---------------------------------------------------------------- the real ffprobe/ffmpeg (macOS with ffmpeg)
 
 const realTools =
@@ -1238,6 +1321,73 @@ function tone(seconds: number, rate = 22050): Buffer {
 }
 
 describe("speech_generate: the real sandboxed ffprobe and ffmpeg (#248, macOS)", () => {
+  realIt(
+    "a header-less VBR MP3 near the mark: the real ffprobe counts its frames and the piece is re-split",
+    async () => {
+      // A few loud (dear) frames first, then silence (cheap ones), VBR without a Xing/Info header: ffprobe's container
+      // duration estimates it far shorter than its 14.6 s.
+      const vbr = (() => {
+        const out = path.join(tmp(), "vbr.mp3");
+        const r = spawnSync(realTools!.ffmpeg.exe, [
+          "-nostdin",
+          "-v",
+          "error",
+          "-f",
+          "lavfi",
+          "-i",
+          "anoisesrc=d=1:c=white:a=0.9:r=44100",
+          "-f",
+          "lavfi",
+          "-i",
+          "anullsrc=r=44100:cl=mono:d=13.6",
+          "-filter_complex",
+          "[0]aformat=channel_layouts=mono[a];[a][1]concat=n=2:v=0:a=1",
+          "-c:a",
+          "libmp3lame",
+          "-q:a",
+          "2",
+          "-write_xing",
+          "0",
+          out,
+        ]);
+        expect(r.status).toBe(0);
+        const est = spawnSync(
+          realTools!.ffprobe,
+          ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", out],
+          {
+            encoding: "utf8",
+          },
+        );
+        // The estimate a header-based measurement would have used: well under the mark.
+        expect(Number(est.stdout)).toBeLessThan(LIMITS.nearCutSeconds);
+        return fs.readFileSync(out);
+      })();
+      let dataDir = "";
+      let made: SpeechAudio | undefined;
+      const real = () =>
+        (made ??= sandboxedSpeechAudio({
+          dataDir,
+          platform: "darwin",
+          ffmpegPath: process.env.TEST_AUDIO_FFMPEG,
+        })!);
+      const lazy: SpeechAudio = {
+        workdir: () => real().workdir(),
+        probe: (f, sg) => real().probe(f, sg),
+        join: (j, sg) => real().join(j, sg),
+      };
+      const t = await start({
+        audio: lazy,
+        answer: (input, n) =>
+          n === 0 ? vbr : tone(Math.round(speechSeconds(input, LIMITS.typical) * 10) / 10),
+      });
+      dataDir = t.dataDir;
+      const pieces = splitSpeech(LONG, LIMITS);
+      const again = resplitSpeech(pieces[0]!, LIMITS);
+      const r = await t.speak({ text: LONG });
+      expect(r.ok).toBe(true);
+      expect(t.posts.map((p) => p.input)).toEqual([pieces[0], ...again, ...pieces.slice(1)]);
+    },
+  );
   realIt("measures each piece, joins them in order into one MP3 of their summed length", async () => {
     let dataDir = "";
     const lazy: SpeechAudio = {

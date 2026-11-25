@@ -222,37 +222,55 @@ export function fixtureOpenRouterFetch(): typeof fetch {
   }) as typeof fetch;
 }
 
-/** MPEG-1 Layer III bit rates (kbit/s) by index, and sample rates. */
-const MP3_KBPS = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
-const MP3_RATES = [44100, 48000, 32000];
+/** MPEG Layer III bit rates (kbit/s) by index — MPEG-1, then MPEG-2/2.5 — and sample rates by version. */
+const MP3_KBPS_V1 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+const MP3_KBPS_V2 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+const MP3_RATES: Record<number, number[]> = {
+  3: [44100, 48000, 32000],
+  2: [22050, 24000, 16000],
+  0: [11025, 12000, 8000],
+};
 
 /**
- * The frames of an MPEG-1 Layer III file (after an ID3v2 tag), counted from their headers: where each one starts
- * and ends, its rate and channels. Undefined when there is none. The scripted ffprobe/ffmpeg's ground (#251 r3).
+ * The audio frames of an MPEG Layer III file (after an ID3v2 tag), **counted** one by one from their own headers
+ * (each frame's own bit rate — a VBR file is walked frame by frame, nothing is estimated from the first ones); a
+ * leading Xing/Info frame (a length header, no audio) is not counted. Where each counted frame starts and ends, the
+ * samples per frame, the rate and channels; undefined when there is none. The scripted ffprobe/ffmpeg's ground.
  */
-export function mp3Frames(
-  b: Buffer,
-): { frames: { start: number; end: number }[]; sampleRate: number; channels: number } | undefined {
+export function mp3Frames(b: Buffer):
+  | {
+      frames: { start: number; end: number }[];
+      samplesPerFrame: number;
+      sampleRate: number;
+      channels: number;
+    }
+  | undefined {
   let p = 0;
   if (b.length >= 10 && b.toString("latin1", 0, 3) === "ID3")
     p = 10 + (((b[6]! & 0x7f) << 21) | ((b[7]! & 0x7f) << 14) | ((b[8]! & 0x7f) << 7) | (b[9]! & 0x7f));
   const frames: { start: number; end: number }[] = [];
   let sampleRate = 0;
   let channels = 0;
+  let samplesPerFrame = 1152;
   while (p + 4 <= b.length) {
     if (b[p] !== 0xff || (b[p + 1]! & 0xe0) !== 0xe0) break;
-    if (((b[p + 1]! >> 3) & 3) !== 3 || ((b[p + 1]! >> 1) & 3) !== 1) break;
+    const version = (b[p + 1]! >> 3) & 3;
+    if (version === 1 || ((b[p + 1]! >> 1) & 3) !== 1) break;
     const bi = (b[p + 2]! >> 4) & 15;
     const si = (b[p + 2]! >> 2) & 3;
     if (bi === 0 || bi === 15 || si === 3) break;
-    sampleRate = MP3_RATES[si]!;
+    sampleRate = MP3_RATES[version]![si]!;
     channels = ((b[p + 3]! >> 6) & 3) === 3 ? 1 : 2;
-    const len = Math.floor((144 * MP3_KBPS[bi]! * 1000) / sampleRate) + ((b[p + 2]! >> 1) & 1);
+    const v1 = version === 3;
+    samplesPerFrame = v1 ? 1152 : 576;
+    const kbps = (v1 ? MP3_KBPS_V1 : MP3_KBPS_V2)[bi]!;
+    const len = Math.floor(((v1 ? 144 : 72) * kbps * 1000) / sampleRate) + ((b[p + 2]! >> 1) & 1);
     if (p + len > b.length) break;
-    frames.push({ start: p, end: p + len });
+    const head = b.toString("latin1", p, Math.min(p + len, p + 64));
+    if (!(frames.length === 0 && /Xing|Info/.test(head))) frames.push({ start: p, end: p + len });
     p += len;
   }
-  return frames.length ? { frames, sampleRate, channels } : undefined;
+  return frames.length ? { frames, samplesPerFrame, sampleRate, channels } : undefined;
 }
 
 /**
@@ -268,7 +286,7 @@ export function fixtureSpeechAudio(dataDir: string): SpeechAudio {
       const f = mp3Frames(fs.readFileSync(file));
       if (!f) return undefined;
       return {
-        seconds: (f.frames.length * 1152) / f.sampleRate,
+        seconds: (f.frames.length * f.samplesPerFrame) / f.sampleRate,
         codec: "mp3",
         sampleRate: f.sampleRate,
         channels: f.channels,

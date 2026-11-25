@@ -159,7 +159,7 @@ export class UsageStore {
     const at = this.mediaNow();
     const usd = cost(m.costUsd ?? undefined);
     const micros = usd === null ? null : Math.round(usd * 1_000_000);
-    this.db
+    const row = this.db
       .insert(usageRecords)
       .values({
         userId: m.userId,
@@ -192,8 +192,10 @@ export class UsageStore {
             ? { updatedAt: at }
             : { costUsd: usd, pricedCostMicros: micros, mediaSettlement: "settled", updatedAt: at },
       })
-      .run();
-    this.onRecorded?.(at);
+      .returning({ createdAt: usageRecords.createdAt })
+      .get();
+    // The day the row belongs to (a correction after midnight checks the day of the call — #251 r4).
+    this.onRecorded?.(row?.createdAt ?? at);
   }
 
   /**

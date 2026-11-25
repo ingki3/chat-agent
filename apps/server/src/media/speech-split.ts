@@ -109,6 +109,8 @@ const ADDRESS = /:\/\/|^www\.|@/iu;
  */
 function sentenceEnd(text: string, at: number, match: string): boolean {
   if (!match.startsWith(".") || match.startsWith("..")) return true;
+  // A line break after the period ends the line whatever the word was ("…https://example.com.\n", #251 r4).
+  if (/\n/u.test(match)) return true;
   let from = at;
   while (from > 0 && !/\s/u.test(text[from - 1]!)) from--;
   const word = text.slice(from, at);
@@ -125,6 +127,14 @@ function sentenceEnd(text: string, at: number, match: string): boolean {
 }
 
 const CLAUSE = /[,;:，、；：]\s*/gu;
+/**
+ * Whether a clause mark is a place to cut (#251 r4): a full-width one (，、；：) always; an ASCII one (, ; :) only
+ * with whitespace after it — never inside a token such as an address ("https://…") or a number ("3,000").
+ */
+const clauseEnd = (_start: number, match: string): boolean => !/^[,;:]$/u.test(match);
+
+/** A paragraph break: a line break, blank line(s), and the whitespace after them. */
+const PARAGRAPH = /\n[^\S\n]*\n\s*/gu;
 const SPACE = /\s+/gu;
 
 /** Seconds of speech this text is estimated at, at these rates. */
@@ -200,15 +210,19 @@ function hardCut(text: string, span: Span, target: number, rates: Rates, ends: r
 function units(text: string, target: number, rates: Rates): Span[] {
   const ends = graphemeEnds(text);
   const ok = new Set(ends);
-  const fits = (sp: Span) => speechSeconds(text.slice(sp.start, sp.end), rates) <= target;
+  // Measured as sent: a span's edge whitespace is trimmed off before it goes to the model.
+  const fits = (sp: Span) => speechSeconds(text.slice(sp.start, sp.end).trim(), rates) <= target;
   const out: Span[] = [];
   const isEnd = (start: number, match: string) => sentenceEnd(text, start, match);
-  for (const s of cutAfter(text, { start: 0, end: text.length }, SENTENCE, ok, isEnd)) {
+  // Paragraphs (a blank line) first, unconditionally (#251 r4): no sentence rule can join two paragraphs.
+  const paragraphs = cutAfter(text, { start: 0, end: text.length }, PARAGRAPH, ok);
+  const sentences = paragraphs.flatMap((pa) => cutAfter(text, pa, SENTENCE, ok, isEnd));
+  for (const s of sentences) {
     if (fits(s)) {
       out.push(s);
       continue;
     }
-    for (const c of cutAfter(text, s, CLAUSE, ok)) {
+    for (const c of cutAfter(text, s, CLAUSE, ok, clauseEnd)) {
       if (fits(c)) {
         out.push(c);
         continue;
@@ -230,7 +244,7 @@ export function splitSpans(text: string, limits: SpeechSplitLimits = SPEECH_SPLI
   const spans: Span[] = [];
   let cur: Span | undefined;
   for (const u of units(text, t, limits.slow)) {
-    if (cur && speechSeconds(text.slice(cur.start, u.end), limits.slow) > t) {
+    if (cur && speechSeconds(text.slice(cur.start, u.end).trim(), limits.slow) > t) {
       spans.push(cur);
       cur = undefined;
     }

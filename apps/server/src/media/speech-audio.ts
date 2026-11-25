@@ -13,8 +13,9 @@ import { storagePaths } from "../storage/paths.js";
  * joined into one MP3 (ffmpeg). The programs are `audio_transcribe`'s ffmpeg (`AUDIO_FFMPEG`, default Homebrew's —
  * `ffmpegOf`, ops §46) and the ffprobe beside it, each run as its own sandboxed process group (`runIsolated`, #42):
  * no network, no child processes, a fixed environment, a time, memory and output limit; it reads only the call's
- * `in/` folder and writes only its `out/`. Without them (not macOS, no ffmpeg/ffprobe) there is no `SpeechAudio`:
- * a text that fits one piece is made as before (unmeasured), a longer one is refused before anything is paid.
+ * `in/` folder and writes only its `out/`. Without them (not macOS, no ffmpeg/ffprobe) there is no `SpeechAudio`,
+ * and no speech is made at all — every piece must be measured (`media_audio_unavailable`, before anything is paid).
+ * A length is always counted from the audio frames (`mp3PacketSeconds`), never taken from the container's header.
  *
  * Working folders: `<DATA_DIR>/speech-scratch/<uuid>/{in,out}`, removed when the call ends (and at server start).
  */
@@ -152,11 +153,20 @@ const Probe = z.object({
         codec_name: z.string().max(40),
         sample_rate: z.coerce.number().int().positive(),
         channels: z.number().int().min(1).max(8),
+        nb_read_packets: z.coerce.number().int().positive(),
       }),
     )
     .min(1),
-  format: z.object({ duration: z.coerce.number().positive().finite() }),
 });
+
+/**
+ * Seconds of MP3 audio from its frames (#251 r4): every packet the demuxer reads is one MPEG audio frame, 1152
+ * samples at MPEG-1 rates (32–48 kHz), 576 at MPEG-2/2.5 rates. Never the container's `duration` — for a VBR file
+ * without a Xing/Info header that is an estimate from the first frames' bit rate (a 290 s file read as 108 s).
+ */
+export function mp3PacketSeconds(packets: number, sampleRate: number): number {
+  return (packets * (sampleRate >= 32_000 ? 1152 : 576)) / sampleRate;
+}
 
 const PIECE = /^piece-\d{3}\.mp3$/;
 
@@ -171,8 +181,10 @@ export function probeOptions(tools: { ffmpeg: Ffmpeg; ffprobe: string }, file: s
       "-hide_banner",
       "-select_streams",
       "a:0",
+      // Every packet read and counted (no decoding; one aggregate number, not a packet list).
+      "-count_packets",
       "-show_entries",
-      "format=duration:stream=codec_name,sample_rate,channels",
+      "stream=codec_name,sample_rate,channels,nb_read_packets",
       "-of",
       "json",
       file,
@@ -285,8 +297,10 @@ export function sandboxedSpeechAudio(o: {
         const p = Probe.safeParse(JSON.parse(r.stdout));
         if (!p.success) return undefined;
         const s = p.data.streams[0]!;
+        // MP3 only: its frame length is what the count is turned into seconds with.
+        if (s.codec_name !== "mp3") return undefined;
         return {
-          seconds: p.data.format.duration,
+          seconds: mp3PacketSeconds(s.nb_read_packets, s.sample_rate),
           codec: s.codec_name,
           sampleRate: s.sample_rate,
           channels: s.channels,
