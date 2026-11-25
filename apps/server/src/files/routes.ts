@@ -37,12 +37,58 @@ export const CONVERSATION_FILES_KIND = "conversation-files";
 export const FILE_CODES = ["file_ok", "file_aborted", "invalid_request", ...FILE_ERRORS] as const;
 
 /**
- * Kinds a browser may show in the page (`?inline=1`): raster images only. Everything else — PDF, office files,
- * text — is always a download; active content (SVG, HTML, XML) is not even accepted (FILE_KINDS).
+ * Kinds a browser may show in the page (`?inline=1`): raster images (PNG, JPG, WebP) and audio (M4A, MP3, WAV —
+ * the chat's `<audio>` player, #238). Everything else — PDF, office files, text, video — is always a download;
+ * active content (SVG, HTML, XML) is not even accepted (FILE_KINDS).
  */
-export const INLINE_KINDS: ReadonlySet<FileKind> = new Set(["png", "jpg"]);
-/** CSP of every served original: nothing in it may run or load anything, and it gets an opaque origin. */
-export const FILE_CSP = "sandbox; default-src 'none'; img-src 'self'; style-src 'unsafe-inline'";
+export const INLINE_KINDS: ReadonlySet<FileKind> = new Set(["png", "jpg", "webp", "m4a", "mp3", "wav"]);
+/**
+ * CSP of every served original: nothing in it may run or load anything, and it gets an opaque origin. An image or
+ * an audio file opened on its own is drawn by the browser's own viewer, which loads that one file (`img-src`,
+ * `media-src` 'self'); nothing else.
+ */
+export const FILE_CSP =
+  "sandbox; default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'";
+
+/**
+ * A single `Range: bytes=…` of a file of `size` bytes: `{start, end}` (inclusive), "unsatisfiable" (416), or
+ * undefined (no header, several ranges, or one that does not parse — then the whole file is sent).
+ */
+export function byteRange(
+  header: string | undefined,
+  size: number,
+): { start: number; end: number } | "unsatisfiable" | undefined {
+  if (typeof header !== "string") return undefined;
+  // The unit is case-insensitive (RFC 9110 §14.1); numbers may have leading zeros and any length.
+  const m = /^bytes=(\d*)-(\d*)$/i.exec(header.trim());
+  if (!m || (!m[1] && !m[2])) return undefined;
+  if (!m[1]) {
+    // A suffix: the last N bytes (more than the file: all of it).
+    const n = bounded(m[2]!, size);
+    if (n === 0 || size === 0) return "unsatisfiable";
+    return { start: Math.max(0, size - n), end: size - 1 };
+  }
+  const start = bounded(m[1], size);
+  const end = m[2] ? bounded(m[2], size) : size - 1;
+  if (m[2] && !lessOrEqual(m[1], m[2])) return undefined;
+  if (start >= size) return "unsatisfiable";
+  return { start, end: Math.min(end, size - 1) };
+}
+
+/** A decimal string as a number, or `size` when it is larger than `size` (never an unsafe integer). */
+function bounded(digits: string, size: number): number {
+  const d = digits.replace(/^0+(?=\d)/, "");
+  if (d.length > String(size).length) return size;
+  const n = Number(d);
+  return n > size ? size : n;
+}
+
+/** Whether decimal `a` ≤ decimal `b`, compared as strings (no overflow). */
+function lessOrEqual(a: string, b: string): boolean {
+  const x = a.replace(/^0+(?=\d)/, "");
+  const y = b.replace(/^0+(?=\d)/, "");
+  return x.length !== y.length ? x.length < y.length : x <= y;
+}
 
 const ERROR_STATUS: Record<FileError | "invalid_request", number> = {
   file_too_large: 413,
@@ -313,12 +359,29 @@ export function registerFileRoutes(
       const inline = req.query.inline === "1" && INLINE_KINDS.has(f.kind);
       const { base, ext } = nameParts(toUploadedFile(f).name);
       const disposition = attachment(base, ext || f.kind);
-      return reply
+      reply
         .headers(RAW_HEADERS)
         .header("Content-Security-Policy", FILE_CSP)
         .header("Content-Disposition", inline ? disposition.replace(/^attachment/, "inline") : disposition)
+        .header("Accept-Ranges", "bytes")
+        .type(f.mediaType);
+      // One byte range (#238: the chat's audio player seeks with it; iOS needs it to play) — after every check
+      // above. Several ranges, or a header that does not parse, get the whole file (RFC 9110 lets a server ignore it).
+      // `If-Range` asks for the range only if the file is unchanged — this route gives no validator (no ETag or
+      // Last-Modified), so a conditional range always gets the whole file (RFC 9110 §13.1.5).
+      const range = req.headers["if-range"] === undefined ? byteRange(req.headers.range, f.bytes) : undefined;
+      if (range === "unsatisfiable") {
+        fs.closeSync(fd);
+        return reply.code(416).header("Content-Range", `bytes */${f.bytes}`).send();
+      }
+      if (range)
+        return reply
+          .code(206)
+          .header("Content-Range", `bytes ${range.start}-${range.end}/${f.bytes}`)
+          .header("Content-Length", String(range.end - range.start + 1))
+          .send(fs.createReadStream("", { fd, autoClose: true, start: range.start, end: range.end }));
+      return reply
         .header("Content-Length", String(f.bytes))
-        .type(f.mediaType)
         .send(fs.createReadStream("", { fd, autoClose: true }));
     },
   );

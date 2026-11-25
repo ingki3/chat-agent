@@ -6,6 +6,7 @@ import {
   isCategory,
   isAudioCode,
   isYoutubeCode,
+  isMediaToolCode,
   isErrorCode,
   isHttpStatus,
   isId,
@@ -82,7 +83,8 @@ export class ErrorLog {
                 isFinanceCode(c) ||
                 isPythonCode(c) ||
                 isAudioCode(c) ||
-                isYoutubeCode(c),
+                isYoutubeCode(c) ||
+                isMediaToolCode(c),
               e.code,
             ) ?? "unknown",
           category: keep(isCategory, e.category) ?? "app",

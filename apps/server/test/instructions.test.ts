@@ -9,6 +9,7 @@ import { createTestDb } from "../src/db/client.js";
 import { runs as runsTable } from "../src/db/schema.js";
 import {
   assembleInstructions,
+  SPEECH_OFF_RULE,
   defaultTemplates,
   INSTRUCTIONS_DIR,
   isFinanceTool,
@@ -192,6 +193,21 @@ describe("assembly", () => {
           expect(r.text.includes(FINANCE_HEADING)).toBe(kind === "finance");
           expect(r.text.includes(RESEARCH_HEADING)).toBe(mode === "research");
         });
+
+  it("#238: without speech_generate the run is told not to make speech another way; with it, not", () => {
+    const off = assembleInstructions({ user: users.adult, mode: "normal", tools: ["echo_time"], now: NOW });
+    expect(off.text).toContain(SPEECH_OFF_RULE);
+    expect(off.text).toMatch(/speechSynthesis/);
+    expect(off.text).toMatch(/관리자 → 미디어 생성/);
+    const on = assembleInstructions({
+      user: users.adult,
+      mode: "normal",
+      tools: ["echo_time", "speech_generate"],
+      now: NOW,
+    });
+    expect(on.text).not.toContain("## 음성 생성");
+    expect(on.text).not.toMatch(/speechSynthesis/);
+  });
 
   it("is deterministic and the hash follows the text", () => {
     const a = assembleInstructions({ user: users.adult, mode: "normal", tools: [], now: NOW });

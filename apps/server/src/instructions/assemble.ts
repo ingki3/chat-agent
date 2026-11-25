@@ -107,6 +107,18 @@ export function seoulDate(now: Date): string {
  * followed by today's date. With 내 지침 (#144) the admin's AGENT.md parts go around the youth section and the user's
  * own material box (SOUL, USER, MEMORY) last. Nothing else about the user (name, email) goes in.
  */
+/**
+ * When the run has no `speech_generate` (#238: the speech kind off, no model or key, or a scheduled run), the model
+ * must not make speech some other way — production saw an HTML artifact reading a script aloud with the browser's
+ * `speechSynthesis`. A fixed rule (not a template: it follows the tool list), scoped to speech only.
+ */
+export const SPEECH_OFF_RULE = [
+  "## 음성 생성",
+  "- 이번 실행에는 음성 생성 도구(speech_generate)가 없다. 사용자가 음성·낭독·TTS를 요청해도 음성을 만들지 않는다. 브라우저 speechSynthesis·Web Speech API(SpeechSynthesisUtterance), OS의 TTS 명령, 이것들을 쓰는 아티팩트(HTML 등)로 대신하지 않는다.",
+  "- 대신 음성 생성 기능이 꺼져 있다고 짧게 알린다(관리자가 관리자 → 미디어 생성에서 켤 수 있다). 원하면 읽을 글은 텍스트로 준다. 음성과 관계없는 아티팩트는 그대로 만든다.",
+].join("\n");
+export const SPEECH_TOOL = "speech_generate";
+
 export function assembleInstructions(input: {
   user: InstructionUser;
   mode: InstructionMode;
@@ -131,6 +143,7 @@ export function assembleInstructions(input: {
     body?.trim() ? [`## ${title}\n${body.trim()}`] : [];
   const text = [
     ...family.map((s) => s.body),
+    ...(input.tools.includes(SPEECH_TOOL) ? [] : [SPEECH_OFF_RULE]),
     ...admin("가족 공통 운영 규칙 (AGENT.md, 관리자)", input.docs?.agentCommon),
     ...after.map((s) => s.body),
     ...admin("이 계정의 운영 규칙 (AGENT.md, 관리자)", input.docs?.agentAccount),

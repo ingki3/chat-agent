@@ -166,6 +166,26 @@ td.fv-cell-focus {
   gap: 4px;
   align-items: center;
 }
+/* A reply's generated image or audio (#238): shown in place, the download chip under it. */
+.fileref-media {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 8px 0;
+  max-width: 100%;
+}
+.fileref-image {
+  display: block;
+  max-width: min(100%, 480px);
+  max-height: 480px;
+  height: auto;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+}
+.fileref-audio {
+  width: min(100%, 360px);
+}
 /* What happened to the locator stays in sight while reading. */
 .file-view > [data-testid="file-view-status"] {
   position: sticky;

@@ -67,6 +67,8 @@ import type { AudioTranscriber } from "../audio/service.js";
 import { YOUTUBE_AUDIO_TOOL, YOUTUBE_TOOLS, type YoutubeToolInfo } from "@agentlee/mcp-tools/youtube";
 import { YOUTUBE_SKILL } from "@agentlee/shared";
 import type { YoutubeAudioFetcher } from "../youtube/service.js";
+import { MEDIA_TOOLS, type MediaToolInfo } from "@agentlee/mcp-tools/media";
+import type { MediaGenerator } from "../media/generate.js";
 import {
   FILE_CITE_TOOL,
   FILE_LIST_TOOL,
@@ -654,6 +656,12 @@ export type McpServiceOptions = {
   /** `youtube_audio_fetch` (#191). Without it the tool is not offered. Per user: the `youtube-audio-download` skill. */
   youtube?: YoutubeAudioFetcher;
   /**
+   * `image_generate` / `speech_generate` (#238 stage 2). Without it they are not offered. Offered per kind while the
+   * admin has it on with a model and a key is there — to every active account (youth accounts too: their requests
+   * ask for the strictest moderation), never in a run with a skill scope (a scheduled run, #56: nobody asked there).
+   */
+  media?: MediaGenerator;
+  /**
    * File tools (#48): the run's conversation's uploads, read through their extraction. `citations` adds
    * `file_cite`. Without it the file tools are not offered.
    */
@@ -754,6 +762,8 @@ export class McpService {
   private readonly audioTools: readonly AudioToolInfo[];
   /** `youtube_audio_fetch` (#191), when configured: offered to a user who may use `youtube-audio-download`. */
   private readonly youtubeTools: readonly YoutubeToolInfo[];
+  /** `image_generate` / `speech_generate` (#238), when configured. */
+  private readonly mediaTools: readonly MediaToolInfo[];
 
   constructor(
     private readonly tokens: McpTokens,
@@ -802,6 +812,7 @@ export class McpService {
     this.pythonAvailable = () => this.opts.scratchpad?.state() === "available";
     this.audioTools = opts.audio ? AUDIO_TOOLS : [];
     this.youtubeTools = opts.youtube ? YOUTUBE_TOOLS : [];
+    this.mediaTools = opts.media ? MEDIA_TOOLS : [];
     this.composedTools = this.finance && opts.artifacts ? [FINANCE_CHART_TOOL] : [];
     // Our tool names are fixed in code: they may be logged (#46).
     registerToolNames(this.toolNames());
@@ -892,6 +903,7 @@ export class McpService {
         ...this.pythonTools,
         ...this.audioTools,
         ...this.youtubeTools,
+        ...this.mediaTools,
         ...this.financeTools,
         ...this.composedTools,
       ],
@@ -993,9 +1005,23 @@ export class McpService {
       ...(this.opts.youtube?.state() === "available"
         ? this.youtubeTools.filter((t) => this.mayUse(s, t.skill))
         : []),
+      ...this.mediaTools.filter((t) => this.mayGenerate(s, t)),
       ...this.financeTools.filter((t) => this.mayUse(s, t.skill)),
       ...this.composedTools.filter((t) => this.mayUseAny(s, t.skills)),
     ];
+  }
+
+  /**
+   * Whether this run may use a media tool now (#238): an active user, no skill scope (a scheduled run), and the kind
+   * on with a model and a key. Checked for the tool list and again at every call.
+   */
+  private mayGenerate(scope: Pick<ToolScope, "userId" | "skills">, tool: MediaToolInfo): boolean {
+    return (
+      !!this.opts.media &&
+      !scope.skills &&
+      !!this.users.byId(scope.userId)?.active &&
+      this.opts.media.offered(tool.kind)
+    );
   }
 
   /** Whether this user may use at least one of these skills now (`allows`). */
@@ -1112,6 +1138,7 @@ export class McpService {
         ...this.pythonTools,
         ...this.audioTools,
         ...this.youtubeTools,
+        ...this.mediaTools,
         ...this.financeTools,
         ...this.composedTools,
       ],
@@ -1313,6 +1340,34 @@ export class McpService {
             durationMs: now() - t0,
             // A fixed code only: never the address, the video id, the title or the file.
             youtubeCode: r.ok ? "youtube_ok" : r.code,
+          });
+          if (!r.ok)
+            this.opts.errors?.record({
+              source: "tool",
+              code: r.code,
+              category: "tool",
+              tool: name,
+              userId: scope.userId,
+              conversationId: scope.conversationId,
+              runId: scope.runId,
+            });
+          return shown;
+        }
+        const mediaTool = this.mediaTools.find((t) => t.name === name);
+        if (mediaTool) {
+          const r = await this.callMediaTool(mediaTool, input, scope);
+          // The guard's refusal is told to the model as an ordinary failure; the log and the error list keep why.
+          const shown: SkillResult =
+            !r.ok && r.code === "media_secret_blocked" ? { ok: false, code: "media_failed" } : r;
+          logEvent(this.opts.log, r.ok ? "info" : "warn", "media.finished", {
+            userId: scope.userId,
+            conversationId: scope.conversationId,
+            runId: scope.runId,
+            tool: name,
+            status: r.ok ? "ok" : "error",
+            durationMs: now() - t0,
+            // A fixed code only: never the prompt, the text, the voice or the file.
+            mediaCode: r.ok ? "media_ok" : r.code,
           });
           if (!r.ok)
             this.opts.errors?.record({
@@ -1539,6 +1594,23 @@ export class McpService {
     return yt.run(scope, input, {
       alive: () => this.tokens.hasRun(scope.runId) && this.mayUse(scope, YOUTUBE_SKILL),
     });
+  }
+
+  /**
+   * `image_generate` / `speech_generate` (#238): an active user and no skill scope (checked again here), then the
+   * generator — which checks again that the kind is on with a model and a key (the admin may have switched it off
+   * since the tool list). While it runs: the run's token still alive.
+   */
+  private async callMediaTool(
+    tool: MediaToolInfo,
+    input: Record<string, unknown>,
+    scope: ToolScope,
+  ): Promise<SkillResult> {
+    const media = this.opts.media;
+    if (!media || !this.users.byId(scope.userId)?.active || scope.skills)
+      return { ok: false, code: "media_not_allowed" };
+    // Switched off or without a key since the tool list: the generator answers media_disabled / media_no_key.
+    return media.run(tool.kind, scope, input, { alive: () => this.tokens.hasRun(scope.runId) });
   }
 
   /**

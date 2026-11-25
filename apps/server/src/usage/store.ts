@@ -1,4 +1,4 @@
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import type { UsagePurpose } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { connections, usageRecords } from "../db/schema.js";
@@ -32,6 +32,8 @@ export type UsageRow = typeof usageRecords.$inferSelect;
 
 /** The `runtime` of a media row (#238): the generation ran at OpenRouter, not in a runtime. */
 export const MEDIA_RUNTIME = "openrouter";
+/** One media generation's usage row key: `<runId>#media:<callId>`. */
+export const mediaRunKey = (runId: string, callId: string) => `${runId}#media:${callId}`;
 
 /** A token count as stored: a non-negative integer, or NULL when the runtime did not report it. */
 const tokens = (v: number | undefined): number | null =>
@@ -153,7 +155,7 @@ export class UsageStore {
       .values({
         userId: m.userId,
         conversationId: m.conversationId,
-        runId: `${m.runId}#media:${m.callId}`,
+        runId: mediaRunKey(m.runId, m.callId),
         attempt: 1,
         runtime: MEDIA_RUNTIME,
         model: m.model,
@@ -168,6 +170,7 @@ export class UsageStore {
         cacheReadTokens: null,
         cacheWriteTokens: null,
         costUsd: usd,
+        mediaSettlement: usd === null ? "unconfirmed" : "settled",
         requestCount: 1,
         updatedAt: at,
       })
@@ -175,10 +178,216 @@ export class UsageStore {
         target: [usageRecords.runId, usageRecords.attempt],
         // A re-report without a cost keeps the cost already known; a cost (a first one, or a correction — $0
         // included) replaces it.
-        set: usd === null ? { updatedAt: at } : { costUsd: usd, pricedCostMicros: micros, updatedAt: at },
+        set:
+          usd === null
+            ? { updatedAt: at }
+            : { costUsd: usd, pricedCostMicros: micros, mediaSettlement: "settled", updatedAt: at },
       })
       .run();
     this.onRecorded?.(at);
+  }
+
+  /**
+   * 미디어 생성 (#238): a paid generation's row written **before** its request, holding the call's reserved upper
+   * bound (`estimated_cost_micros`), state `reserved` and no cost yet. The daily media budget counts the bound until
+   * a cost is settled — also when none ever comes. Throws when the row cannot be written (then nothing is sent).
+   * Synchronous: the caller checks the budget and writes this in one go, so two calls cannot both take the last of
+   * the budget.
+   */
+  reserveMedia(m: {
+    userId: string;
+    conversationId: string | null;
+    runId: string;
+    callId: string;
+    model: string;
+    estimateUsd: number;
+  }): void {
+    const at = this.now();
+    this.db
+      .insert(usageRecords)
+      .values({
+        userId: m.userId,
+        conversationId: m.conversationId,
+        runId: mediaRunKey(m.runId, m.callId),
+        attempt: 1,
+        runtime: MEDIA_RUNTIME,
+        model: m.model,
+        connectionId: null,
+        purpose: "media",
+        createdAt: at,
+        authType: "api_key",
+        priceVersion: null,
+        pricedCostMicros: null,
+        estimatedCostMicros: Math.ceil(m.estimateUsd * 1_000_000),
+        mediaSettlement: "reserved",
+        mediaSettleTries: 0,
+        inputTokens: null,
+        outputTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        costUsd: null,
+        requestCount: 1,
+        updatedAt: at,
+      })
+      .run();
+  }
+
+  /**
+   * The reported cost of a reserved generation (it replaces the bound in the budget). The daily cost check runs for
+   * the day the row belongs to (its `created_at`), not the day the cost arrived — a call made before midnight and
+   * settled after it counts for the day it was made.
+   */
+  settleMedia(runKey: string, costUsd: number): void {
+    const usd = cost(costUsd);
+    if (usd === null) return;
+    const row = this.db
+      .update(usageRecords)
+      .set({
+        costUsd: usd,
+        pricedCostMicros: Math.round(usd * 1_000_000),
+        mediaSettlement: "settled",
+        updatedAt: this.now(),
+      })
+      .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
+      .returning({ createdAt: usageRecords.createdAt })
+      .get();
+    if (row) this.onRecorded?.(row.createdAt);
+  }
+
+  /**
+   * A generation answered without a cost: `awaiting_cost` with OpenRouter's generation id (looked up again later by
+   * the settler), or `unconfirmed` when there is no id to look up. The bound keeps holding the budget either way.
+   */
+  answeredMedia(runKey: string, generationId: string | null): void {
+    this.db
+      .update(usageRecords)
+      .set({
+        mediaGenerationId: generationId,
+        mediaSettlement: generationId ? "awaiting_cost" : "unconfirmed",
+        updatedAt: this.now(),
+      })
+      .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
+      .run();
+  }
+
+  /** A generation whose cost can never be confirmed (an unknown outcome, or the lookups gave up). */
+  unconfirmMedia(runKey: string): void {
+    this.db
+      .update(usageRecords)
+      .set({ mediaSettlement: "unconfirmed", updatedAt: this.now() })
+      .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
+      .run();
+  }
+
+  /** One more cost lookup that found nothing (the settler's backoff counts these). */
+  triedMedia(runKey: string, tries: number): void {
+    this.db
+      .update(usageRecords)
+      .set({ mediaSettleTries: tries, updatedAt: this.now() })
+      .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
+      .run();
+  }
+
+  /**
+   * The generation id of a reserved generation, written as soon as the 2xx headers came (before its body is read
+   * or its cost looked up): a process that stops right then leaves a row the next one can still settle.
+   */
+  generationMedia(runKey: string, generationId: string): void {
+    this.db
+      .update(usageRecords)
+      .set({ mediaGenerationId: generationId, updatedAt: this.now() })
+      .where(
+        and(
+          eq(usageRecords.runId, runKey),
+          eq(usageRecords.purpose, "media"),
+          eq(usageRecords.mediaSettlement, "reserved"),
+        ),
+      )
+      .run();
+  }
+
+  /**
+   * At start, before the server takes any request (#238 review r4): **every** `reserved` row is a previous
+   * process's — one server holds the data folder's lock (storage/data-lock.ts), and no media call of this process
+   * has started yet — so no clock is compared. With a generation id it waits for its cost (`awaiting_cost`), without
+   * one it is `unconfirmed` (its reserved amount stays). One transaction: both moves, or none. Returns the count.
+   */
+  recoverReservedMedia(o: { noWait?: boolean } = {}): number {
+    const at = this.now();
+    const reserved = and(eq(usageRecords.purpose, "media"), eq(usageRecords.mediaSettlement, "reserved"));
+    const sqlite = this.db.$client;
+    const move = sqlite.transaction(() => {
+      const a = this.db
+        .update(usageRecords)
+        .set({ mediaSettlement: "awaiting_cost", updatedAt: at })
+        .where(and(reserved, isNotNull(usageRecords.mediaGenerationId)))
+        .run().changes;
+      const b = this.db
+        .update(usageRecords)
+        .set({ mediaSettlement: "unconfirmed", updatedAt: at })
+        .where(and(reserved, isNull(usageRecords.mediaGenerationId)))
+        .run().changes;
+      return a + b;
+    });
+    // BEGIN IMMEDIATE: the write lock is taken first. `noWait` (a background retry, review r6): with the busy
+    // handler off for this one statement, a lock held elsewhere is SQLITE_BUSY at once — the event loop never
+    // waits for it — and the next timer tick tries again.
+    if (!o.noWait) return move.immediate();
+    const timeout = Number(sqlite.pragma("busy_timeout", { simple: true })) || 0;
+    sqlite.pragma("busy_timeout = 0");
+    try {
+      return move.immediate();
+    } finally {
+      sqlite.pragma(`busy_timeout = ${timeout}`);
+    }
+  }
+
+  /**
+   * Generations waiting for their cost (`awaiting_cost`) that are due at `at`: their backoff since the last try
+   * (1 min · 2^tries, at most 6 h) has passed, or they are to be given up (no id, too many tries, too old) — the due
+   * ones are chosen first, then at most `limit`, oldest try first. `giveUpOnly`: only the rows to be given up (a
+   * cycle without a key can do nothing else).
+   */
+  dueMedia(
+    at: number,
+    o: { maxTries: number; maxAgeMs: number; limit: number; giveUpOnly?: boolean },
+  ): { runKey: string; generationId: string | null; tries: number; createdAt: number; updatedAt: number }[] {
+    const tries = sql`coalesce(${usageRecords.mediaSettleTries}, 0)`;
+    return this.db
+      .select({
+        runKey: usageRecords.runId,
+        generationId: usageRecords.mediaGenerationId,
+        tries: usageRecords.mediaSettleTries,
+        createdAt: usageRecords.createdAt,
+        updatedAt: usageRecords.updatedAt,
+      })
+      .from(usageRecords)
+      .where(
+        and(
+          eq(usageRecords.purpose, "media"),
+          eq(usageRecords.mediaSettlement, "awaiting_cost"),
+          or(
+            isNull(usageRecords.mediaGenerationId),
+            sql`${tries} >= ${o.maxTries}`,
+            lt(usageRecords.createdAt, at - o.maxAgeMs),
+            o.giveUpOnly
+              ? undefined
+              : sql`${usageRecords.updatedAt} + min(21600000, 60000 * (1 << min(${tries}, 20))) <= ${at}`,
+          ),
+        ),
+      )
+      .orderBy(asc(usageRecords.updatedAt))
+      .limit(o.limit)
+      .all()
+      .map((r) => ({ ...r, tries: r.tries ?? 0 }));
+  }
+
+  /** A reserved generation OpenRouter refused (no charge): its row goes. */
+  releaseMedia(runKey: string): void {
+    this.db
+      .delete(usageRecords)
+      .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
+      .run();
   }
 
   /** A run's rows by attempt (tests, and the usage screen #32 later). */

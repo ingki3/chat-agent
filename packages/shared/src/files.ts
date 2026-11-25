@@ -15,7 +15,7 @@ export const FILE_LIMITS = {
 } as const;
 
 /**
- * The supported formats (FR-4.2): PDF, HWP/HWPX, DOCX, XLSX/CSV, PPTX, TXT/MD, PNG/JPG images and — for
+ * The supported formats (FR-4.2): PDF, HWP/HWPX, DOCX, XLSX/CSV, PPTX, TXT/MD, PNG/JPG/WebP images and — for
  * `audio_transcribe` (#173) — M4A/MP3/WAV audio and MP4 video (no text is extracted from those). Nothing else is
  * accepted — in particular no SVG, HTML or XML (active content), no archives and no executables. `exts` are the
  * extensions a name may end with; `mediaType` is what the server answers with (never the browser's guess).
@@ -44,6 +44,8 @@ export const FILE_KINDS = {
   md: { exts: ["md", "markdown"], mediaType: "text/markdown", label: "마크다운" },
   png: { exts: ["png"], mediaType: "image/png", label: "PNG 이미지" },
   jpg: { exts: ["jpg", "jpeg"], mediaType: "image/jpeg", label: "JPG 이미지" },
+  /** #238: what image models often return; a raster image like PNG/JPG. */
+  webp: { exts: ["webp"], mediaType: "image/webp", label: "WebP 이미지" },
   m4a: { exts: ["m4a"], mediaType: "audio/mp4", label: "M4A 음성" },
   mp3: { exts: ["mp3"], mediaType: "audio/mpeg", label: "MP3 음성" },
   wav: { exts: ["wav"], mediaType: "audio/wav", label: "WAV 음성" },

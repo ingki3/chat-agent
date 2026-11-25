@@ -347,6 +347,12 @@ describe("runs record usage (#44)", () => {
       "auth_type",
       "price_version",
       "priced_cost_micros",
+      // #238: a media generation's reserved cost bound (a number, no content).
+      "estimated_cost_micros",
+      // #238: OpenRouter's generation id (an id) and where the row's cost stands (a fixed state), tries (a number).
+      "media_generation_id",
+      "media_settlement",
+      "media_settle_tries",
     ]);
   });
 

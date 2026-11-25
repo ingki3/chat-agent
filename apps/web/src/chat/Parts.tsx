@@ -1,5 +1,5 @@
 import { Fragment, memo, useId, useMemo, useState } from "react";
-import { redactForDisplay, type CitationNotePart, type PublicPart } from "@agentlee/shared";
+import { fileKindOf, redactForDisplay, type CitationNotePart, type PublicPart } from "@agentlee/shared";
 import { Link } from "react-router";
 import { files } from "../api.js";
 import { useFileViewHref } from "../files/context.js";
@@ -238,7 +238,7 @@ const PartView = memo(function PartView({
     case "citation_ref":
       return <span className="chip small">{part.label ?? "출처"}</span>;
     case "file_ref":
-      return <FileRef part={part} />;
+      return <FileRef part={part} preview />;
     // A 깊이 조사 job (#211): its plan, progress and end.
     case "research":
       return <ResearchCard jobId={part.jobId} />;
@@ -251,8 +251,55 @@ const PartView = memo(function PartView({
  * A file of the conversation (#22, #49): a download link to the original, and — where the conversation is known —
  * "보기", the viewer of its extracted text (#24; a link: click or tap, nothing needs hover).
  */
-export function FileRef({ part }: { part: Extract<PublicPart, { type: "file_ref" }> }) {
+export function FileRef({
+  part,
+  preview = false,
+}: {
+  part: Extract<PublicPart, { type: "file_ref" }>;
+  /**
+   * A reply's file (#238): an image is shown in place, an audio file gets a player — both from the server's own
+   * `?inline=1` (it serves only raster images and audio inline; anything else stays a download).
+   */
+  preview?: boolean;
+}) {
   const view = useFileViewHref()(part.fileId);
+  const kind = preview ? fileKindOf(part.name ?? "") : undefined;
+  const media =
+    kind === "png" || kind === "jpg" || kind === "webp"
+      ? "image"
+      : kind === "mp3" || kind === "m4a" || kind === "wav"
+        ? "audio"
+        : undefined;
+  const chip = <FileChip part={part} view={view} />;
+  if (!media) return chip;
+  return (
+    <span className="fileref-media" data-testid="file-ref-media">
+      {media === "image" ? (
+        <a href={files.url(part.fileId, true)} target="_blank" rel="noopener noreferrer">
+          <img
+            className="fileref-image"
+            src={files.url(part.fileId, true)}
+            alt={part.name ?? "이미지"}
+            loading="lazy"
+            data-testid="file-ref-image"
+          />
+        </a>
+      ) : (
+        <audio
+          className="fileref-audio"
+          controls
+          preload="metadata"
+          src={files.url(part.fileId, true)}
+          aria-label={`${part.name ?? "음성"} 재생`}
+          data-testid="file-ref-audio"
+        />
+      )}
+      {chip}
+    </span>
+  );
+}
+
+function FileChip({ part, view }: { part: Extract<PublicPart, { type: "file_ref" }>; view: string | null }) {
   return (
     <span className="fileref-group">
       <a className="chip small fileref" href={files.url(part.fileId)} download data-testid="file-ref">

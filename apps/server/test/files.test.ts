@@ -245,6 +245,15 @@ const SAMPLES: Record<FileKind, { name: string; body: Buffer }> = {
   md: { name: "정리.md", body: Buffer.from("# 제목\n\n본문 <b>굵게</b>\n") },
   png: { name: "사진.png", body: PNG },
   jpg: { name: "사진.JPEG", body: JPG },
+  webp: {
+    name: "그림.webp",
+    body: Buffer.concat([
+      Buffer.from("RIFF"),
+      Buffer.from([16, 0, 0, 0]),
+      Buffer.from("WEBPVP8 "),
+      Buffer.alloc(8),
+    ]),
+  },
   m4a: { name: "회의.m4a", body: isoBmff("M4A ") },
   mp3: { name: "회의.mp3", body: MP3 },
   wav: { name: "회의.wav", body: WAV },
@@ -271,17 +280,19 @@ describe("supported formats (FR-4.2) and type detection — extension and conten
         "mp3",
         "wav",
         "mp4",
+        // #238: what image models often return.
+        "webp",
       ].sort(),
     );
-    for (const ext of ["svg", "html", "htm", "xml", "xhtml", "js", "exe", "zip", "gif", "doc", "webp", ""])
+    for (const ext of ["svg", "html", "htm", "xml", "xhtml", "js", "exe", "zip", "gif", "doc", ""])
       expect(fileKindOf(`a.${ext}`), ext).toBeUndefined();
     expect(fileKindOf("사진.JPG")).toBe("jpg");
     expect(fileKindOf("archive.tar.md")).toBe("md");
     expect(fileKindOf(".pdf")).toBeUndefined();
     expect(FILE_ACCEPT.split(",")).toContain(".hwpx");
     expect(FILE_ACCEPT).not.toMatch(/svg|html/);
-    // Only raster images may be shown inline.
-    expect([...INLINE_KINDS].sort()).toEqual(["jpg", "png"]);
+    // Only raster images and audio (the chat's player, #238) may be shown inline.
+    expect([...INLINE_KINDS].sort()).toEqual(["jpg", "m4a", "mp3", "png", "wav", "webp"]);
   });
 
   it("every sample is accepted as its own kind and refused as any other (a disguised extension)", () => {

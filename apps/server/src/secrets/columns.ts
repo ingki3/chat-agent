@@ -175,6 +175,9 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "usage_records.connection_id": ID,
   "usage_records.purpose": ENUM,
   "usage_records.auth_type": ENUM,
+  // #238: OpenRouter's generation id — checked `gen-[0-9A-Za-z-]` before it is stored (GENERATION_ID), never free text.
+  "usage_records.media_generation_id": { exempt: "OpenRouter's generation id (validated `gen-…` shape)" },
+  "usage_records.media_settlement": ENUM,
   "sources.id": ID,
   "sources.user_id": ID,
   "sources.conversation_id": ID,
