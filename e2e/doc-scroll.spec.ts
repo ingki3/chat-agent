@@ -198,6 +198,44 @@ for (const bodyOverflow of ["visible", "hidden"])
     expect(s.appTop).toBe(0);
   });
 
+test("printing: the guard, the fallback pin and the main column's scroller are screen only", async ({
+  page,
+  isMobile,
+}) => {
+  test.skip(isMobile, "one window size is enough");
+  await useAccount(page, SON);
+  await page.goto("/");
+  await expect(page.getByLabel("메시지 입력")).toBeVisible();
+  // The fallback (no `clip`) applied as such a browser would: the stylesheet's own `not (overflow: clip)` rules.
+  const rules = await page.evaluate(() => {
+    const fallback: string[] = [];
+    for (const sheet of document.styleSheets)
+      for (const rule of sheet.cssRules)
+        if (
+          rule instanceof CSSSupportsRule &&
+          rule.conditionText.replace(/\s+/g, "") === "not(overflow:clip)"
+        )
+          for (const inner of rule.cssRules) fallback.push(inner.cssText);
+    const style = document.createElement("style");
+    style.textContent = fallback.join("\n");
+    document.head.append(style);
+    return fallback.length;
+  });
+  expect(rules).toBeGreaterThan(0);
+  const layout = () =>
+    page.evaluate(() => ({
+      html: getComputedStyle(document.documentElement).overflowY,
+      body: getComputedStyle(document.body).overflowY,
+      root: getComputedStyle(document.getElementById("root")!).position,
+      main: getComputedStyle(document.querySelector(".main")!).overflowY,
+    }));
+  expect(await layout()).toEqual({ html: "hidden", body: "clip", root: "fixed", main: "auto" });
+  // Printed as before #247: a pinned shell would repeat on every page, a clipped body would cut the print short.
+  await page.emulateMedia({ media: "print" });
+  expect(await layout()).toEqual({ html: "visible", body: "visible", root: "static", main: "visible" });
+  await page.emulateMedia({ media: "screen" });
+});
+
 test("the schedule form's runtime chip: Esc after scrolling the form returns focus to the chip, in view", async ({
   page,
   isMobile,
