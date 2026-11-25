@@ -51,7 +51,7 @@ export function Shell({ user, onSignedOut }: { user: AuthUser; onSignedOut: (s: 
   useEffect(() => {
     if (drawer || !restoreFocus.current) return;
     restoreFocus.current = false;
-    trigger.current?.focus({ preventScroll: true });
+    trigger.current?.focus();
   }, [drawer]);
 
   useEffect(() => {

@@ -785,8 +785,7 @@ const UserMessage = memo(function UserMessage({
     try {
       await onEdit(m.id, t);
       setEditing(null);
-      // The composer is always in view: focusing it never scrolls anything (#247).
-      document.getElementById(COMPOSER_INPUT)?.focus({ preventScroll: true });
+      document.getElementById(COMPOSER_INPUT)?.focus();
     } catch (e) {
       setError(errorText(e));
     } finally {

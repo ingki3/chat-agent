@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { SON, newConversation, sendMessage, useAccount } from "./helpers.js";
+import { SON, newConversation, newMember, sendMessage, signIn, useAccount } from "./helpers.js";
 
 /**
  * The document never scrolls under the app shell (#247): the whole app (sidebar and main column) once showed shifted
@@ -157,4 +157,84 @@ test("the sign-in screen is an ordinary page: it still scrolls in a tiny window"
   expect(s.shell).toBe(false);
   expect(s.scrollY).toBeGreaterThan(0);
   await ctx.close();
+});
+
+for (const bodyOverflow of ["visible", "hidden"])
+  test(`without \`overflow: clip\` (older browsers, body ${bodyOverflow}): the page may scroll, the app stays pinned`, async ({
+    page,
+    isMobile,
+  }) => {
+    test.skip(isMobile, "one window size is enough");
+    await page.setViewportSize({ width: 1280, height: 300 });
+    await useAccount(page, SON);
+    await page.goto("/");
+    await expect(page.getByLabel("메시지 입력")).toBeVisible();
+    await addStray(page);
+    const s = await page.evaluate((overflow) => {
+      // What such a browser applies: body without `clip` (`visible` — the declaration is unknown there; `hidden` as
+      // a fallback would give) and the stylesheet's own `not (overflow: clip)` rules.
+      const fallback: string[] = [];
+      for (const sheet of document.styleSheets)
+        for (const rule of sheet.cssRules)
+          if (
+            rule instanceof CSSSupportsRule &&
+            rule.conditionText.replace(/\s+/g, "") === "not(overflow:clip)"
+          )
+            for (const inner of rule.cssRules) fallback.push(inner.cssText);
+      const style = document.createElement("style");
+      style.textContent = `html.app-shell body { overflow: ${overflow} !important; }\n${fallback.join("\n")}`;
+      document.head.append(style);
+      document.querySelector("[data-testid=stray]")!.scrollIntoView({ block: "end" });
+      window.scrollTo(0, 10_000);
+      return {
+        rules: fallback.length,
+        scrolled: document.body.scrollTop + document.scrollingElement!.scrollTop,
+        appTop: Math.round(document.querySelector(".app")!.getBoundingClientRect().top),
+      };
+    }, bodyOverflow);
+    expect(s.rules).toBeGreaterThan(0);
+    // The page did scroll (without `clip` nothing stops a script) — the pinned app did not move with it.
+    expect(s.scrolled).toBeGreaterThan(0);
+    expect(s.appTop).toBe(0);
+  });
+
+test("the schedule form's runtime chip: Esc after scrolling the form returns focus to the chip, in view", async ({
+  page,
+  isMobile,
+}) => {
+  await page.setViewportSize({ width: isMobile ? 412 : 1280, height: 380 });
+  await useAccount(page, SON);
+  await page.goto("/schedules/new");
+  const chip = page.locator("#runtime-chip");
+  await chip.click();
+  await expect(chip).toHaveAttribute("aria-expanded", "true");
+  const form = page.locator(".page");
+  await form.evaluate((el) => el.scrollTo({ top: 0 }));
+  await expect(chip).not.toBeInViewport();
+  await page.keyboard.press("Escape");
+  await expect(chip).toHaveAttribute("aria-expanded", "false");
+  await expect(chip).toBeFocused();
+  await expect(chip).toBeInViewport();
+  await expectDocumentFixed(page, "after Esc");
+});
+
+test("signing out in the same tab: the class goes, the sign-in screen scrolls as a page again", async ({
+  page,
+  browser,
+  baseURL,
+  isMobile,
+}) => {
+  test.skip(isMobile, "one window size is enough");
+  // An account of its own: signing out ends its session, which no other test uses.
+  const who = await newMember(browser, baseURL!, "docscroll");
+  await signIn(page, baseURL!, who);
+  await page.setViewportSize({ width: 1280, height: 240 });
+  await page.goto("/settings");
+  await expect(page.locator("html")).toHaveClass(/\bapp-shell\b/);
+  await page.getByRole("button", { name: "로그아웃" }).click();
+  await expect(page.getByRole("button", { name: /로그인/ })).toBeAttached();
+  await expect(page.locator("html")).not.toHaveClass(/\bapp-shell\b/);
+  await page.setViewportSize({ width: 360, height: 240 });
+  const scrollY = await page.evaluate(() => (window.scrollTo(0, 10_000), window.scrollY));
+  expect(scrollY).toBeGreaterThan(0);
 });
