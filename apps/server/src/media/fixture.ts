@@ -9,6 +9,7 @@ import {
   OPENROUTER_SPEECH_URL,
   SPEECH_PRICING_URL,
 } from "./openrouter.js";
+import { walkMp3 } from "./mp3.js";
 import { makeSpeechWorkdir, type Measured, type SpeechAudio } from "./speech-audio.js";
 
 /**
@@ -222,90 +223,41 @@ export function fixtureOpenRouterFetch(): typeof fetch {
   }) as typeof fetch;
 }
 
-/** MPEG Layer III bit rates (kbit/s) by index — MPEG-1, then MPEG-2/2.5 — and sample rates by version. */
-const MP3_KBPS_V1 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
-const MP3_KBPS_V2 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
-const MP3_RATES: Record<number, number[]> = {
-  3: [44100, 48000, 32000],
-  2: [22050, 24000, 16000],
-  0: [11025, 12000, 8000],
-};
-
-/**
- * The audio frames of an MPEG Layer III file (after an ID3v2 tag), **counted** one by one from their own headers
- * (each frame's own bit rate — a VBR file is walked frame by frame, nothing is estimated from the first ones); a
- * leading Xing/Info frame (a length header, no audio) is not counted. Where each counted frame starts and ends, the
- * samples per frame, the rate and channels; undefined when there is none. The scripted ffprobe/ffmpeg's ground.
- */
-export function mp3Frames(b: Buffer):
-  | {
-      frames: { start: number; end: number }[];
-      /** Each frame at its own rate (the rate may change inside a file): what decoding it would play. */
-      seconds: number;
-      samplesPerFrame: number;
-      sampleRate: number;
-      channels: number;
-    }
-  | undefined {
-  let p = 0;
-  if (b.length >= 10 && b.toString("latin1", 0, 3) === "ID3")
-    p = 10 + (((b[6]! & 0x7f) << 21) | ((b[7]! & 0x7f) << 14) | ((b[8]! & 0x7f) << 7) | (b[9]! & 0x7f));
-  const frames: { start: number; end: number }[] = [];
-  let sampleRate = 0;
-  let channels = 0;
-  let samplesPerFrame = 1152;
-  let seconds = 0;
-  while (p + 4 <= b.length) {
-    if (b[p] !== 0xff || (b[p + 1]! & 0xe0) !== 0xe0) break;
-    const version = (b[p + 1]! >> 3) & 3;
-    if (version === 1 || ((b[p + 1]! >> 1) & 3) !== 1) break;
-    const bi = (b[p + 2]! >> 4) & 15;
-    const si = (b[p + 2]! >> 2) & 3;
-    if (bi === 0 || bi === 15 || si === 3) break;
-    sampleRate = MP3_RATES[version]![si]!;
-    channels = ((b[p + 3]! >> 6) & 3) === 3 ? 1 : 2;
-    const v1 = version === 3;
-    samplesPerFrame = v1 ? 1152 : 576;
-    const kbps = (v1 ? MP3_KBPS_V1 : MP3_KBPS_V2)[bi]!;
-    const len = Math.floor(((v1 ? 144 : 72) * kbps * 1000) / sampleRate) + ((b[p + 2]! >> 1) & 1);
-    if (p + len > b.length) break;
-    const head = b.toString("latin1", p, Math.min(p + len, p + 64));
-    if (!(frames.length === 0 && /Xing|Info/.test(head))) {
-      frames.push({ start: p, end: p + len });
-      seconds += samplesPerFrame / sampleRate;
-    }
-    p += len;
-  }
-  return frames.length ? { frames, seconds, samplesPerFrame, sampleRate, channels } : undefined;
-}
-
 /** In a scripted answer: makes the scripted decoder fail on it (a corrupt MP3, as `-xerror` would stop on). */
 export const FIXTURE_CORRUPT_MARK = "FIXTURE-CORRUPT";
 
 /**
  * A scripted ffmpeg (measure, join) for the FAKE_RUNTIME (e2e) server and tests, with the real one's semantics
- * (#251 re-plan 2): the length is what decoding would play — every frame walked at its own rate — and a file that
- * would not decode cleanly is `corrupt` (no MPEG frames, bytes after the last frame, or `FIXTURE_CORRUPT_MARK`).
- * The join is the pieces' frames one after another. No program runs. Working folders as the real one's.
+ * (#251 re-plans 2–3): the same form check over the whole file (`walkMp3` — the real code), then the length as what
+ * decoding would play (the audio frames × samples per frame; the real decoder also takes the encoder's delay and
+ * padding off), `corrupt` for `FIXTURE_CORRUPT_MARK`, `too_long` over the cap. The join is the pieces' audio frames
+ * one after another. No program runs. Working folders as the real one's.
  */
 export function fixtureSpeechAudio(dataDir: string): SpeechAudio {
   let joins = 0;
   return {
     workdir: () => makeSpeechWorkdir(dataDir),
-    async measure(file): Promise<Measured> {
+    async measure(file, m): Promise<Measured> {
       const b = fs.readFileSync(file);
-      const f = mp3Frames(b);
-      if (!f || b.includes(FIXTURE_CORRUPT_MARK, 0, "latin1") || f.frames.at(-1)!.end !== b.length)
-        return { ok: false, corrupt: true };
-      return { ok: true, seconds: Math.floor(f.seconds * 1000) / 1000 };
+      const walk = walkMp3(b);
+      if (!walk.ok) return { ok: false, reason: walk.reason === "unsupported" ? "unsupported" : "corrupt" };
+      if (b.includes(FIXTURE_CORRUPT_MARK, 0, "latin1")) return { ok: false, reason: "corrupt" };
+      if (walk.samples > m.maxSeconds * walk.sampleRate) return { ok: false, reason: "too_long" };
+      return {
+        ok: true,
+        samples: walk.samples,
+        seconds: walk.samples / walk.sampleRate,
+        sampleRate: walk.sampleRate,
+        channels: walk.channels,
+      };
     },
     async join(job) {
       const parts: Buffer[] = [];
       for (const file of job.files) {
         const b = fs.readFileSync(file);
-        const f = mp3Frames(b);
-        if (!f) return undefined;
-        for (const fr of f.frames) parts.push(b.subarray(fr.start, fr.end));
+        const walk = walkMp3(b);
+        if (!walk.ok) return undefined;
+        for (const fr of walk.frames) if (!fr.info) parts.push(b.subarray(fr.start, fr.end));
       }
       const out = path.join(job.workdir, "out", `speech-${++joins}.mp3`);
       fs.writeFileSync(out, Buffer.concat(parts), { mode: 0o600 });

@@ -24,6 +24,11 @@ export const SPEECH_SPLIT = {
   /** Slow (sizing) and typical (checking) rates: Hangul·CJK syllables, digits, other characters per second. */
   slow: { syllables: 4.5, digits: 3, chars: 11, sentencePause: 0.4 },
   typical: { syllables: 6.5, digits: 4.5, chars: 15, sentencePause: 0.25 },
+  /**
+   * The longest a piece's decoded audio may be (#251 re-plan 3): an answer longer than this is abnormal (no file,
+   * no retry, its cost recorded) — it is not even decoded when its frames already say so.
+   */
+  pieceMaxSeconds: 600,
   /** Pieces of one call at most, as first split; more is `media_too_long` (nothing is sent). */
   maxPieces: 16,
   /**
@@ -43,6 +48,7 @@ export type SpeechSplitLimits = {
   typical: Rates;
   maxPieces: number;
   maxRequests: number;
+  pieceMaxSeconds: number;
 };
 type Rates = { syllables: number; digits: number; chars: number; sentencePause: number };
 
@@ -150,10 +156,15 @@ export function speechSeconds(text: string, rates: Rates): number {
     else chars++;
   }
   const ends = text.match(SENTENCE_END)?.length ?? 0;
-  return (
-    syllables / rates.syllables + digits / rates.digits + chars / rates.chars + ends * rates.sentencePause
-  );
+  // In whole microseconds (#251 r6: 52/6.5 + 39/4.5 + 50/15 adds up to 19.999999999999996): every comparison
+  // with a limit is then between whole microseconds.
+  const total =
+    syllables / rates.syllables + digits / rates.digits + chars / rates.chars + ends * rates.sentencePause;
+  return Math.round(total * 1_000_000) / 1_000_000;
 }
+
+/** Seconds as whole microseconds (the unit limits are compared in). */
+const micros = (seconds: number): number => Math.round(seconds * 1_000_000);
 
 /** A part of the source text: `[start, end)` in UTF-16 offsets. */
 export type Span = { start: number; end: number };
@@ -292,7 +303,8 @@ export function resplitSpeech(piece: string, limits: SpeechSplitLimits = SPEECH_
  */
 export function looksCut(piece: string, seconds: number, limits: SpeechSplitLimits = SPEECH_SPLIT): boolean {
   if (!Number.isFinite(seconds) || seconds <= 0) return true;
-  if (seconds >= limits.nearCutSeconds) return true;
-  const expected = speechSeconds(piece, limits.typical);
-  return expected >= limits.shortCheckMinSeconds && seconds < expected * limits.shortRatio;
+  const got = micros(seconds);
+  if (got >= micros(limits.nearCutSeconds)) return true;
+  const expected = micros(speechSeconds(piece, limits.typical));
+  return expected >= micros(limits.shortCheckMinSeconds) && got < Math.round(expected * limits.shortRatio);
 }

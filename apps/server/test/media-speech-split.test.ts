@@ -21,15 +21,16 @@ import {
   fixtureOpenRouterFetch,
   FIXTURE_CORRUPT_MARK,
   fixtureSpeechAudio,
-  mp3Frames,
   silentMp3,
 } from "../src/media/fixture.js";
-import { isMp3 } from "../src/media/generate.js";
+import { walkMp3 } from "../src/media/mp3.js";
 import { OPENROUTER_SPEECH_URL } from "../src/media/openrouter.js";
 import {
   joinOptions,
   makeSpeechWorkdir,
+  measureFailure,
   measureOptions,
+  progressMicros,
   removeSpeechWorkdir,
   sandboxedSpeechAudio,
   speechTools,
@@ -109,8 +110,10 @@ const durOf = (b: Buffer): number | undefined => {
   return m ? Number(m[1]) : undefined;
 };
 
-/** In a fake answer: the fake decoder fails on it (corrupt). */
+/** In a fake answer: the fake decoder fails on it (corrupt), finds another form, or cannot run. */
 const CORRUPT = "CORRUPT;";
+const UNSUPPORTED = "UNSUPPORTED;";
+const MEASURE_FAILED = "MEASURE-FAILED;";
 
 /**
  * A fake measure/join with the real one's semantics: the "decoded" length from the bytes, a decoding error for a
@@ -120,11 +123,17 @@ function fakeAudio(dataDir: () => string) {
   const joins: { names: string[]; bitrateK: number }[] = [];
   const audio: SpeechAudio = {
     workdir: () => makeSpeechWorkdir(dataDir()),
-    async measure(file) {
+    async measure(file, m) {
       const b = fs.readFileSync(file);
-      if (b.includes(CORRUPT, 0, "latin1")) return { ok: false, corrupt: true };
+      if (b.includes(CORRUPT, 0, "latin1")) return { ok: false, reason: "corrupt" };
+      if (b.includes(UNSUPPORTED, 0, "latin1")) return { ok: false, reason: "unsupported" };
+      if (b.includes(MEASURE_FAILED, 0, "latin1")) return { ok: false, reason: "failed" };
       const d = durOf(b);
-      return d === undefined ? { ok: false, corrupt: true } : { ok: true, seconds: d };
+      if (d === undefined) return { ok: false, reason: "corrupt" };
+      if (d > m.maxSeconds) return { ok: false, reason: "too_long" };
+      const rate = Number(/RATE=(\d+);/.exec(b.toString("latin1"))?.[1] ?? 44100);
+      const samples = Math.round(d * rate);
+      return { ok: true, samples, seconds: samples / rate, sampleRate: rate, channels: 1 };
     },
     async join(job) {
       joins.push({ names: job.files.map((f) => path.basename(f)), bitrateK: job.bitrateK });
@@ -633,34 +642,35 @@ describe("speech_generate: long scripts through the tool (#248)", () => {
   it("ffmpeg runs sandboxed: reads only the input's folder, writes only out/, no network; none off macOS", () => {
     const tools = { ffmpeg: { exe: "/opt/x/bin/ffmpeg", trusted: ["/opt/x/bin"] } };
     const w = "/data/speech-scratch/abc";
-    const m = measureOptions(tools, `${w}/in/piece-000.mp3`, `${w}/out/measure-1.u8`);
+    const m = measureOptions(tools, `${w}/in/piece-000.mp3`);
     expect(m).toMatchObject({
       command: "/opt/x/bin/ffmpeg",
       read: [`${w}/in`],
-      write: [`${w}/out`],
+      write: [],
       network: "none",
       noFlagChanges: true,
       trusted: ["/opt/x/bin"],
     });
-    // A strict, full decode to 1 kHz mono 8-bit PCM — the length is the output's size; no header is read for it.
+    // A strict decode of the whole file at its own rate into nothing; only its progress (played time) is read.
     expect(m.args).toEqual(
-      expect.arrayContaining(["-xerror", "-err_detect", "explode", "-ar", "1000", "-ac", "1", "pcm_u8"]),
+      expect.arrayContaining(["-xerror", "-err_detect", "explode", "-progress", "pipe:1", "null"]),
     );
+    expect(m.args).not.toContain("-ar");
+    expect(m.args).not.toContain("-t");
     expect(m.args.join(" ")).not.toMatch(/duration|count_packets/);
-    // The joined result is measured where it lies (out/ only).
-    expect(measureOptions(tools, `${w}/out/s.mp3`, `${w}/out/measure-2.u8`)).toMatchObject({
-      read: [],
-      write: [`${w}/out`],
-    });
     const j = joinOptions(tools, {
       workdir: w,
       files: [`${w}/in/piece-000.mp3`, `${w}/in/piece-001.mp3`],
       out: `${w}/out/s.mp3`,
       bitrateK: 64,
+      sampleRate: 22050,
     });
     expect(j).toMatchObject({ read: [`${w}/in`], write: [`${w}/out`], network: "none", noFlagChanges: true });
     expect(j.args).toEqual(expect.arrayContaining(["libmp3lame", "64k", "-ac", "1", "-fs"]));
-    expect(j.args.join(" ")).toContain("[0:a:0][1:a:0]concat=n=2:v=0:a=1[a]");
+    // Each piece to the same PCM (s16 mono at the pieces' rate), then concatenated — no resampling.
+    expect(j.args.join(" ")).toContain(
+      "[0:a:0]aformat=sample_fmts=s16:channel_layouts=mono:sample_rates=22050[p0];[1:a:0]aformat=sample_fmts=s16:channel_layouts=mono:sample_rates=22050[p1];[p0][p1]concat=n=2:v=0:a=1[a]",
+    );
     expect(j.args).not.toContain("copy");
     expect(speechTools(undefined, "/data", "linux")).toBeUndefined();
     expect(speechTools("/nope/ffmpeg", "/data", "darwin")).toBeUndefined();
@@ -1232,11 +1242,12 @@ function vbrWithoutHeader(seconds: number): Buffer {
 describe("speech_generate: review round 4 regressions (#251)", () => {
   it("P2: the scripted decoder walks every frame at its own rate (VBR) and skips a leading Xing/Info frame", () => {
     const vbr = vbrWithoutHeader(14.6);
-    const f = mp3Frames(vbr)!;
-    expect(f.seconds).toBeCloseTo(14.6, 1);
+    const f = walkMp3(vbr);
+    expect(f.ok && f.samples / f.sampleRate).toBeCloseTo(14.6, 1);
     const xing = mp3Frame(9);
     xing.write("Xing", 36, "latin1");
-    expect(mp3Frames(Buffer.concat([xing, vbr]))!.frames).toHaveLength(f.frames.length);
+    const g = walkMp3(Buffer.concat([xing, vbr]));
+    expect(g.ok && g.samples).toBe(f.ok && f.samples);
   });
 
   it("P2: a header-less VBR piece near the provider's mark is caught (measured by frames) and re-split", async () => {
@@ -1283,9 +1294,9 @@ describe("speech_generate: review round 4 regressions (#251)", () => {
   });
 });
 
-// ---------------------------------------------------------------- review round 5 re-plan (#251)
+// ---------------------------------------------------------------- review rounds 5–6 re-plans (#251)
 
-/** One MPEG-2 Layer III frame header (22.05 kHz) at this bit-rate index, padded to its length. */
+/** One MPEG-2 Layer III frame header (22.05 kHz, mono) at this bit-rate index, padded to its length. */
 function mp3Frame22(bitrateIndex: number): Buffer {
   const kbps = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160][bitrateIndex]!;
   const frame = Buffer.alloc(Math.floor((72 * kbps * 1000) / 22050));
@@ -1293,13 +1304,15 @@ function mp3Frame22(bitrateIndex: number): Buffer {
   return frame;
 }
 
-describe("speech_generate: review round 5 re-plan — measured by decoding (#251)", () => {
+/** The answers' bytes, as a fake measure would say about them. */
+const answerWith = (mark: string) => (input: string) =>
+  Buffer.concat([fakeMp3(speechSeconds(input, LIMITS.typical)), Buffer.from(mark, "latin1")]);
+
+describe("speech_generate: review rounds 5–6 re-plans — one form, exact decoded length (#251)", () => {
   it("a piece that does not decode cleanly is media_audio_corrupt: no retry, no file, its cost recorded", async () => {
     const t = await start({
       answer: (input, n) =>
-        n === 1
-          ? Buffer.concat([fakeMp3(speechSeconds(input, LIMITS.typical)), Buffer.from(CORRUPT, "latin1")])
-          : fakeMp3(speechSeconds(input, LIMITS.typical)),
+        n === 1 ? answerWith(CORRUPT)(input) : fakeMp3(speechSeconds(input, LIMITS.typical)),
     });
     const r = await t.speak({ text: LONG });
     expect(r).toMatchObject({ ok: false, code: "media_audio_corrupt" });
@@ -1312,7 +1325,66 @@ describe("speech_generate: review round 5 re-plan — measured by decoding (#251
     expect(t.scratch()).toEqual([]);
   });
 
-  it("the scripted decoder: every frame at its own rate (a rate change inside a file), corrupt answers fail", async () => {
+  for (const [what, first, code, hint] of [
+    ["another form (MP2, a rate change)", answerWith(UNSUPPORTED), "media_audio_unsupported", /형식/],
+    ["an abnormally long answer", () => fakeMp3(700), "media_audio_unsupported", /비정상적으로 길어/],
+    ["a measurement that could not run", answerWith(MEASURE_FAILED), "media_measure_failed", /확인하지 못해/],
+  ] as const)
+    it(`${what}: ${code}, no retry, no file, its cost recorded`, async () => {
+      const t = await start({ answer: (input, n) => (n === 0 ? first(input) : fakeMp3(1)) });
+      const r = await t.speak({ text: LONG });
+      expect(r).toMatchObject({ ok: false, code });
+      expect(!r.ok && r.hint).toMatch(hint);
+      expect(t.posts).toHaveLength(1);
+      expect(t.files()).toEqual([]);
+      expect(t.rows()).toEqual([expect.objectContaining({ cost_usd: PIECE_COST })]);
+    });
+
+  it("every piece of a call in one form: a second piece at another rate is media_audio_unsupported", async () => {
+    const t = await start({
+      answer: (input, n) =>
+        n === 1 ? answerWith("RATE=22050;")(input) : fakeMp3(speechSeconds(input, LIMITS.typical)),
+    });
+    expect(await t.speak({ text: LONG })).toMatchObject({ ok: false, code: "media_audio_unsupported" });
+    expect(t.posts).toHaveLength(2);
+    expect(t.files()).toEqual([]);
+  });
+
+  it("the form check walks the whole file: Layer III only, one rate and channel count, frames to the end", () => {
+    const cbr = silentMp3(30);
+    const w = walkMp3(cbr);
+    expect(w).toMatchObject({ ok: true, sampleRate: 44100, channels: 2, samplesPerFrame: 1152 });
+    expect(w.ok && w.samples).toBe(30 * 1152);
+    // A rate change after many good frames (8 kHz → 44.1 kHz): unsupported — not just the first frame is read.
+    const mixed = Buffer.concat([
+      ...Array.from({ length: 200 }, () => mp3Frame22(8)),
+      ...Array.from({ length: 3 }, () => mp3Frame(9)),
+    ]);
+    expect(walkMp3(mixed)).toEqual({ ok: false, reason: "unsupported" });
+    // A channel-count change.
+    const stereo = mp3Frame(9);
+    const mono = mp3Frame(9);
+    mono[3] = 0xc4;
+    expect(walkMp3(Buffer.concat([stereo, stereo, mono]))).toEqual({ ok: false, reason: "unsupported" });
+    // MP2 (Layer II) frames.
+    const mp2 = mp3Frame(9);
+    mp2[1] = 0xfd;
+    expect(walkMp3(Buffer.concat([mp2, mp2]))).toEqual({ ok: false, reason: "unsupported" });
+    // Garbage after the frames, a cut last frame, no frames: not a clean frame stream (corrupt).
+    expect(walkMp3(Buffer.concat([cbr, Buffer.from("junk")]))).toEqual({ ok: false, reason: "not_mp3" });
+    expect(walkMp3(cbr.subarray(0, cbr.length - 10))).toEqual({ ok: false, reason: "not_mp3" });
+    expect(walkMp3(Buffer.from("not audio"))).toEqual({ ok: false, reason: "not_mp3" });
+    // An ID3v1 tag at the end is allowed; a leading Xing/Info frame holds no audio.
+    const tag = Buffer.alloc(128);
+    tag.write("TAG", 0, "latin1");
+    expect(walkMp3(Buffer.concat([cbr, tag]))).toMatchObject({ ok: true });
+    const xing = mp3Frame(9);
+    xing.write("Info", 36, "latin1");
+    const withInfo = walkMp3(Buffer.concat([xing, ...Array.from({ length: 30 }, () => mp3Frame(9))]));
+    expect(withInfo.ok && withInfo.samples).toBe(30 * 1152);
+  });
+
+  it("the scripted decoder (FAKE_RUNTIME) has the real one's semantics", async () => {
     const dir = tmp();
     fs.mkdirSync(path.join(dir, "in"));
     fs.mkdirSync(path.join(dir, "out"));
@@ -1322,39 +1394,59 @@ describe("speech_generate: review round 5 re-plan — measured by decoding (#251
       fs.writeFileSync(f, b);
       return f;
     };
-    // 200 frames at 22.05 kHz (576 samples each), then 100 at 44.1 kHz (1152 each).
-    const mixed = Buffer.concat([
-      ...Array.from({ length: 200 }, () => mp3Frame22(8)),
-      ...Array.from({ length: 100 }, () => mp3Frame(9)),
-    ]);
-    const want = (200 * 576) / 22050 + (100 * 1152) / 44100;
-    const m = await audio.measure(write("piece-000.mp3", mixed));
-    expect(m.ok && m.seconds).toBeCloseTo(want, 2);
-    expect(await audio.measure(write("piece-001.mp3", Buffer.from("not audio")))).toEqual({
+    const m = { maxSeconds: 600 };
+    expect(await audio.measure(write("piece-000.mp3", silentMp3()), m)).toEqual({
+      ok: true,
+      samples: 20 * 1152,
+      seconds: (20 * 1152) / 44100,
+      sampleRate: 44100,
+      channels: 2,
+    });
+    const mixed = Buffer.concat([mp3Frame22(8), mp3Frame(9)]);
+    expect(await audio.measure(write("piece-001.mp3", mixed), m)).toEqual({
       ok: false,
-      corrupt: true,
+      reason: "unsupported",
+    });
+    expect(await audio.measure(write("piece-002.mp3", Buffer.from("x")), m)).toEqual({
+      ok: false,
+      reason: "corrupt",
     });
     expect(
       await audio.measure(
-        write("piece-002.mp3", Buffer.concat([silentMp3(), Buffer.from(FIXTURE_CORRUPT_MARK)])),
+        write("piece-003.mp3", Buffer.concat([silentMp3(), Buffer.from(FIXTURE_CORRUPT_MARK)])),
+        m,
       ),
-    ).toEqual({ ok: false, corrupt: true });
-    expect(await audio.measure(write("piece-003.mp3", silentMp3()))).toEqual({ ok: true, seconds: 0.522 });
+    ).toEqual({ ok: false, reason: "corrupt" });
+    expect(await audio.measure(write("piece-004.mp3", silentMp3()), { maxSeconds: 0.1 })).toEqual({
+      ok: false,
+      reason: "too_long",
+    });
   });
 
-  it("estimates are counted per class as integers: 300 ASCII characters at the typical rate are exactly 20 s", () => {
+  it("a run that could not start (the sandbox refusing) is a failed measurement, never corrupt", () => {
+    expect(measureFailure({ code: 71, stderr: "sandbox-exec: sandbox_apply: Operation not permitted" })).toBe(
+      "failed",
+    );
+    expect(measureFailure({ code: 1, stderr: "x.mp3: Permission denied" })).toBe("failed");
+    expect(measureFailure({ code: 183, stderr: "[mp3float] big_values too big\nError while decoding" })).toBe(
+      "corrupt",
+    );
+    expect(progressMicros("out_time_us=1000\nprogress=continue\nout_time_us=20000\nprogress=end\n")).toBe(
+      20000,
+    );
+    expect(progressMicros("out_time_us=1000\nprogress=continue\n")).toBeUndefined();
+  });
+
+  it("estimates and limits compare in whole microseconds: 20 s exactly is 20 s, whatever the classes", () => {
     const text = "a".repeat(300);
     expect(speechSeconds(text, SPEECH_SPLIT.typical)).toBe(20);
-    // …so the short check applies (the production limits): a 1.04 s answer for it is cut.
     expect(looksCut(text, 1.04)).toBe(true);
-    expect(
-      speechSeconds("가".repeat(13) + "1".repeat(9), {
-        syllables: 6.5,
-        digits: 4.5,
-        chars: 15,
-        sentencePause: 0,
-      }),
-    ).toBe(4);
+    // 52 Hangul + 39 digits + 50 other characters: 8 + 8.67 + 3.33 = exactly 20 s at the typical rate.
+    const mixed = "가".repeat(52) + "1".repeat(39) + "a".repeat(50);
+    expect(speechSeconds(mixed, SPEECH_SPLIT.typical)).toBe(20);
+    expect(looksCut(mixed, 1)).toBe(true);
+    expect(looksCut(mixed, 10)).toBe(false);
+    expect(looksCut(mixed, 9.999999)).toBe(true);
   });
 });
 
@@ -1364,71 +1456,85 @@ const realTools =
   process.platform === "darwin" ? speechTools(process.env.TEST_AUDIO_FFMPEG, "/nonexistent-data") : undefined;
 const realIt = realTools ? it : it.skip;
 
-/** A real MP3 tone of `seconds` (made here with the unsandboxed ffmpeg — test input only). */
+/** An MP3 made here by the unsandboxed ffmpeg (test input only); its bytes. */
+function encode(args: string[]): Buffer {
+  const out = path.join(tmp(), "x.mp3");
+  const r = spawnSync(realTools!.ffmpeg.exe, ["-nostdin", "-v", "error", ...args, out]);
+  expect(r.status).toBe(0);
+  return fs.readFileSync(out);
+}
+
+/** A real MP3 tone of `seconds` (22.05 kHz mono unless asked otherwise). */
 const tones = new Map<string, Buffer>();
-function tone(seconds: number, rate = 22050): Buffer {
-  const key = `${seconds.toFixed(2)}@${rate}`;
+function tone(seconds: number, rate = 22050, freq = 440): Buffer {
+  const key = `${seconds.toFixed(2)}@${rate}@${freq}`;
   const had = tones.get(key);
   if (had) return had;
-  const dir = tmp();
-  const out = path.join(dir, "t.mp3");
-  const r = spawnSync(realTools!.ffmpeg.exe, [
-    "-nostdin",
-    "-hide_banner",
-    "-loglevel",
-    "error",
+  const b = encode([
     "-f",
     "lavfi",
     "-i",
-    `sine=frequency=440:duration=${seconds.toFixed(2)}:sample_rate=${rate}`,
+    `sine=frequency=${freq}:duration=${seconds.toFixed(3)}:sample_rate=${rate}`,
     "-ac",
     "1",
     "-c:a",
     "libmp3lame",
     "-b:a",
     "32k",
-    out,
   ]);
-  expect(r.status).toBe(0);
-  const b = fs.readFileSync(out);
   tones.set(key, b);
   return b;
 }
 
+/** The frames' side information scrambled from frame `from` on (headers intact): the decoder errors there. */
+function scramble(b: Buffer, from: number, to = Infinity): Buffer {
+  const out = Buffer.from(b);
+  const w = walkMp3(out);
+  if (!w.ok) throw new Error("not an mp3");
+  w.frames.forEach((f, i) => {
+    if (i >= from && i < to)
+      for (let k = f.start + 4; k < Math.min(f.end, f.start + 40); k++) out[k] = (k * 131 + 7) & 0xff;
+  });
+  return out;
+}
+
+/** A sandboxed ffmpeg, made when first used (the data folder is known then). */
+function realAudio(dataDir: () => string): SpeechAudio {
+  let made: SpeechAudio | undefined;
+  const real = () =>
+    (made ??= sandboxedSpeechAudio({
+      dataDir: dataDir(),
+      platform: "darwin",
+      ffmpegPath: process.env.TEST_AUDIO_FFMPEG,
+    })!);
+  return {
+    workdir: () => real().workdir(),
+    measure: (f, m) => real().measure(f, m),
+    join: (j, sg) => real().join(j, sg),
+  };
+}
+
 describe("speech_generate: the real sandboxed ffmpeg (#248, macOS)", () => {
-  /** An MP3 made here by the unsandboxed ffmpeg (test input only); its bytes. */
-  const encode = (args: string[]): Buffer => {
-    const out = path.join(tmp(), "x.mp3");
-    const r = spawnSync(realTools!.ffmpeg.exe, ["-nostdin", "-v", "error", ...args, out]);
-    expect(r.status).toBe(0);
-    return fs.readFileSync(out);
-  };
-  const realAudio = (dataDir: () => string): SpeechAudio => {
-    let made: SpeechAudio | undefined;
-    const real = () =>
-      (made ??= sandboxedSpeechAudio({
-        dataDir: dataDir(),
-        platform: "darwin",
-        ffmpegPath: process.env.TEST_AUDIO_FFMPEG,
-      })!);
-    return {
-      workdir: () => real().workdir(),
-      measure: (f, sg) => real().measure(f, sg),
-      join: (j, sg) => real().join(j, sg),
+  /** A working folder of a real `SpeechAudio`, and a way to put a file into its `in/`. */
+  const bench = () => {
+    const data = tmp();
+    const audio = realAudio(() => data);
+    const w = audio.workdir();
+    let n = 0;
+    const put = (b: Buffer) => {
+      const f = path.join(w, "in", `piece-${String(n++).padStart(3, "0")}.mp3`);
+      fs.writeFileSync(f, b);
+      return f;
     };
+    closers.push(() => removeSpeechWorkdir(w));
+    return { audio, w, put };
   };
+  const M = { maxSeconds: 600 };
 
   realIt(
-    "a normal CBR MP3 with ID3 and Xing/Info measures as its length; a corrupt one is corrupt",
+    "exact lengths at the file's own rate: CBR with ID3 and Xing/Info, a 20 ms file, a header-less VBR",
     async () => {
-      const data = tmp();
-      const audio = realAudio(() => data);
-      const w = audio.workdir();
-      const put = (name: string, b: Buffer) => {
-        const f = path.join(w, "in", name);
-        fs.writeFileSync(f, b);
-        return f;
-      };
+      const { audio, put } = bench();
       const cbr = encode([
         "-f",
         "lavfi",
@@ -1440,105 +1546,200 @@ describe("speech_generate: the real sandboxed ffmpeg (#248, macOS)", () => {
         "128k",
       ]);
       expect(cbr.toString("latin1", 0, 3)).toBe("ID3");
-      const ok = await audio.measure(put("piece-000.mp3", cbr));
-      expect(ok.ok && ok.seconds).toBeCloseTo(5, 1);
-      // Side information of many frames scrambled (their headers left intact): the decoder errors out.
-      const bad = Buffer.from(cbr);
-      let at = 0;
-      let frames = 0;
-      while (at < bad.length - 4) {
-        if (bad[at] === 0xff && (bad[at + 1]! & 0xe0) === 0xe0 && ((bad[at + 1]! >> 3) & 3) === 3) {
-          if (frames >= 30 && frames < 150)
-            for (let k = at + 4; k < at + 40; k++) bad[k] = (k * 131 + 7) & 0xff;
-          frames++;
-          at += 417;
-        } else at++;
-      }
-      expect(await audio.measure(put("piece-001.mp3", bad))).toEqual({ ok: false, corrupt: true });
-      removeSpeechWorkdir(w);
+      expect(await audio.measure(put(cbr), M)).toMatchObject({
+        ok: true,
+        samples: 220500,
+        sampleRate: 44100,
+        seconds: 5,
+      });
+      const short = encode([
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:duration=0.02:sample_rate=44100",
+        "-c:a",
+        "libmp3lame",
+      ]);
+      expect(await audio.measure(put(short), M)).toMatchObject({ ok: true, samples: 882, seconds: 0.02 });
+      const vbr = encode([
+        "-f",
+        "lavfi",
+        "-i",
+        "anoisesrc=d=1:c=white:a=0.9:r=44100",
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=r=44100:cl=mono:d=13.6",
+        "-filter_complex",
+        "[0]aformat=channel_layouts=mono[a];[a][1]concat=n=2:v=0:a=1",
+        "-c:a",
+        "libmp3lame",
+        "-q:a",
+        "2",
+        "-write_xing",
+        "0",
+      ]);
+      const v = await audio.measure(put(vbr), M);
+      expect(v.ok && v.seconds).toBeCloseTo(14.6, 1);
+    },
+  );
+
+  realIt("another form is unsupported: alternating sample rates, MP2", async () => {
+    const { audio, put } = bench();
+    const at = (rate: number, d: number) =>
+      encode([
+        "-f",
+        "lavfi",
+        "-i",
+        `sine=frequency=300:duration=${d}:sample_rate=${rate}`,
+        "-ac",
+        "1",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "32k",
+        "-write_xing",
+        "0",
+        "-id3v2_version",
+        "0",
+      ]);
+    const alternating = Buffer.concat([at(8000, 2), at(48000, 1), at(8000, 2), at(48000, 1)]);
+    expect(await audio.measure(put(alternating), M)).toEqual({ ok: false, reason: "unsupported" });
+    const mp2 = encode([
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=frequency=300:duration=3:sample_rate=44100",
+      "-c:a",
+      "mp2",
+      "-f",
+      "mp2",
+    ]);
+    expect(await audio.measure(put(mp2), M)).toEqual({ ok: false, reason: "unsupported" });
+  });
+
+  realIt(
+    "corruption is found to the file's end (a good control first); over the cap is too_long, undecoded",
+    async () => {
+      const { audio, put } = bench();
+      const good = tone(60, 8000);
+      // The control: this environment decodes the clean file.
+      expect(await audio.measure(put(good), M)).toMatchObject({ ok: true });
+      // Corrupt only in its last seconds.
+      const w = walkMp3(good);
+      const frames = w.ok ? w.frames.length : 0;
+      expect(await audio.measure(put(scramble(good, frames - 40)), M)).toEqual({
+        ok: false,
+        reason: "corrupt",
+      });
+      // Over the cap: refused from its frames alone.
+      expect(await audio.measure(put(good), { maxSeconds: 30 })).toEqual({ ok: false, reason: "too_long" });
     },
   );
 
   realIt(
-    "a corrupt piece through the tool: media_audio_corrupt, no retry, no file, its cost recorded",
+    "through the tool: a corrupt piece ends the call (no retry); a rate change is unsupported",
     async () => {
       let dataDir = "";
-      const corrupt = (() => {
-        const b = Buffer.from(
-          encode([
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:duration=8:sample_rate=44100",
-            "-c:a",
-            "libmp3lame",
-            "-b:a",
-            "128k",
-          ]),
-        );
-        let at = 0;
-        let frames = 0;
-        while (at < b.length - 4) {
-          if (b[at] === 0xff && (b[at + 1]! & 0xe0) === 0xe0 && ((b[at + 1]! >> 3) & 3) === 3) {
-            if (frames >= 30 && frames < 150)
-              for (let k = at + 4; k < at + 40; k++) b[k] = (k * 131 + 7) & 0xff;
-            frames++;
-            at += 417;
-          } else at++;
-        }
-        return b;
-      })();
-      const t = await start({ audio: realAudio(() => dataDir), answer: () => corrupt });
-      dataDir = t.dataDir;
+      const good = tone(8);
+      // The control in the same environment: a clean answer goes through.
+      const ok = await start({ audio: realAudio(() => dataDir), answer: () => good });
+      dataDir = ok.dataDir;
+      expect((await ok.speak({ text: SENTENCES[0]! })).ok).toBe(true);
+      let dir2 = "";
+      const t = await start({ audio: realAudio(() => dir2), answer: () => scramble(good, 30, 150) });
+      dir2 = t.dataDir;
       expect(await t.speak({ text: LONG })).toMatchObject({ ok: false, code: "media_audio_corrupt" });
       expect(t.posts).toHaveLength(1);
       expect(t.files()).toEqual([]);
       expect(t.rows()).toEqual([expect.objectContaining({ cost_usd: PIECE_COST })]);
+      let dir3 = "";
+      const t3 = await start({
+        audio: realAudio(() => dir3),
+        answer: (input, n) =>
+          tone(Math.round(speechSeconds(input, LIMITS.typical) * 10) / 10, n === 0 ? 22050 : 24000),
+      });
+      dir3 = t3.dataDir;
+      expect(await t3.speak({ text: LONG })).toMatchObject({ ok: false, code: "media_audio_unsupported" });
+      expect(t3.posts).toHaveLength(2);
     },
   );
 
   realIt(
-    "a sample-rate change inside one answer near the mark is decoded in full and the piece re-split",
+    "joined from PCM: the exact summed length, and the last piece's own tone intact to its end",
     async () => {
       let dataDir = "";
-      // 11.6 s at 8 kHz, then 3 s at 48 kHz, as one byte stream (no headers that would describe either part).
-      const low = encode([
-        "-f",
-        "lavfi",
-        "-i",
-        "sine=frequency=300:duration=11.6:sample_rate=8000",
-        "-ac",
-        "1",
-        "-c:a",
-        "libmp3lame",
-        "-b:a",
-        "16k",
-        "-write_xing",
-        "0",
-        "-id3v2_version",
-        "0",
-      ]);
-      const high = encode([
-        "-f",
-        "lavfi",
-        "-i",
-        "sine=frequency=300:duration=3:sample_rate=48000",
-        "-ac",
-        "1",
-        "-c:a",
-        "libmp3lame",
-        "-b:a",
-        "64k",
-        "-write_xing",
-        "0",
-        "-id3v2_version",
-        "0",
-      ]);
-      const mixed = Buffer.concat([low, high]);
+      const pieces = splitSpeech(LONG, LIMITS);
+      const secs = pieces.map((p) => Math.round(speechSeconds(p, LIMITS.typical) * 10) / 10);
+      const t = await start({
+        audio: realAudio(() => dataDir),
+        // The last piece at 1 kHz, the others at 440 Hz.
+        answer: (_input, n) => tone(secs[n]!, 22050, n === pieces.length - 1 ? 1000 : 440),
+      });
+      dataDir = t.dataDir;
+      const r = await t.speak({ text: LONG });
+      expect(r.ok).toBe(true);
+      const out = (r as { output: { durationSeconds: number; chunks: number; fileId: string } }).output;
+      const want = secs.reduce((a, b) => a + b, 0);
+      expect(out.chunks).toBe(pieces.length);
+      expect(Math.abs(out.durationSeconds - want)).toBeLessThan(0.1);
+      // Decode the stored file and count the zero crossings of its last piece's span: 1 kHz all the way.
+      const row = t.app.files!.get(out.fileId)!;
+      const fd = t.app.files!.open(row)!;
+      const buf = Buffer.alloc(row.bytes);
+      fs.readSync(fd, buf, 0, row.bytes, 0);
+      fs.closeSync(fd);
+      const mp3 = path.join(tmp(), "joined.mp3");
+      fs.writeFileSync(mp3, buf);
+      const pcm = spawnSync(
+        realTools!.ffmpeg.exe,
+        ["-nostdin", "-v", "error", "-i", mp3, "-ac", "1", "-f", "s16le", "-c:a", "pcm_s16le", "-"],
+        {
+          maxBuffer: 64 * 1024 * 1024,
+        },
+      ).stdout as Buffer;
+      const rate = 22050;
+      const samples = pcm.length / 2;
+      const last = secs.at(-1)!;
+      // The last piece's span, away from its edges (the encoder's delay and padding).
+      const from = Math.round((want - last + 0.1) * rate);
+      const to = Math.round((want - 0.1) * rate);
+      expect(to).toBeLessThanOrEqual(samples);
+      let crossings = 0;
+      for (let i = from + 1; i < to; i++)
+        if (pcm.readInt16LE((i - 1) * 2) < 0 !== pcm.readInt16LE(i * 2) < 0) crossings++;
+      const hz = crossings / 2 / ((to - from) / rate);
+      expect(hz).toBeGreaterThan(980);
+      expect(hz).toBeLessThan(1020);
+      expect(t.scratch()).toEqual([]);
+    },
+  );
+
+  realIt("a cut at the mark (decoded length) is caught and re-split; a header-less VBR one too", async () => {
+    let dataDir = "";
+    const vbr = encode([
+      "-f",
+      "lavfi",
+      "-i",
+      "anoisesrc=d=1:c=white:a=0.9:r=22050",
+      "-f",
+      "lavfi",
+      "-i",
+      "anullsrc=r=22050:cl=mono:d=13.6",
+      "-filter_complex",
+      "[0]aformat=channel_layouts=mono[a];[a][1]concat=n=2:v=0:a=1",
+      "-c:a",
+      "libmp3lame",
+      "-q:a",
+      "2",
+      "-write_xing",
+      "0",
+    ]);
+    for (const first of [tone(14.6), vbr]) {
       const t = await start({
         audio: realAudio(() => dataDir),
         answer: (input, n) =>
-          n === 0 ? mixed : tone(Math.round(speechSeconds(input, LIMITS.typical) * 10) / 10),
+          n === 0 ? first : tone(Math.round(speechSeconds(input, LIMITS.typical) * 10) / 10),
       });
       dataDir = t.dataDir;
       const pieces = splitSpeech(LONG, LIMITS);
@@ -1546,158 +1747,6 @@ describe("speech_generate: the real sandboxed ffmpeg (#248, macOS)", () => {
       const r = await t.speak({ text: LONG });
       expect(r.ok).toBe(true);
       expect(t.posts.map((p) => p.input)).toEqual([pieces[0], ...again, ...pieces.slice(1)]);
-    },
-  );
-  realIt(
-    "a header-less VBR MP3 near the mark: the real ffprobe counts its frames and the piece is re-split",
-    async () => {
-      // A few loud (dear) frames first, then silence (cheap ones), VBR without a Xing/Info header: ffprobe's container
-      // duration estimates it far shorter than its 14.6 s.
-      const vbr = (() => {
-        const out = path.join(tmp(), "vbr.mp3");
-        const r = spawnSync(realTools!.ffmpeg.exe, [
-          "-nostdin",
-          "-v",
-          "error",
-          "-f",
-          "lavfi",
-          "-i",
-          "anoisesrc=d=1:c=white:a=0.9:r=44100",
-          "-f",
-          "lavfi",
-          "-i",
-          "anullsrc=r=44100:cl=mono:d=13.6",
-          "-filter_complex",
-          "[0]aformat=channel_layouts=mono[a];[a][1]concat=n=2:v=0:a=1",
-          "-c:a",
-          "libmp3lame",
-          "-q:a",
-          "2",
-          "-write_xing",
-          "0",
-          out,
-        ]);
-        expect(r.status).toBe(0);
-        // The estimate a header-based measurement would have used (ffprobe's container duration, when there is
-        // an ffprobe beside the ffmpeg): well under the mark.
-        const ffprobe = path.join(path.dirname(realTools!.ffmpeg.exe), "ffprobe");
-        if (fs.existsSync(ffprobe)) {
-          const est = spawnSync(
-            ffprobe,
-            ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", out],
-            { encoding: "utf8" },
-          );
-          expect(Number(est.stdout)).toBeLessThan(LIMITS.nearCutSeconds);
-        }
-        return fs.readFileSync(out);
-      })();
-      let dataDir = "";
-      let made: SpeechAudio | undefined;
-      const real = () =>
-        (made ??= sandboxedSpeechAudio({
-          dataDir,
-          platform: "darwin",
-          ffmpegPath: process.env.TEST_AUDIO_FFMPEG,
-        })!);
-      const lazy: SpeechAudio = {
-        workdir: () => real().workdir(),
-        measure: (f, sg) => real().measure(f, sg),
-        join: (j, sg) => real().join(j, sg),
-      };
-      const t = await start({
-        audio: lazy,
-        answer: (input, n) =>
-          n === 0 ? vbr : tone(Math.round(speechSeconds(input, LIMITS.typical) * 10) / 10),
-      });
-      dataDir = t.dataDir;
-      const pieces = splitSpeech(LONG, LIMITS);
-      const again = resplitSpeech(pieces[0]!, LIMITS);
-      const r = await t.speak({ text: LONG });
-      expect(r.ok).toBe(true);
-      expect(t.posts.map((p) => p.input)).toEqual([pieces[0], ...again, ...pieces.slice(1)]);
-    },
-  );
-  realIt("measures each piece, joins them in order into one MP3 of their summed length", async () => {
-    let dataDir = "";
-    const lazy: SpeechAudio = {
-      workdir: () => real().workdir(),
-      measure: (f, s) => real().measure(f, s),
-      join: (j, s) => real().join(j, s),
-    };
-    let made: SpeechAudio | undefined;
-    const real = () =>
-      (made ??= sandboxedSpeechAudio({
-        dataDir,
-        platform: "darwin",
-        ffmpegPath: process.env.TEST_AUDIO_FFMPEG,
-      })!);
-    const t = await start({
-      audio: lazy,
-      answer: (input) => tone(Math.round(speechSeconds(input, LIMITS.typical) * 10) / 10),
-    });
-    dataDir = t.dataDir;
-    const pieces = splitSpeech(LONG, LIMITS);
-    const r = await t.speak({ text: LONG });
-    expect(r.ok).toBe(true);
-    const out = (r as { output: { durationSeconds: number; chunks: number; fileId: string } }).output;
-    const want = pieces.reduce((a, p) => a + Math.round(speechSeconds(p, LIMITS.typical) * 10) / 10, 0);
-    expect(out.chunks).toBe(pieces.length);
-    expect(Math.abs(out.durationSeconds - want)).toBeLessThan(0.5);
-    const row = t.app.files!.get(out.fileId)!;
-    expect(row.kind).toBe("mp3");
-    // The stored file itself, measured again.
-    const work = tmp();
-    const stored = path.join(work, "in");
-    fs.mkdirSync(stored);
-    fs.mkdirSync(path.join(work, "out"));
-    const copy = path.join(stored, "piece-000.mp3");
-    const fd = t.app.files!.open(row)!;
-    const buf = Buffer.alloc(row.bytes);
-    fs.readSync(fd, buf, 0, row.bytes, 0);
-    fs.closeSync(fd);
-    expect(isMp3(buf)).toBe(true);
-    fs.writeFileSync(copy, buf);
-    const again = await real().measure(copy);
-    expect(again.ok && again.seconds).toBeCloseTo(out.durationSeconds, 1);
-    expect(t.scratch()).toEqual([]);
+    }
   });
-
-  realIt(
-    "pieces with different streams are re-encoded; a real cut at the mark is caught and re-split",
-    async () => {
-      let dataDir = "";
-      let made: SpeechAudio | undefined;
-      const real = () =>
-        (made ??= sandboxedSpeechAudio({
-          dataDir,
-          platform: "darwin",
-          ffmpegPath: process.env.TEST_AUDIO_FFMPEG,
-        })!);
-      const lazy: SpeechAudio = {
-        workdir: () => real().workdir(),
-        measure: (f, s) => real().measure(f, s),
-        join: (j, s) => real().join(j, s),
-      };
-      const t = await start({
-        audio: lazy,
-        answer: (input, n) =>
-          n === 0
-            ? tone(14.6)
-            : tone(Math.round(speechSeconds(input, LIMITS.typical) * 10) / 10, n % 2 ? 22050 : 24000),
-      });
-      dataDir = t.dataDir;
-      const pieces = splitSpeech(LONG, LIMITS);
-      const again = resplitSpeech(pieces[0]!, LIMITS);
-      const r = await t.speak({ text: LONG });
-      expect(r.ok).toBe(true);
-      expect(t.posts.map((p) => p.input)).toEqual([pieces[0], ...again, ...pieces.slice(1)]);
-      const out = (r as { output: { durationSeconds: number; chunks: number } }).output;
-      expect(out.chunks).toBe(again.length + pieces.length - 1);
-      const want = [...again, ...pieces.slice(1)].reduce(
-        (a, p) => a + Math.round(speechSeconds(p, LIMITS.typical) * 10) / 10,
-        0,
-      );
-      expect(Math.abs(out.durationSeconds - want)).toBeLessThan(0.6);
-    },
-  );
 });

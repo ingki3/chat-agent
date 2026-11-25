@@ -251,6 +251,13 @@ export const MEDIA_TOOL_CODES = [
   "media_truncated",
   /** #251 re-plan 2: a piece's audio did not decode cleanly (corrupt) — no file, no retry, its cost recorded. */
   "media_audio_corrupt",
+  /**
+   * #251 re-plan 3: a piece's audio is not of the one form taken (MPEG Layer III, one rate and channel count, the
+   * same for every piece), or abnormally long — no file, no retry, its cost recorded.
+   */
+  "media_audio_unsupported",
+  /** #251 re-plan 3: a piece could not be measured (the sandbox, a limit) — no file, no retry, its cost recorded. */
+  "media_measure_failed",
 ] as const;
 export type MediaToolCode = (typeof MEDIA_TOOL_CODES)[number];
 
@@ -286,6 +293,10 @@ export const MEDIA_TOOL_HINTS: Partial<Record<MediaToolCode, string>> = {
     "이 서버에 ffmpeg가 없어 만든 음성의 실제 길이를 확인할 수 없어서(중간에 끊긴 음성을 저장하지 않으려고) 음성을 만들지 않았어요. 관리자에게 ffmpeg 설치를 부탁하세요(비용은 나가지 않았어요).",
   media_audio_corrupt:
     "제공자가 보낸 음성이 손상돼(디코딩 오류) 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 잠시 뒤 다시 요청해 주세요.",
+  media_audio_unsupported:
+    "제공자가 보낸 음성의 형식이 이 서버가 받는 형식(한 가지 표본율·채널의 MP3)이 아니어서 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 관리자에게 알려 주세요.",
+  media_measure_failed:
+    "만든 음성의 길이를 이 서버에서 확인하지 못해 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 잠시 뒤 다시 해 보거나 관리자에게 알려 주세요.",
   media_truncated:
     "음성이 제공자 쪽에서 중간에 끊겨 와서(더 잘게 나눠 다시 해도 끊김) 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 글을 더 짧게 나눠 요청해 주세요.",
 };

@@ -101,8 +101,9 @@ import {
  * (decoded to its end by ffmpeg, `speech-audio.ts`; a decoding error is `media_audio_corrupt`) and a piece that came back cut (at the provider's mark, or far shorter than its
  * estimate) is split smaller and tried once more — within the call's cap on paid requests, its pieces reserved
  * (budget check again) just before they are sent; cut again is `media_truncated`. Then ffmpeg
- * joins the pieces into one MP3 (stream copy; re-encoded when their streams differ, or at a lower rate when the
- * result passes 50MB), its length is checked against the pieces' sum, and it is stored as one file. Any stop on
+ * joins the pieces into one MP3 (every piece — all of one form — decoded to the same PCM, concatenated, encoded
+ * once; at a lower rate when the result passes 50MB), its exact length is checked against the pieces' summed
+ * samples, and it is stored as one file. Any stop on
  * the way (a failed or refused piece, cancel, a settings change, the call's time budget) stores nothing: the pieces
  * already sent keep their rows (their cost is recorded), the reserved rows of pieces never sent are removed. Every
  * piece is measured (decoded; its length from the decoded samples): without ffmpeg no speech is made at all —
@@ -974,11 +975,15 @@ export class MediaGenerator {
         if (!r.bytes.length || !isMp3(r.bytes)) throw new MediaToolError("media_unsupported_model");
         const file = path.join(workdir, "in", `piece-${String(n++).padStart(3, "0")}.mp3`);
         fs.writeFileSync(file, r.bytes, { flag: "wx", mode: 0o600 });
-        // Decoded to its end (#251 re-plan 2): a decoding error is a corrupt answer — no file, no retry (the cost
+        // Its form checked and its length decoded to the end (#251 re-plans 2–3): a corrupt, unsupported or
+        // abnormally long answer, or one that could not be measured, ends the call — no file, no retry (the cost
         // stays recorded); a clean but short one goes to the re-split below.
-        const m = await audio.measure(file, ctx.signal);
-        if (!m.ok)
-          throw this.stopped(ctx) ?? new MediaToolError(m.corrupt ? "media_audio_corrupt" : "media_failed");
+        const m = await audio.measure(file, { maxSeconds: this.split.pieceMaxSeconds, signal: ctx.signal });
+        if (!m.ok) throw this.stopped(ctx) ?? measuredError(m.reason);
+        // Every piece of one call in one form (they are joined from the same PCM).
+        const form = made[0];
+        if (form && (form.sampleRate !== m.sampleRate || form.channels !== m.channels))
+          throw new MediaToolError("media_audio_unsupported");
         if (looksCut(p.text, m.seconds, this.split)) {
           // Cut by the provider: smaller pieces, once (their rows reserved — and the budget checked — first).
           fs.rmSync(file, { force: true });
@@ -999,7 +1004,14 @@ export class MediaGenerator {
           queue.unshift(...again.map((a) => ({ ...a, retry: true })));
           continue;
         }
-        made.push({ file, bytes: r.bytes, seconds: m.seconds });
+        made.push({
+          file,
+          bytes: r.bytes,
+          seconds: m.seconds,
+          samples: m.samples,
+          sampleRate: m.sampleRate,
+          channels: m.channels,
+        });
         bytesSoFar += r.bytes.length;
       }
       const joined = await this.joined(ctx, made, workdir);
@@ -1031,10 +1043,11 @@ export class MediaGenerator {
   }
 
   /**
-   * The pieces as one MP3 (#248): one piece as it came; several joined by ffmpeg, re-encoded (128 kbit/s mono; over
-   * 50MB once more at 64 kbit/s) — a piece's stream may change even inside it, so stream copy is never assumed safe —
-   * and the result decoded and measured like a piece: about the pieces' summed length (a little per seam: encoder
-   * delay and padding), or nothing is stored.
+   * The pieces as one MP3 (#248): one piece as it came (its form already checked: MPEG Layer III); several joined
+   * by ffmpeg from PCM — each decoded to the same PCM at their one rate, concatenated in order, encoded once (128
+   * kbit/s mono; over 50MB once more at 64 kbit/s) — and the result decoded and measured like a piece: the pieces'
+   * exact summed samples, give or take the encoder's delay and padding (≤ 0.1 s and a little per piece), or nothing
+   * is stored (#251 re-plan 3).
    */
   private async joined(
     ctx: CallCtx,
@@ -1049,16 +1062,20 @@ export class MediaGenerator {
     if (made.length === 1) return { bytes: first.bytes, seconds: round(first.seconds) };
     if (!ctx.alive()) throw new MediaToolError("media_cancelled");
     const files = made.map((m) => m.file);
-    const want = made.reduce((a, m) => a + m.seconds, 0);
+    const sampleRate = first.sampleRate;
+    // The exact sum of the pieces' decoded samples: the joined audio must hold all of it.
+    const want = made.reduce((a, m) => a + m.samples, 0);
     const size = (f: string) => fs.statSync(f).size;
-    let out = await audio.join({ workdir, files, bitrateK: 128 }, ctx.signal);
+    let out = await audio.join({ workdir, files, bitrateK: 128, sampleRate }, ctx.signal);
     if (out && size(out) > FILE_LIMITS.bytes)
-      out = await audio.join({ workdir, files, bitrateK: 64 }, ctx.signal);
+      out = await audio.join({ workdir, files, bitrateK: 64, sampleRate }, ctx.signal);
     if (!out || !size(out) || size(out) > FILE_LIMITS.bytes)
       throw this.stopped(ctx) ?? new MediaToolError("media_failed");
-    const m = await audio.measure(out, ctx.signal);
+    const m = await audio.measure(out, { maxSeconds: (want / sampleRate) * 2 + 60, signal: ctx.signal });
     if (!m.ok) throw this.stopped(ctx) ?? new MediaToolError("media_failed");
-    if (Math.abs(m.seconds - want) > 1 + 0.25 * made.length) throw new MediaToolError("media_failed");
+    // Encoded once: only the encoder's delay and padding may differ (≤ 0.1 s, and a little per seam).
+    if (m.sampleRate !== sampleRate || Math.abs(m.samples - want) > sampleRate * (0.1 + 0.01 * made.length))
+      throw new MediaToolError("media_failed");
     const bytes = fs.readFileSync(out);
     if (!isMp3(bytes)) throw new MediaToolError("media_failed");
     return { bytes, seconds: round(m.seconds) };
@@ -1173,7 +1190,26 @@ const UNSPLITTABLE =
 const TOO_MANY_REQUESTS =
   "음성 조각이 제공자 쪽에서 끊겨 다시 나누면 한 번의 호출에서 보낼 수 있는 요청 수를 넘어 멈췄어요. 파일은 저장하지 않았고, 이미 나간 비용은 기록됐어요. 글을 몇 부분으로 나눠 따로 요청해 주세요.";
 /** A piece's answer: its bytes, and (measured) its file in the working folder and its stream. */
-type Made = { bytes: Buffer; file: string; seconds: number };
+type Made = {
+  bytes: Buffer;
+  file: string;
+  seconds: number;
+  samples: number;
+  sampleRate: number;
+  channels: 1 | 2;
+};
+
+/** A measurement that did not succeed, as the tool's outcome (#251 re-plans 2–3). */
+function measuredError(reason: "corrupt" | "unsupported" | "too_long" | "failed"): MediaToolError {
+  if (reason === "corrupt") return new MediaToolError("media_audio_corrupt");
+  if (reason === "unsupported") return new MediaToolError("media_audio_unsupported");
+  if (reason === "too_long") return new MediaToolError("media_audio_unsupported", ABNORMAL_LENGTH);
+  return new MediaToolError("media_measure_failed");
+}
+
+/** #251 re-plan 3: an answer far longer than any piece can be. */
+const ABNORMAL_LENGTH =
+  "제공자가 보낸 음성이 비정상적으로 길어(조각 하나의 상한을 넘음) 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 관리자에게 알려 주세요.";
 
 /** `20261124-153012` (UTC) for a file name. */
 const stamp = (t: number) => new Date(t).toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
