@@ -43,7 +43,7 @@ import { moderationFor, STRICTNESS, withMediaPolicy } from "./policy.js";
 import { mediaRunKey } from "../usage/store.js";
 import type { MediaSettingsStore } from "./settings.js";
 import { imageSize, stripImage, textRuns } from "./strip.js";
-import { removeSpeechWorkdir, type SpeechAudio } from "./speech-audio.js";
+import { removeSpeechWorkdir, type Measured, type SpeechAudio } from "./speech-audio.js";
 import {
   looksCut,
   resplitSpeech,
@@ -990,11 +990,9 @@ export class MediaGenerator {
         // abnormally long answer, or one that could not be measured, ends the call — no file, no retry (the cost
         // stays recorded); a clean but short one goes to the re-split below. The first answer decoded fixes the
         // call's rate (also when it is cut and not kept); later ones are converted to it.
-        const m = await audio.measure(file, {
-          maxSeconds: this.split.pieceMaxSeconds,
-          sampleRate,
-          signal: ctx.signal,
-        });
+        const m = await measureSafely(() =>
+          audio.measure(file, { maxSeconds: this.split.pieceMaxSeconds, sampleRate, signal: ctx.signal }),
+        );
         if (!m.ok) throw this.stopped(ctx) ?? measuredError(m.reason);
         sampleRate ??= m.sampleRate;
         // The provider's bytes are done with: only the PCM goes on.
@@ -1069,7 +1067,14 @@ export class MediaGenerator {
     const pcms = made.map((m) => m.pcm);
     const sampleRate = first.sampleRate;
     const want = made.reduce((a, m) => a + m.samples, 0);
-    const size = (f: string) => fs.statSync(f).size;
+    const size = (f: string) => {
+      try {
+        return fs.statSync(f).size;
+      } catch {
+        // The working folder failing under us: not measured (no path in what is told).
+        throw new MediaToolError("media_measure_failed");
+      }
+    };
     let out = await audio.encode(
       { workdir, pcms, bitrateK: made.length === 1 ? 192 : 128, sampleRate },
       ctx.signal,
@@ -1080,11 +1085,9 @@ export class MediaGenerator {
       throw this.stopped(ctx) ?? new MediaToolError("media_failed");
     // The pieces' PCM is done with.
     for (const f of pcms) fs.rmSync(f, { force: true });
-    const m = await audio.measure(out, {
-      maxSeconds: (want / sampleRate) * 2 + 60,
-      sampleRate,
-      signal: ctx.signal,
-    });
+    const m = await measureSafely(() =>
+      audio.measure(out, { maxSeconds: (want / sampleRate) * 2 + 60, sampleRate, signal: ctx.signal }),
+    );
     // Not measured: the same outcome (and hint — the cost is recorded) as a piece's; anything else is ours.
     if (!m.ok)
       throw (
@@ -1095,7 +1098,13 @@ export class MediaGenerator {
     // A gross loss only (the encoder's delay and padding are well inside this).
     if (Math.abs(m.samples - want) > sampleRate * (1 + 0.25 * made.length))
       throw new MediaToolError("media_failed");
-    return { bytes: fs.readFileSync(out), seconds: round(m.seconds) };
+    let bytes: Buffer;
+    try {
+      bytes = fs.readFileSync(out);
+    } catch {
+      throw new MediaToolError("media_measure_failed");
+    }
+    return { bytes, seconds: round(m.seconds) };
   }
 
   /**
@@ -1214,13 +1223,30 @@ const TOO_MANY_REQUESTS =
 /** A piece kept: its decoded PCM (in `out/`) and its length at the call's rate. */
 type Made = { pcm: string; seconds: number; samples: number; sampleRate: number };
 
+/**
+ * A measurement whose own file reads fail under it (an I/O error, #251 r13): `media_measure_failed` — never the raw
+ * error, which would name the working folder.
+ */
+async function measureSafely(fn: () => Promise<Measured>): Promise<Measured> {
+  try {
+    return await fn();
+  } catch {
+    return { ok: false, reason: "failed" };
+  }
+}
+
 /** A measurement that did not succeed, as the tool's outcome (#251 re-plans 2–3). */
-function measuredError(reason: "corrupt" | "unsupported" | "too_long" | "failed"): MediaToolError {
+function measuredError(reason: "corrupt" | "unsupported" | "too_long" | "failed" | "lost"): MediaToolError {
   if (reason === "corrupt") return new MediaToolError("media_audio_corrupt");
   if (reason === "unsupported") return new MediaToolError("media_audio_unsupported");
+  if (reason === "lost") return new MediaToolError("media_audio_unsupported", CONVERSION_LOST);
   if (reason === "too_long") return new MediaToolError("media_audio_unsupported", ABNORMAL_LENGTH);
   return new MediaToolError("media_measure_failed");
 }
+
+/** #251 r13: an answer whose audio was lost converting it to the call's rate (not its format). */
+const CONVERSION_LOST =
+  "제공자가 보낸 음성의 표본율이 중간에 바뀌어, 변환하는 동안 음성 일부가 사라져 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 관리자에게 알려 주세요.";
 
 /** #251 re-plan 3: an answer far longer than any piece can be. */
 const ABNORMAL_LENGTH =

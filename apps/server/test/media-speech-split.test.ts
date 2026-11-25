@@ -40,7 +40,6 @@ import {
   sweepSpeechScratch,
   type SpeechAudio,
 } from "../src/media/speech-audio.js";
-import { headerSeconds } from "../src/media/mp3-length.js";
 import {
   looksCut,
   resplitSpeech,
@@ -1574,7 +1573,7 @@ describe("speech_generate: review rounds 5–6 re-plans — one form, exact deco
       await scripted(lost, { code: 0, stdout: at441 }).measure(file, { ...M, sampleRate: 8000 }),
     ).toEqual({
       ok: false,
-      reason: "unsupported",
+      reason: "lost",
     });
     const kept = { code: 0, samplesAt: { 8000: 8000 * 100 - 3, 44100: 44100 * 100 } };
     expect(
@@ -1685,34 +1684,33 @@ describe("speech_generate: review rounds 5–6 re-plans — one form, exact deco
     expect(t.scratch()).toEqual([]);
   });
 
-  it("#251 r12: the frame headers' own length — every frame at its own rate; tags and frame data not read", () => {
-    const frames = (n: number) => Array.from({ length: n }, () => mp3Frame(9));
-    // 200 frames at 22.05 kHz then 100 at 44.1 kHz: each at its own rate.
-    const mixed = Buffer.concat([...Array.from({ length: 200 }, () => mp3Frame22(8)), ...frames(100)]);
-    expect(headerSeconds(mixed)).toBeCloseTo((200 * 576) / 22050 + (100 * 1152) / 44100, 9);
-    // Tags around the frames (ID3v2 skipped by its size; APEv2, ID3v1, junk) add nothing.
-    const cbr = Buffer.concat(frames(30));
-    const want = (30 * 1152) / 44100;
-    const ape = Buffer.concat([
-      Buffer.from("APETAGEX", "latin1"),
-      Buffer.alloc(24),
-      Buffer.from("Title\0x", "latin1"),
-    ]);
-    const id3v1 = Buffer.alloc(128);
-    id3v1.write("TAG", 0, "latin1");
-    for (const tail of [ape, Buffer.concat([ape, id3v1]), id3v1, Buffer.from("junk")])
-      expect(headerSeconds(Buffer.concat([cbr, tail]))).toBeCloseTo(want, 9);
-    expect(headerSeconds(Buffer.concat([ape, cbr]))).toBeCloseTo(want, 9);
-    expect(headerSeconds(silentMp3(30))).toBeCloseTo(want, 9);
-    // Header-like bytes inside a frame's data are never read as a frame.
-    const trap = mp3Frame(9);
-    trap.set([0xff, 0xfb, 0x90, 0x64], 100);
-    expect(headerSeconds(Buffer.concat([...frames(3), trap, ...frames(3)]))).toBeCloseTo(
-      (7 * 1152) / 44100,
-      9,
-    );
-    // A walk that cannot follow (no frames at all) counts nothing — it can only make a file look longer decoded.
-    expect(headerSeconds(Buffer.from("not audio"))).toBe(0);
+  it("#251 r13: a measurement whose file reads fail under it is media_measure_failed — no path in what is told", async () => {
+    let dataDir = "";
+    const fake = fakeAudio(() => dataDir);
+    const failing: SpeechAudio = {
+      ...fake.audio,
+      measure: async () => {
+        throw new Error(`EIO: i/o error, read '${dataDir}/speech-scratch/x/in/piece-000.mp3'`);
+      },
+    };
+    const t = await start({ audio: failing });
+    dataDir = t.dataDir;
+    const r = await t.speak({ text: SENTENCES[0]! });
+    expect(r).toMatchObject({ ok: false, code: "media_measure_failed" });
+    expect(JSON.stringify(r)).not.toContain(dataDir);
+    expect(t.rows()).toEqual([expect.objectContaining({ cost_usd: PIECE_COST })]);
+  });
+
+  it("#251 r13: audio lost in conversion is told apart from a format not taken", async () => {
+    let dataDir = "";
+    const fake = fakeAudio(() => dataDir);
+    const lossy: SpeechAudio = { ...fake.audio, measure: async () => ({ ok: false, reason: "lost" }) };
+    const t = await start({ audio: lossy });
+    dataDir = t.dataDir;
+    const r = await t.speak({ text: SENTENCES[0]! });
+    expect(r).toMatchObject({ ok: false, code: "media_audio_unsupported" });
+    expect(!r.ok && r.hint).toMatch(/변환하는 동안/);
+    expect(!r.ok && r.hint).not.toMatch(/형식이 이 서버가 받는 형식/);
   });
 
   it("estimates and limits compare in whole microseconds: 20 s exactly is 20 s, whatever the classes", () => {
@@ -2396,7 +2394,7 @@ describe("speech_generate: the real sandboxed ffmpeg (#248, macOS)", () => {
       // …converted to an 8 kHz call it loses audio at the rate changes: refused, never judged on the shorter length.
       expect(await audio.measure(put(long), { ...M, sampleRate: 8000 })).toEqual({
         ok: false,
-        reason: "unsupported",
+        reason: "lost",
       });
     },
   );
@@ -2428,7 +2426,7 @@ describe("speech_generate: the real sandboxed ffmpeg (#248, macOS)", () => {
       // In an 8 kHz call: compared with an independent decode, the loss converting across its rate changes shows.
       expect(await audio.measure(put(prefixed), { ...M, sampleRate: 8000 })).toEqual({
         ok: false,
-        reason: "unsupported",
+        reason: "lost",
       });
       // As a call's first answer (its stream rate is the call's): two decodes agree and its full length is judged —
       // past the mark (re-split in a call), never the shortened one.
@@ -2438,60 +2436,6 @@ describe("speech_generate: the real sandboxed ffmpeg (#248, macOS)", () => {
       const clean = await audio.measure(put(at(8000, 20)), M);
       // (No length header here: the encoder's delay and padding stay in, ~0.16 s.)
       expect(clean.ok && Math.abs(clean.seconds - 20)).toBeLessThan(0.3);
-    },
-  );
-
-  realIt(
-    "#251 r12: a 48 kHz start then frames alternating 8/16 kHz: both decodes lose the same audio — unsupported",
-    async () => {
-      const { audio, put } = bench();
-      // One self-contained frame (no bit reservoir) of a tone at `rate`, 64 kbit/s.
-      const frameOf = (rate: number) => {
-        const b = encode([
-          "-f",
-          "lavfi",
-          "-i",
-          `sine=r=${rate}:f=440:d=2`,
-          "-c:a",
-          "libmp3lame",
-          "-b:a",
-          "64k",
-          "-reservoir",
-          "0",
-          "-write_xing",
-          "0",
-          "-id3v2_version",
-          "0",
-          "-f",
-          "mp3",
-        ]);
-        const f = fixtureMp3Frames(b)[19]!;
-        return b.subarray(f.start, f.end);
-      };
-      const prefix = encode([
-        "-f",
-        "lavfi",
-        "-i",
-        "sine=r=48000:f=300:d=2",
-        "-c:a",
-        "libmp3lame",
-        "-b:a",
-        "64k",
-        "-reservoir",
-        "0",
-        "-write_xing",
-        "0",
-        "-id3v2_version",
-        "0",
-        "-f",
-        "mp3",
-      ]);
-      const n = Math.round(288 / (576 / 8000 + 576 / 16000));
-      const pair = Buffer.concat([frameOf(8000), frameOf(16000)]);
-      const lossy = Buffer.concat([prefix, ...Array.from({ length: n }, () => pair)]);
-      // Its headers hold ~290 s; decoding (at any rate) plays several seconds less.
-      expect(headerSeconds(lossy)).toBeGreaterThan(285);
-      expect(await audio.measure(put(lossy), M)).toEqual({ ok: false, reason: "unsupported" });
     },
   );
 
@@ -2521,6 +2465,62 @@ describe("speech_generate: the real sandboxed ffmpeg (#248, macOS)", () => {
           if (m.ok) fs.rmSync(m.pcm, { force: true });
         }
       expect(refused).toEqual([]);
+    },
+  );
+
+  realIt(
+    "#251 r13: a valid MP3 with a large encoder delay and padding is taken at its decoded length (7.208 s)",
+    async () => {
+      const { audio, put } = bench();
+      // 8 kHz mono; its start delay and end padding (4,529 and 3,471 samples) recorded by ffmpeg's MP3 muxer.
+      const gap = fs.readFileSync(path.join(import.meta.dirname, "fixtures", "speech", "gap-valid.mp3"));
+      const m = await audio.measure(put(gap), M);
+      expect(m.ok && m.seconds).toBeCloseTo(7.208, 3);
+    },
+  );
+
+  realIt(
+    "#251 r13: an ID3v2 update tag carrying another MP3 is metadata — the same length as with one tag",
+    async () => {
+      const { audio, put } = bench();
+      const sz = (n: number) => Buffer.from([(n >> 21) & 127, (n >> 14) & 127, (n >> 7) & 127, n & 127]);
+      const base = encode([
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:duration=8:sample_rate=44100",
+        "-ac",
+        "1",
+        "-c:a",
+        "libmp3lame",
+      ]);
+      // Where its audio frames start (after ffmpeg's own ID3v2 tag).
+      const first = fixtureMp3Frames(base)[0]!.start;
+      const preview = Buffer.concat([Buffer.from("\x03audio/mpeg\0sample.mp3\0preview\0", "latin1"), base]);
+      const geob = Buffer.concat([
+        Buffer.from("GEOB", "latin1"),
+        sz(preview.length),
+        Buffer.from([0, 0]),
+        preview,
+      ]);
+      const single = Buffer.concat([
+        Buffer.from([0x49, 0x44, 0x33, 4, 0, 0]),
+        sz(geob.length),
+        geob,
+        base.subarray(first),
+      ]);
+      const update = Buffer.concat([
+        Buffer.from([0x49, 0x44, 0x33, 4, 0, 0x40]),
+        sz(geob.length + 7),
+        sz(7),
+        Buffer.from([1, 0x40, 0]),
+        geob,
+      ]);
+      const double = Buffer.concat([base.subarray(0, first), update, base.subarray(first)]);
+      const one = await audio.measure(put(single), M);
+      const two = await audio.measure(put(double), M);
+      expect(one.ok && one.samples).toBeGreaterThan(0);
+      expect(two.ok && two.samples).toBe(one.ok && one.samples);
     },
   );
 

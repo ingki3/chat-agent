@@ -4,7 +4,6 @@ import path from "node:path";
 import { z } from "zod";
 import { FILE_LIMITS, MEDIA_TOOL_LIMITS } from "@agentlee/shared";
 import { ffmpegOf, type Ffmpeg } from "../audio/packages.js";
-import { headerSeconds } from "./mp3-length.js";
 import { runIsolated, type RunIsolatedOptions, type RunResult } from "../isolation/sandbox.js";
 import { removeTree } from "../python/service.js";
 import { storagePaths } from "../storage/paths.js";
@@ -34,7 +33,8 @@ import { storagePaths } from "../storage/paths.js";
 /** A measurement: the decoded PCM (`pcm`, in `out/`) and its length, or why there is none. */
 export type Measured =
   | { ok: true; seconds: number; samples: number; sampleRate: number; pcm: string }
-  | { ok: false; reason: "corrupt" | "unsupported" | "too_long" | "failed" };
+  /** `lost`: audio lost converting it to the call's rate (two decodes disagree). */
+  | { ok: false; reason: "corrupt" | "unsupported" | "too_long" | "failed" | "lost" };
 
 export type SpeechAudio = {
   /** A fresh, owner-only working folder with `in/` and `out/` (the caller removes it: `removeSpeechWorkdir`). */
@@ -59,12 +59,6 @@ export type SpeechAudio = {
  * encoder's and resampler's edges are a few milliseconds; more is audio lost across rate changes inside it).
  */
 export const CONVERSION_TOLERANCE_S = 0.25;
-
-/**
- * #251 r12: how much longer the frame headers' own length (`headerSeconds`) may be than the decoded length before
- * the answer counts as having lost audio in decoding (normal files: ≤ ~0.22 s at 8 kHz, less at higher rates).
- */
-export const HEADER_LOSS_S = 1;
 
 export const SPEECH_AUDIO_LIMITS = {
   measureTimeoutMs: MEDIA_TOOL_LIMITS.speechMeasureTimeoutMs,
@@ -448,20 +442,12 @@ export function sandboxedSpeechAudio(o: {
       const otherSeconds = other.samples / reference;
       if (Math.abs(otherSeconds - seconds) > CONVERSION_TOLERANCE_S) {
         fs.rmSync(d.pcm, { force: true });
-        return { ok: false, reason: "unsupported" };
+        return { ok: false, reason: "lost" };
       }
       if (sampleRate !== gate.sampleRate) seconds = otherSeconds;
       if (seconds > m.maxSeconds) {
         fs.rmSync(d.pcm, { force: true });
         return { ok: false, reason: "too_long" };
-      }
-      // One-directional cross-check (#251 r12; after the cap — a decode cut at the cap is too long, not lost): both
-      // decodes resample, and can lose the same audio at frames that change rate. What the frames' own headers hold
-      // is never less than what decoding plays (by the encoder's delay and padding, ~0.2 s at most), and a walk that
-      // misses frames only counts less — so only "far more in the headers than decoded" refuses, as audio lost.
-      if (headerSeconds(fs.readFileSync(file)) - seconds > HEADER_LOSS_S) {
-        fs.rmSync(d.pcm, { force: true });
-        return { ok: false, reason: "unsupported" };
       }
       return { ok: true, samples: d.samples, seconds, sampleRate, pcm: d.pcm };
     },
