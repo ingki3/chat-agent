@@ -974,9 +974,9 @@ export class MediaGenerator {
         const r = await this.piece(ctx, p, plan.body, left);
         costs.push(r.cost);
         if (!r.bytes) throw new MediaToolError("media_failed");
-        // A paid answer that is not MP3 (WAV, …) from a model that passed the planning check: the answer's form,
-        // not the model's settings (#251 r7) — like any other unsupported answer.
-        if (!r.bytes.length || !isMp3(r.bytes)) throw new MediaToolError("media_audio_unsupported");
+        // Empty: nothing to judge. Otherwise the answer's form is the decoder's verdict below (#251 re-plan 4 — no
+        // byte sniffing of our own: a WAV or MP2 answer, or a leading tag, is for the decoder to report).
+        if (!r.bytes.length) throw new MediaToolError("media_audio_unsupported");
         const file = path.join(workdir, "in", `piece-${String(n++).padStart(3, "0")}.mp3`);
         fs.writeFileSync(file, r.bytes, { flag: "wx", mode: 0o600 });
         // Its form checked and its length decoded to the end (#251 re-plans 2–3): a corrupt, unsupported or
@@ -1085,9 +1085,8 @@ export class MediaGenerator {
     // A gross loss only (#251 r7: the encoder's delay and padding, and decoders' own rounding, are well inside this).
     if (m.sampleRate !== sampleRate || Math.abs(m.samples - want) > sampleRate * (1 + 0.25 * made.length))
       throw new MediaToolError("media_failed");
-    const bytes = fs.readFileSync(out);
-    if (!isMp3(bytes)) throw new MediaToolError("media_failed");
-    return { bytes, seconds: round(m.seconds) };
+    // Our own encode, measured above as one mp3 stream.
+    return { bytes: fs.readFileSync(out), seconds: round(m.seconds) };
   }
 
   /**

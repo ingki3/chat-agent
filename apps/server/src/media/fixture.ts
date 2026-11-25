@@ -9,7 +9,6 @@ import {
   OPENROUTER_SPEECH_URL,
   SPEECH_PRICING_URL,
 } from "./openrouter.js";
-import { walkMp3 } from "./mp3.js";
 import { makeSpeechWorkdir, type Measured, type SpeechAudio } from "./speech-audio.js";
 
 /**
@@ -223,16 +222,64 @@ export function fixtureOpenRouterFetch(): typeof fetch {
   }) as typeof fetch;
 }
 
-/** In a scripted answer: makes the scripted decoder fail on it (a corrupt MP3, as `-xerror` would stop on). */
+/** In a scripted answer: makes the scripted decoder fail on it (a corrupt MP3, as the strict decode would). */
 export const FIXTURE_CORRUPT_MARK = "FIXTURE-CORRUPT";
 
+/** Layer III bit rates (kbit/s) by index (MPEG-1, then MPEG-2/2.5) and sample rates by version. */
+const KBPS_V1 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+const KBPS_V2 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+const RATES: Record<number, readonly number[]> = {
+  3: [44100, 48000, 32000],
+  2: [22050, 24000, 16000],
+  0: [11025, 12000, 8000],
+};
+
 /**
- * A scripted ffmpeg (measure, join) for the FAKE_RUNTIME (e2e) server and tests, with the real one's semantics
- * (#251 re-plans 2–3, r7): the same form check over the whole file (`walkMp3` — the real code; tags and other bytes
- * stepped over), then the length as what decoding would play (the audio frames × samples per frame; the real decoder
- * also takes the encoder's delay and padding off), `corrupt` only for `FIXTURE_CORRUPT_MARK` (the real one: only the
- * strict decoder says so), `too_long` over the cap. The join is the pieces' audio frames
- * one after another. No program runs. Working folders as the real one's.
+ * The fake's own model of an MP3 (test and FAKE_RUNTIME only — production asks the decoder, `speech-audio.ts`): its
+ * MPEG audio frames, walked one after another from the start (after an ID3v2 tag) until something is not a frame.
+ * Each frame's layer, rate and channel count; `samples` per frame (1152 MPEG-1, 576 MPEG-2/2.5, Layer III). It does
+ * not care about Xing/Info frames (they count as audio here) — the real decoder's exact trimming is not modelled.
+ */
+export function fixtureMp3Frames(
+  b: Buffer,
+): { start: number; end: number; layer: number; rate: number; channels: 1 | 2; samples: number }[] {
+  let p = 0;
+  if (b.length >= 10 && b.toString("latin1", 0, 3) === "ID3")
+    p = 10 + (((b[6]! & 0x7f) << 21) | ((b[7]! & 0x7f) << 14) | ((b[8]! & 0x7f) << 7) | (b[9]! & 0x7f));
+  const out: { start: number; end: number; layer: number; rate: number; channels: 1 | 2; samples: number }[] =
+    [];
+  while (p + 4 <= b.length) {
+    if (b[p] !== 0xff || (b[p + 1]! & 0xe0) !== 0xe0) break;
+    const version = (b[p + 1]! >> 3) & 3;
+    const layer = (b[p + 1]! >> 1) & 3;
+    const bi = (b[p + 2]! >> 4) & 15;
+    const si = (b[p + 2]! >> 2) & 3;
+    if (version === 1 || layer === 0 || bi === 0 || bi === 15 || si === 3) break;
+    const rate = RATES[version]![si]!;
+    const v1 = version === 3;
+    const kbps = (v1 ? KBPS_V1 : KBPS_V2)[bi]!;
+    // (Layer I/II lengths are not modelled: such a frame is taken with the Layer III length — enough to report it.)
+    const len = Math.floor(((v1 ? 144 : 72) * kbps * 1000) / rate) + ((b[p + 2]! >> 1) & 1);
+    if (p + len > b.length) break;
+    out.push({
+      start: p,
+      end: p + len,
+      layer,
+      rate,
+      channels: ((b[p + 3]! >> 6) & 3) === 3 ? 1 : 2,
+      samples: v1 ? 1152 : 576,
+    });
+    p += len;
+  }
+  return out;
+}
+
+/**
+ * A scripted ffmpeg/ffprobe (measure, join) for the FAKE_RUNTIME (e2e) server and tests, with the real one's
+ * semantics (#251 re-plan 4) on its own small model (`fixtureMp3Frames`): `corrupt` for `FIXTURE_CORRUPT_MARK`;
+ * `unsupported` unless every frame is Layer III at one rate and channel count; the length is the frames' samples;
+ * `too_long` over the cap. The join is the pieces' frames one after another. No program runs. Working folders as the
+ * real one's.
  */
 export function fixtureSpeechAudio(dataDir: string): SpeechAudio {
   let joins = 0;
@@ -240,27 +287,31 @@ export function fixtureSpeechAudio(dataDir: string): SpeechAudio {
     workdir: () => makeSpeechWorkdir(dataDir),
     async measure(file, m): Promise<Measured> {
       const b = fs.readFileSync(file);
-      const walk = walkMp3(b);
-      if (!walk.ok) return { ok: false, reason: "unsupported" };
       if (b.includes(FIXTURE_CORRUPT_MARK, 0, "latin1")) return { ok: false, reason: "corrupt" };
-      // What decoding would play: the audio frames (a leading Xing/Info frame holds none).
-      const samples = walk.frames.filter((f) => !f.info).length * walk.samplesPerFrame;
-      if (samples > m.maxSeconds * walk.sampleRate) return { ok: false, reason: "too_long" };
+      const frames = fixtureMp3Frames(b);
+      const first = frames[0];
+      if (
+        !first ||
+        frames.some((f) => f.layer !== 1 || f.rate !== first.rate || f.channels !== first.channels)
+      )
+        return { ok: false, reason: "unsupported" };
+      const samples = frames.reduce((a, f) => a + f.samples, 0);
+      if (samples > m.maxSeconds * first.rate) return { ok: false, reason: "too_long" };
       return {
         ok: true,
         samples,
-        seconds: samples / walk.sampleRate,
-        sampleRate: walk.sampleRate,
-        channels: walk.channels,
+        seconds: samples / first.rate,
+        sampleRate: first.rate,
+        channels: first.channels,
       };
     },
     async join(job) {
       const parts: Buffer[] = [];
       for (const file of job.files) {
         const b = fs.readFileSync(file);
-        const walk = walkMp3(b);
-        if (!walk.ok) return undefined;
-        for (const fr of walk.frames) if (!fr.info) parts.push(b.subarray(fr.start, fr.end));
+        const frames = fixtureMp3Frames(b);
+        if (!frames.length) return undefined;
+        for (const fr of frames) parts.push(b.subarray(fr.start, fr.end));
       }
       const out = path.join(job.workdir, "out", `speech-${++joins}.mp3`);
       fs.writeFileSync(out, Buffer.concat(parts), { mode: 0o600 });

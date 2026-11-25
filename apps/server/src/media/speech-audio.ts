@@ -1,31 +1,34 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { z } from "zod";
 import { FILE_LIMITS, MEDIA_TOOL_LIMITS } from "@agentlee/shared";
 import { ffmpegOf, type Ffmpeg } from "../audio/packages.js";
-import { walkMp3 } from "./mp3.js";
 import { runIsolated, type RunIsolatedOptions, type RunResult } from "../isolation/sandbox.js";
 import { removeTree } from "../python/service.js";
 import { storagePaths } from "../storage/paths.js";
 
 /**
  * The audio side of a long `speech_generate` (#248): every piece's MP3 is checked and measured, and the pieces are
- * joined into one MP3, by `audio_transcribe`'s ffmpeg (`AUDIO_FFMPEG`, default Homebrew's — `ffmpegOf`, ops §46),
- * each run as its own sandboxed process group (`runIsolated`, #42): no network, no child processes, a fixed
- * environment, a time, memory and output limit; it reads only the call's folders. Without it (not macOS, no ffmpeg)
- * there is no `SpeechAudio`, and no speech is made at all (`media_audio_unavailable`, before anything is paid).
+ * joined into one MP3, by `audio_transcribe`'s ffmpeg (`AUDIO_FFMPEG`, default Homebrew's — `ffmpegOf`, ops §46) and
+ * the ffprobe beside it, each run as its own sandboxed process group (`runIsolated`, #42): no network, no child
+ * processes, a fixed environment, a time, memory and output limit; it reads only the call's folders. Without them
+ * (not macOS, no ffmpeg/ffprobe) there is no `SpeechAudio`, and no speech is made at all (`media_audio_unavailable`,
+ * before anything is paid).
  *
- * **What is taken, and how it is measured (#251 re-plan 3, narrowed in r7):**
- * 1. the form, over the whole file, in this process (`mp3.ts`): MPEG Layer III with one sample rate and one channel
- *    count — else `unsupported` (another layer, a rate or channel change, not MPEG audio at all). A form check only:
- *    tags and other bytes are stepped over, never called corrupt;
- * 2. the length and the integrity, by ffmpeg alone: it decodes the whole file at its own rate — no resampling, no
- *    cut-off before its end — strictly (`-xerror -err_detect explode`: the first decoding error stops it, or an
- *    error-level line: `corrupt`), into the null muxer, and `astats` sums the **decoded samples** (`Number of
- *    samples`, an integer — no clock is converted). Over the cap (`maxSeconds`, by those samples) is `too_long`. No
- *    PCM is stored; the output is a few log lines;
- * 3. a run that could not be done (no sandbox, a spawn failure, out of memory, a time or memory limit, a signal, no
- *    sample count reported) is `failed` — never `corrupt`.
+ * **How an answer is judged (#251 re-plan 4 — nothing of our own interprets audio bytes or log text):**
+ * 1. integrity, from the strict decoder's **exit status only**: ffmpeg decodes the whole file (`-xerror -err_detect
+ *    explode`, into the null muxer). Exit 0: clean. A run that did not really run — the runner failing to start it,
+ *    a kill or time/memory/output limit, a signal, or an exit status that means one (sandbox-exec 71, 126, 127,
+ *    ENOMEM 244, ffmpeg's own "received a signal" 255) — is `failed`; any other exit status is `corrupt`. Its log is
+ *    never read;
+ * 2. form and length, from what the decoder reports per frame: ffprobe decodes the file again and lists, as JSON,
+ *    every stream (type, codec, attached-picture flag) and every decoded audio frame (channels, `nb_samples`, and its
+ *    duration in the stream's time base — the frame's own rate is `nb_samples ÷ duration`). Taken: exactly one audio
+ *    stream, codec `mp3`, no other stream but attached pictures, every frame at one rate and one channel count.
+ *    Anything else is `unsupported`. The length is the integer sum of `nb_samples` — decoded samples, with the
+ *    encoder's delay and padding already taken off by the decoder (as ffmpeg plays it). Over `maxSeconds` is
+ *    `too_long`. The report is bounded (`probeOutputBytes`); one that does not read as that structure is `failed`.
  *
  * The join (`join`): the pieces — all of one form (the caller checks) — each decoded to the same PCM inside one
  * ffmpeg (`aformat` s16 mono at their own rate), concatenated in order (`concat` filter) and encoded once.
@@ -141,22 +144,33 @@ export function sweepSpeechScratch(dataDir: string): boolean {
   return ok;
 }
 
-/** ffmpeg as `audio_transcribe` finds it (macOS only — the sandbox); undefined without it. */
+/** ffmpeg as `audio_transcribe` finds it and the ffprobe beside it (macOS only — the sandbox); undefined without. */
 export function speechTools(
   configured: string | undefined,
   dataDir: string,
   platform: NodeJS.Platform = process.platform,
-): { ffmpeg: Ffmpeg } | undefined {
+): { ffmpeg: Ffmpeg; ffprobe: string } | undefined {
   // The sandbox is macOS only (runIsolated fails closed elsewhere).
   if (platform !== "darwin") return undefined;
   const ff = ffmpegOf(configured, dataDir);
-  return ff.ok ? { ffmpeg: ff.ffmpeg } : undefined;
+  if (!ff.ok) return undefined;
+  let probe: string;
+  try {
+    probe = fs.realpathSync.native(path.join(path.dirname(ff.ffmpeg.exe), "ffprobe"));
+  } catch {
+    return undefined;
+  }
+  const st = fs.statSync(probe, { throwIfNoEntry: false });
+  if (!st?.isFile() || (st.mode & 0o111) === 0) return undefined;
+  // It must load its libraries from the same read-only program folders.
+  if (!ff.ffmpeg.trusted.some((t) => probe.startsWith(t + path.sep))) return undefined;
+  return { ffmpeg: ff.ffmpeg, ffprobe: probe };
 }
 
 const PIECE = /^piece-\d{3}\.mp3$/;
 
-/** The ffmpeg run that decodes one file to its end to measure it (exported for the profile tests). */
-export function measureOptions(tools: { ffmpeg: Ffmpeg }, file: string): RunIsolatedOptions {
+/** The strict ffmpeg decode of one whole file — its exit status is the integrity verdict (exported for tests). */
+export function decodeOptions(tools: { ffmpeg: Ffmpeg }, file: string): RunIsolatedOptions {
   const dir = path.dirname(file);
   return {
     command: tools.ffmpeg.exe,
@@ -164,16 +178,12 @@ export function measureOptions(tools: { ffmpeg: Ffmpeg }, file: string): RunIsol
       "-nostdin",
       "-hide_banner",
       "-nostats",
-      // Info level, each line tagged with its level: the sample count is an info line, an error an `[error]` one.
-      "-loglevel",
-      "level+info",
-      // The first decoding error stops the run (exit ≠ 0): the file is corrupt.
+      "-v",
+      "error",
+      // The first decoding error stops the run with a non-zero exit status.
       "-xerror",
       "-err_detect",
       "explode",
-      // MP3 only — never probed as something else.
-      "-f",
-      "mp3",
       "-i",
       file,
       "-map",
@@ -181,9 +191,6 @@ export function measureOptions(tools: { ffmpeg: Ffmpeg }, file: string): RunIsol
       "-vn",
       "-sn",
       "-dn",
-      // Decoded at its own rate (no `-ar`), to its end (no `-t`), into nothing; `astats` counts the decoded samples.
-      "-af",
-      "astats=measure_perchannel=none:measure_overall=Number_of_samples",
       "-f",
       "null",
       "-",
@@ -198,6 +205,41 @@ export function measureOptions(tools: { ffmpeg: Ffmpeg }, file: string): RunIsol
     timeoutMs: SPEECH_AUDIO_LIMITS.measureTimeoutMs,
     maxRssBytes: SPEECH_AUDIO_LIMITS.memoryBytes,
     maxOutputBytes: 256 * 1024,
+  };
+}
+
+/** The bound of ffprobe's report for `maxSeconds` of audio: 50 frames a second at 100 bytes each, and some room. */
+export const probeOutputBytes = (maxSeconds: number): number => Math.ceil(maxSeconds * 50 * 100) + 256 * 1024;
+
+/** The ffprobe run that reports the streams and every decoded audio frame (exported for tests). */
+export function probeOptions(
+  tools: { ffmpeg: Ffmpeg; ffprobe: string },
+  file: string,
+  maxSeconds: number,
+): RunIsolatedOptions {
+  const dir = path.dirname(file);
+  return {
+    command: tools.ffprobe,
+    args: [
+      "-v",
+      "error",
+      "-hide_banner",
+      "-show_entries",
+      "stream=index,codec_type,codec_name,sample_rate,time_base:stream_disposition=attached_pic:frame=stream_index,channels,nb_samples,duration",
+      "-of",
+      "json=c=1",
+      file,
+    ],
+    cwd: dir,
+    env: { HOME: dir, LANG: "en_US.UTF-8" },
+    read: [dir],
+    write: [],
+    trusted: tools.ffmpeg.trusted,
+    network: "none",
+    noFlagChanges: true,
+    timeoutMs: SPEECH_AUDIO_LIMITS.measureTimeoutMs,
+    maxRssBytes: SPEECH_AUDIO_LIMITS.memoryBytes,
+    maxOutputBytes: probeOutputBytes(maxSeconds),
   };
 }
 
@@ -255,37 +297,91 @@ export function joinOptions(
 }
 
 /**
- * The decoded samples (per channel) `astats` reported at the end of the run: its one `Number of samples:` line.
- * Undefined when there is none, or more than one (not a single audio stream measured).
+ * The integrity verdict of a finished strict decode, from its exit status and the runner's own report only (never
+ * its log): clean (`ok`); `failed` when it did not really run — not started, killed by a limit or the caller, a
+ * signal, or an exit status that means one of those (sandbox-exec 71, 126 cannot execute, 127 not found, 244 ENOMEM,
+ * 255 ffmpeg's "received a signal"); `corrupt` for any other non-zero status (the decoder stopped on the audio).
  */
-export function decodedSamples(stderr: string): number | undefined {
-  const all = [...stderr.matchAll(/\[Parsed_astats_\d+ @ [^\]]*\] \[info\] Number of samples: (\d+)\s*$/gmu)];
-  return all.length === 1 ? Number(all[0]![1]) : undefined;
+export function decodeVerdict(
+  r: { code: number | null; signal?: NodeJS.Signals | null; killed?: unknown } | undefined,
+): "ok" | "failed" | "corrupt" {
+  if (!r || r.killed || r.signal || r.code === null) return "failed";
+  if (r.code === 0) return "ok";
+  if ([71, 126, 127, 244, 255].includes(r.code)) return "failed";
+  return "corrupt";
 }
 
-/** Whether the run logged an error (or worse) — the strict decoder's verdict. */
-const loggedError = (stderr: string): boolean => /\[(?:error|fatal|panic)\]/u.test(stderr);
+const Probe = z.object({
+  streams: z
+    .array(
+      z.object({
+        index: z.number().int().min(0),
+        codec_type: z.string().max(40).optional(),
+        codec_name: z.string().max(40).optional(),
+        sample_rate: z.coerce.number().int().positive().optional(),
+        time_base: z
+          .string()
+          .regex(/^\d{1,12}\/\d{1,12}$/)
+          .optional(),
+        disposition: z.object({ attached_pic: z.number().int() }).partial().optional(),
+      }),
+    )
+    .max(16),
+  frames: z
+    .array(
+      z.object({
+        stream_index: z.number().int().min(0),
+        channels: z.number().int().min(0).max(8).optional(),
+        nb_samples: z.number().int().min(0).optional(),
+        duration: z.number().int().min(0).optional(),
+      }),
+    )
+    .optional(),
+});
 
 /**
- * A finished measuring run that did not succeed, classified: the sandbox or the program not starting (sandbox-exec
- * refusing, exit 71/126/127), the file not opening, the machine out of memory (ENOMEM, ffmpeg's exit 244) or a
- * signal is `failed` (nothing was learnt about the audio); any other error — the strict decoder stopping — is
- * `corrupt`.
+ * ffprobe's report judged (exported for tests): the one form taken — one audio stream, `mp3`, nothing else but
+ * attached pictures, every decoded frame at the stream's rate (`nb_samples ÷ duration` in its time base) and at
+ * one channel count — and its decoded samples summed. `failed` when the report is not that structure.
  */
-export function measureFailure(r: {
-  code: number | null;
-  signal?: NodeJS.Signals | null;
-  stderr: string;
-}): "failed" | "corrupt" {
-  if (r.signal || r.code === null) return "failed";
-  if (r.code === 71 || r.code === 126 || r.code === 127 || r.code === 244) return "failed";
-  if (
-    /sandbox|Operation not permitted|Permission denied|No such file|exec|Cannot allocate memory|ENOMEM/iu.test(
-      r.stderr,
-    )
-  )
-    return "failed";
-  return "corrupt";
+export function judgeProbe(
+  stdout: string,
+):
+  | { ok: true; samples: number; sampleRate: number; channels: 1 | 2 }
+  | { ok: false; reason: "unsupported" | "failed" } {
+  let parsed: z.infer<typeof Probe>;
+  try {
+    const p = Probe.safeParse(JSON.parse(stdout));
+    if (!p.success) return { ok: false, reason: "failed" };
+    parsed = p.data;
+  } catch {
+    return { ok: false, reason: "failed" };
+  }
+  const audio = parsed.streams.filter((st) => st.codec_type === "audio");
+  const others = parsed.streams.filter(
+    (st) => st.codec_type !== "audio" && !(st.codec_type === "video" && st.disposition?.attached_pic === 1),
+  );
+  if (audio.length !== 1 || others.length) return { ok: false, reason: "unsupported" };
+  const a = audio[0]!;
+  if (a.codec_name !== "mp3") return { ok: false, reason: "unsupported" };
+  if (!a.sample_rate || !a.time_base) return { ok: false, reason: "failed" };
+  const [num, den] = a.time_base.split("/").map(Number) as [number, number];
+  if (!num || !den) return { ok: false, reason: "failed" };
+  const frames = (parsed.frames ?? []).filter((f) => f.stream_index === a.index);
+  let samples = 0;
+  let channels: number | undefined;
+  for (const f of frames) {
+    if (f.nb_samples === undefined || f.channels === undefined || f.duration === undefined)
+      return { ok: false, reason: "failed" };
+    if (f.nb_samples === 0) continue;
+    // The frame's own rate, exactly: nb_samples = rate × duration × num ÷ den.
+    if (f.nb_samples * den !== a.sample_rate * f.duration * num) return { ok: false, reason: "unsupported" };
+    if (channels === undefined) channels = f.channels;
+    else if (channels !== f.channels) return { ok: false, reason: "unsupported" };
+    samples += f.nb_samples;
+  }
+  if (channels !== 1 && channels !== 2) return { ok: false, reason: samples ? "unsupported" : "failed" };
+  return { ok: true, samples, sampleRate: a.sample_rate, channels };
 }
 
 /** A regular file with one name (not a link): its size, or undefined. */
@@ -317,24 +413,22 @@ export function sandboxedSpeechAudio(o: {
     workdir: () => makeSpeechWorkdir(o.dataDir),
     async measure(file, m) {
       if (plainSize(file) === undefined) return { ok: false, reason: "failed" };
-      // 1. The form, over the whole file (nothing decoded yet; never a verdict on the audio's integrity).
-      const walk = walkMp3(fs.readFileSync(file));
-      if (!walk.ok) return { ok: false, reason: "unsupported" };
-      // 2. Decoded to its end, strictly, at its own rate; the decoded samples counted.
-      const r = await attempt(measureOptions(tools, file), m.signal);
-      if (!r || r.killed || r.signal) return { ok: false, reason: "failed" };
-      if (r.code !== 0) return { ok: false, reason: measureFailure(r) };
-      if (loggedError(r.stderr)) return { ok: false, reason: measureFailure(r) };
-      const samples = decodedSamples(r.stderr);
-      if (samples === undefined) return { ok: false, reason: "failed" };
-      // The cap, on the decoded samples alone.
-      if (samples > m.maxSeconds * walk.sampleRate) return { ok: false, reason: "too_long" };
+      // 1. Integrity: the strict decode's exit status.
+      const verdict = decodeVerdict(await attempt(decodeOptions(tools, file), m.signal));
+      if (verdict !== "ok") return { ok: false, reason: verdict };
+      // 2. Form and length: what the decoder reports for every frame.
+      const r = await attempt(probeOptions(tools, file, m.maxSeconds), m.signal);
+      if (decodeVerdict(r) !== "ok") return { ok: false, reason: "failed" };
+      const j = judgeProbe(r!.stdout);
+      if (!j.ok) return j;
+      // The cap, on the decoded samples.
+      if (j.samples > m.maxSeconds * j.sampleRate) return { ok: false, reason: "too_long" };
       return {
         ok: true,
-        samples,
-        seconds: samples / walk.sampleRate,
-        sampleRate: walk.sampleRate,
-        channels: walk.channels,
+        samples: j.samples,
+        seconds: j.samples / j.sampleRate,
+        sampleRate: j.sampleRate,
+        channels: j.channels,
       };
     },
     async join(job, signal) {

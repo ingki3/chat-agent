@@ -208,7 +208,10 @@ export const MEDIA_TOOL_LIMITS = {
    * still finish (the runtimes' MCP tool timeout is set above all of it — runtime/lockdown.ts).
    */
   speechCallTimeoutMs: 30 * 60_000,
-  /** #251 re-plan 2: one measurement decodes the whole file (a piece of ~290 s, a joined result of up to an hour). */
+  /**
+   * #251 re-plans 2–4: one run of a measurement (the strict decode, or ffprobe's frame report — each decodes the
+   * whole file: a piece of ~290 s, a joined result of up to an hour).
+   */
   speechMeasureTimeoutMs: 60_000,
   /** #248: one ffmpeg join (it may run twice: once more at a lower rate when over 50MB). */
   speechJoinTimeoutMs: 180_000,
@@ -245,7 +248,7 @@ export const MEDIA_TOOL_CODES = [
   "media_recovering",
   /** #248: the text needs more pieces than one call may make. */
   "media_too_long",
-  /** #248: this server has no ffmpeg to measure (decode) and join the speech — nothing is made (#251 r3). */
+  /** #248: this server has no ffmpeg/ffprobe to measure (decode) and join the speech — nothing is made (#251 r3). */
   "media_audio_unavailable",
   /** #248: a piece came back cut by the provider, and again after it was split smaller. */
   "media_truncated",
@@ -290,7 +293,7 @@ export const MEDIA_TOOL_HINTS: Partial<Record<MediaToolCode, string>> = {
   media_too_long:
     "글이 너무 길어 한 번에 읽을 수 없어요. 몇 부분으로 나눠 따로 요청해 주세요(이미 나간 비용은 없어요).",
   media_audio_unavailable:
-    "이 서버에 ffmpeg가 없어 만든 음성의 실제 길이를 확인할 수 없어서(중간에 끊긴 음성을 저장하지 않으려고) 음성을 만들지 않았어요. 관리자에게 ffmpeg 설치를 부탁하세요(비용은 나가지 않았어요).",
+    "이 서버에 ffmpeg·ffprobe가 없어 만든 음성의 실제 길이를 확인할 수 없어서(중간에 끊긴 음성을 저장하지 않으려고) 음성을 만들지 않았어요. 관리자에게 ffmpeg(ffprobe 포함) 설치를 부탁하세요(비용은 나가지 않았어요).",
   media_audio_corrupt:
     "제공자가 보낸 음성이 손상돼(디코딩 오류) 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 잠시 뒤 다시 요청해 주세요.",
   media_audio_unsupported:

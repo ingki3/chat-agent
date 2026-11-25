@@ -20,17 +20,19 @@ import {
   FIXTURE_OPENROUTER_KEY_PREFIX,
   fixtureOpenRouterFetch,
   FIXTURE_CORRUPT_MARK,
+  fixtureMp3Frames,
   fixtureSpeechAudio,
   silentMp3,
 } from "../src/media/fixture.js";
-import { walkMp3 } from "../src/media/mp3.js";
 import { OPENROUTER_SPEECH_URL } from "../src/media/openrouter.js";
 import {
   joinOptions,
   makeSpeechWorkdir,
-  measureFailure,
-  measureOptions,
-  decodedSamples,
+  decodeOptions,
+  decodeVerdict,
+  judgeProbe,
+  probeOptions,
+  probeOutputBytes,
   removeSpeechWorkdir,
   sandboxedSpeechAudio,
   speechTools,
@@ -129,7 +131,8 @@ function fakeAudio(dataDir: () => string) {
       if (b.includes(UNSUPPORTED, 0, "latin1")) return { ok: false, reason: "unsupported" };
       if (b.includes(MEASURE_FAILED, 0, "latin1")) return { ok: false, reason: "failed" };
       const d = durOf(b);
-      if (d === undefined) return { ok: false, reason: "corrupt" };
+      // Not one of our fake MP3s (WAV, …): the decoder's report would show another codec.
+      if (d === undefined) return { ok: false, reason: "unsupported" };
       if (d > m.maxSeconds) return { ok: false, reason: "too_long" };
       const rate = Number(/RATE=(\d+);/.exec(b.toString("latin1"))?.[1] ?? 44100);
       const samples = Math.round(d * rate);
@@ -640,10 +643,13 @@ describe("speech_generate: long scripts through the tool (#248)", () => {
   });
 
   it("ffmpeg runs sandboxed: reads only the input's folder, writes only out/, no network; none off macOS", () => {
-    const tools = { ffmpeg: { exe: "/opt/x/bin/ffmpeg", trusted: ["/opt/x/bin"] } };
+    const tools = {
+      ffmpeg: { exe: "/opt/x/bin/ffmpeg", trusted: ["/opt/x/bin"] },
+      ffprobe: "/opt/x/bin/ffprobe",
+    };
     const w = "/data/speech-scratch/abc";
-    const m = measureOptions(tools, `${w}/in/piece-000.mp3`);
-    expect(m).toMatchObject({
+    const d = decodeOptions(tools, `${w}/in/piece-000.mp3`);
+    expect(d).toMatchObject({
       command: "/opt/x/bin/ffmpeg",
       read: [`${w}/in`],
       write: [],
@@ -651,15 +657,16 @@ describe("speech_generate: long scripts through the tool (#248)", () => {
       noFlagChanges: true,
       trusted: ["/opt/x/bin"],
     });
-    // A strict decode of the whole file at its own rate into nothing; `astats` counts the decoded samples.
-    expect(m.args).toEqual(
-      expect.arrayContaining(["-xerror", "-err_detect", "explode", "level+info", "null"]),
-    );
-    expect(m.args.join(" ")).toContain("astats=measure_perchannel=none:measure_overall=Number_of_samples");
-    expect(m.args).not.toContain("-progress");
-    expect(m.args).not.toContain("-ar");
-    expect(m.args).not.toContain("-t");
-    expect(m.args.join(" ")).not.toMatch(/duration|count_packets/);
+    // A strict decode of the whole file into nothing: its exit status is the verdict (no log is read).
+    expect(d.args).toEqual(expect.arrayContaining(["-xerror", "-err_detect", "explode", "null"]));
+    expect(d.args).not.toContain("-t");
+    // ffprobe: every stream and every decoded frame, as JSON; its report bounded by the audio's length.
+    const p = probeOptions(tools, `${w}/in/piece-000.mp3`, 600);
+    expect(p).toMatchObject({ command: "/opt/x/bin/ffprobe", read: [`${w}/in`], write: [], network: "none" });
+    expect(p.args.join(" ")).toContain("frame=stream_index,channels,nb_samples,duration");
+    expect(p.args).toEqual(expect.arrayContaining(["-of", "json=c=1"]));
+    expect(p.maxOutputBytes).toBe(probeOutputBytes(600));
+    expect(probeOutputBytes(600)).toBeGreaterThan(600 * 42 * 80);
     const j = joinOptions(tools, {
       workdir: w,
       files: [`${w}/in/piece-000.mp3`, `${w}/in/piece-001.mp3`],
@@ -1242,15 +1249,10 @@ function vbrWithoutHeader(seconds: number): Buffer {
 }
 
 describe("speech_generate: review round 4 regressions (#251)", () => {
-  it("P2: the scripted decoder walks every frame at its own rate (VBR) and skips a leading Xing/Info frame", () => {
+  it("P2: the scripted decoder walks every frame at its own rate (VBR)", () => {
     const vbr = vbrWithoutHeader(14.6);
-    const f = walkMp3(vbr);
-    const audioFrames = (w: typeof f) =>
-      w.ok ? w.frames.filter((x) => !x.info).length * w.samplesPerFrame : -1;
-    expect(audioFrames(f) / 44100).toBeCloseTo(14.6, 1);
-    const xing = mp3Frame(9);
-    xing.write("Xing", 36, "latin1");
-    expect(audioFrames(walkMp3(Buffer.concat([xing, vbr])))).toBe(audioFrames(f));
+    const frames = fixtureMp3Frames(vbr);
+    expect(frames.reduce((a, f) => a + f.samples, 0) / 44100).toBeCloseTo(14.6, 1);
   });
 
   it("P2: a header-less VBR piece near the provider's mark is caught (measured by frames) and re-split", async () => {
@@ -1353,59 +1355,81 @@ describe("speech_generate: review rounds 5–6 re-plans — one form, exact deco
     expect(t.files()).toEqual([]);
   });
 
-  it("the form check walks the whole file: Layer III only, one rate and channel count — and judges nothing else", () => {
-    const frames = (n: number) => Array.from({ length: n }, () => mp3Frame(9));
-    const cbr = Buffer.concat(frames(30));
-    const w = walkMp3(cbr);
-    expect(w).toMatchObject({ ok: true, sampleRate: 44100, channels: 2, samplesPerFrame: 1152 });
-    expect(w.ok && w.frames).toHaveLength(30);
-    // A rate change after many good frames (22.05 kHz → 44.1 kHz): unsupported — not just the first frame is read.
-    const mixed = Buffer.concat([...Array.from({ length: 200 }, () => mp3Frame22(8)), ...frames(3)]);
-    expect(walkMp3(mixed)).toEqual({ ok: false, reason: "unsupported" });
-    // A channel-count change.
-    const mono = mp3Frame(9);
-    mono[3] = 0xc4;
-    expect(walkMp3(Buffer.concat([...frames(2), mono, mono]))).toEqual({ ok: false, reason: "unsupported" });
-    // MP2 (Layer II) frames.
-    const mp2 = mp3Frame(9);
-    mp2[1] = 0xfd;
-    expect(walkMp3(Buffer.concat([mp2, mp2, mp2]))).toEqual({ ok: false, reason: "unsupported" });
-    // Not MPEG audio at all (WAV, text): unsupported.
-    const wav = Buffer.concat([Buffer.from("RIFF\0\0\0\0WAVEfmt ", "latin1"), Buffer.alloc(2000)]);
-    expect(walkMp3(wav)).toEqual({ ok: false, reason: "unsupported" });
-    expect(walkMp3(Buffer.from("not audio"))).toEqual({ ok: false, reason: "unsupported" });
-    // Tags and other bytes are stepped over — integrity is the decoder's business: APEv2, APEv2 + ID3v1, junk,
-    // a cut last frame.
-    const ape = Buffer.concat([
-      Buffer.from("APETAGEX", "latin1"),
-      Buffer.alloc(24),
-      Buffer.from("Title\0x", "latin1"),
-    ]);
-    const id3v1 = Buffer.alloc(128);
-    id3v1.write("TAG", 0, "latin1");
-    for (const tail of [ape, Buffer.concat([ape, id3v1]), Buffer.from("junk"), id3v1])
-      expect(walkMp3(Buffer.concat([cbr, tail]))).toMatchObject({ ok: true, sampleRate: 44100 });
-    expect(walkMp3(cbr.subarray(0, cbr.length - 10))).toMatchObject({ ok: true });
-    // `TAG` inside the last frame's data, `Info` anywhere but its place: frames like the others.
-    const last = mp3Frame(9);
-    last.write("TAG", last.length - 128 + 417 - last.length, "latin1");
-    const tagInside = Buffer.concat([...frames(5), last]);
-    tagInside.write("TAG", tagInside.length - 128, "latin1");
-    const t = walkMp3(tagInside);
-    expect(t.ok && t.frames).toHaveLength(6);
-    const side = mp3Frame(9);
-    side.write("Info", 100, "latin1");
-    const s2 = walkMp3(Buffer.concat([side, ...frames(3)]));
-    expect(s2.ok && s2.frames[0]!.info).toBe(false);
-    // `Info` at its place (after the side information) marks a length-header frame.
-    const info = mp3Frame(9);
-    info.write("Info", 36, "latin1");
-    const s3 = walkMp3(Buffer.concat([info, ...frames(3)]));
-    expect(s3.ok && s3.frames[0]!.info).toBe(true);
-    // Sync-like bytes inside frame data are never read as headers: a Layer II header pattern inside a frame.
-    const trap = mp3Frame(9);
-    trap.set([0xff, 0xfd, 0x90, 0x64], 100);
-    expect(walkMp3(Buffer.concat([...frames(3), trap, ...frames(3)]))).toMatchObject({ ok: true });
+  it("the decoder's report judged structurally: one mp3 audio stream, one rate and channel count, samples summed", () => {
+    const tb = "1/14112000";
+    // A frame at `rate`: its duration in the time base for `n` samples.
+    const frame = (n: number, rate: number, channels = 1) => ({
+      stream_index: 0,
+      channels,
+      nb_samples: n,
+      duration: (n * 14112000) / rate,
+    });
+    const report = (o: { streams?: unknown[]; frames?: unknown[] }) =>
+      JSON.stringify({
+        streams: o.streams ?? [
+          { index: 0, codec_type: "audio", codec_name: "mp3", sample_rate: "44100", time_base: tb },
+        ],
+        frames: o.frames ?? [frame(47, 44100), frame(1152, 44100), frame(889, 44100)],
+      });
+    // The decoder's trimmed first and last frames count as they are: 47 + 1152 + 889.
+    expect(judgeProbe(report({}))).toEqual({ ok: true, samples: 2088, sampleRate: 44100, channels: 1 });
+    // An attached picture beside the audio is fine; its frame is not counted.
+    expect(
+      judgeProbe(
+        report({
+          streams: [
+            { index: 0, codec_type: "audio", codec_name: "mp3", sample_rate: "44100", time_base: tb },
+            { index: 1, codec_type: "video", codec_name: "mjpeg", disposition: { attached_pic: 1 } },
+          ],
+          frames: [frame(1152, 44100), { stream_index: 1 }],
+        }),
+      ),
+    ).toMatchObject({ ok: true, samples: 1152 });
+    // A rate change inside (frames at 8 kHz in a stream that says 48 kHz), a channel change: unsupported.
+    const mixed = (sr: string) => [
+      { index: 0, codec_type: "audio", codec_name: "mp3", sample_rate: sr, time_base: tb },
+    ];
+    expect(
+      judgeProbe(report({ streams: mixed("48000"), frames: [frame(576, 8000), frame(1152, 48000)] })),
+    ).toEqual({
+      ok: false,
+      reason: "unsupported",
+    });
+    expect(judgeProbe(report({ frames: [frame(1152, 44100, 2), frame(1152, 44100, 1)] }))).toEqual({
+      ok: false,
+      reason: "unsupported",
+    });
+    // Another codec (MP2, WAV's PCM), two audio streams, a real video stream: unsupported.
+    for (const streams of [
+      [{ index: 0, codec_type: "audio", codec_name: "mp2", sample_rate: "44100", time_base: tb }],
+      [
+        {
+          index: 0,
+          codec_type: "audio",
+          codec_name: "pcm_s16le",
+          sample_rate: "44100",
+          time_base: "1/44100",
+        },
+      ],
+      [
+        { index: 0, codec_type: "audio", codec_name: "mp3", sample_rate: "44100", time_base: tb },
+        { index: 1, codec_type: "audio", codec_name: "mp3", sample_rate: "44100", time_base: tb },
+      ],
+      [
+        { index: 0, codec_type: "audio", codec_name: "mp3", sample_rate: "44100", time_base: tb },
+        { index: 1, codec_type: "video", codec_name: "h264", disposition: { attached_pic: 0 } },
+      ],
+      [],
+    ])
+      expect(judgeProbe(report({ streams }))).toEqual({ ok: false, reason: "unsupported" });
+    // A report that is not the structure (garbage, cut off, a field missing or of another type): not measured.
+    for (const bad of [
+      "garbage",
+      report({}).slice(0, 40),
+      report({ frames: [{ stream_index: 0, channels: 1, duration: 368640 }] }),
+      report({ frames: [{ stream_index: 0, channels: 1, nb_samples: "N/A", duration: 368640 }] }),
+    ])
+      expect(judgeProbe(bad)).toEqual({ ok: false, reason: "failed" });
   });
 
   it("the scripted decoder (FAKE_RUNTIME) has the real one's semantics", async () => {
@@ -1447,66 +1471,95 @@ describe("speech_generate: review rounds 5–6 re-plans — one form, exact deco
     });
   });
 
-  it("a run that could not start, ran out of memory or was signalled is a failed measurement, never corrupt", async () => {
-    expect(measureFailure({ code: 71, stderr: "sandbox-exec: sandbox_apply: Operation not permitted" })).toBe(
-      "failed",
-    );
-    expect(measureFailure({ code: 1, stderr: "x.mp3: Permission denied" })).toBe("failed");
-    expect(measureFailure({ code: 244, stderr: "[error] Cannot allocate memory" })).toBe("failed");
-    expect(measureFailure({ code: 1, stderr: "[error] ... ENOMEM" })).toBe("failed");
-    expect(measureFailure({ code: null, signal: "SIGKILL", stderr: "" })).toBe("failed");
-    expect(measureFailure({ code: 183, stderr: "[mp3float] [error] big_values too big" })).toBe("corrupt");
-    // The decoded samples: the one `astats` line; none (or N/A, or two streams) is no count.
-    const line = (n: string) => `[Parsed_astats_0 @ 0x1] [info] Number of samples: ${n}\n`;
-    expect(decodedSamples(`[info] Overall\n${line("969536")}`)).toBe(969536);
-    expect(decodedSamples("[info] size=N/A time=N/A\n")).toBeUndefined();
-    expect(decodedSamples(line("N/A"))).toBeUndefined();
-    expect(decodedSamples(line("1") + line("2"))).toBeUndefined();
-    // Through the real measuring path with a scripted runner (an ffmpeg file of our own, never run).
+  it("integrity from the exit status only: not run, limits, signals, 71/126/127/244/255 are failed; others corrupt", async () => {
+    for (const r of [
+      undefined,
+      { code: 71 },
+      { code: 126 },
+      { code: 127 },
+      { code: 244 },
+      { code: 255 },
+      { code: null, signal: "SIGTERM" as const },
+      { code: 0, killed: "timeout" },
+      { code: 0, killed: "output" },
+    ])
+      expect(decodeVerdict(r)).toBe("failed");
+    expect(decodeVerdict({ code: 183 })).toBe("corrupt");
+    expect(decodeVerdict({ code: 1 })).toBe("corrupt");
+    expect(decodeVerdict({ code: 0 })).toBe("ok");
+    // Through the real measuring path with a scripted runner (ffmpeg and ffprobe files of our own, never run).
     const bin = path.join(tmp(), "ff", "bin");
     fs.mkdirSync(bin, { recursive: true });
-    fs.writeFileSync(path.join(bin, "ffmpeg"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
-    const scripted = (result: { code: number | null; signal?: NodeJS.Signals | null; stderr: string }) =>
+    for (const n of ["ffmpeg", "ffprobe"])
+      fs.writeFileSync(path.join(bin, n), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const tb = "1/14112000";
+    const good = JSON.stringify({
+      streams: [{ index: 0, codec_type: "audio", codec_name: "mp3", sample_rate: "8000", time_base: tb }],
+      frames: [{ stream_index: 0, channels: 1, nb_samples: 576, duration: 1016064 }],
+    });
+    type R = {
+      code: number | null;
+      signal?: NodeJS.Signals | null;
+      stdout?: string;
+      stderr?: string;
+      killed?: null | "timeout";
+    };
+    const scripted = (decode: R, probe: R = { code: 0, stdout: good }) =>
       sandboxedSpeechAudio({
         dataDir: tmp(),
         platform: "darwin",
         ffmpegPath: path.join(bin, "ffmpeg"),
-        run: async () => ({ stdout: "", killed: null, signal: null, ...result }),
+        run: async (o) => {
+          const r = o.command.endsWith("ffprobe") ? probe : decode;
+          return { stdout: "", stderr: "", killed: null, signal: null, ...r };
+        },
       })!;
     const data = tmp();
     const w = makeSpeechWorkdir(data);
     const file = path.join(w, "in", "piece-000.mp3");
-    fs.writeFileSync(file, Buffer.concat(Array.from({ length: 30 }, () => mp3Frame(9))));
+    fs.writeFileSync(file, Buffer.from("anything — the scripted programs decide"));
     const M = { maxSeconds: 600 };
-    expect(await scripted({ code: 0, stderr: line("969536") }).measure(file, M)).toMatchObject({
+    expect(await scripted({ code: 0 }).measure(file, M)).toEqual({
       ok: true,
-      samples: 969536,
-      sampleRate: 44100,
+      samples: 576,
+      seconds: 0.072,
+      sampleRate: 8000,
+      channels: 1,
     });
-    // The final report without a valid count (N/A): not measured.
-    expect(await scripted({ code: 0, stderr: line("N/A") }).measure(file, M)).toEqual({
-      ok: false,
-      reason: "failed",
-    });
-    expect(await scripted({ code: 244, stderr: "[error] Cannot allocate memory" }).measure(file, M)).toEqual({
-      ok: false,
-      reason: "failed",
-    });
-    expect(await scripted({ code: null, signal: "SIGTERM", stderr: "" }).measure(file, M)).toEqual({
-      ok: false,
-      reason: "failed",
-    });
+    // A log that says "[error]" or "exec" (a title, say) changes nothing: only the exit status counts.
     expect(
-      await scripted({ code: 183, stderr: "[mp3float] [error] big_values too big" }).measure(file, M),
-    ).toEqual({
+      (await scripted({ code: 0, stderr: "title : Status [error] Executive summary" }).measure(file, M)).ok,
+    ).toBe(true);
+    expect(await scripted({ code: 183, stderr: "title : Executive summary" }).measure(file, M)).toEqual({
       ok: false,
       reason: "corrupt",
     });
-    // The 600 s cap on decoded samples only: 599.49 s of audio is taken (whatever its frames add up to).
-    expect(
-      await scripted({ code: 0, stderr: line(String(Math.round(599.488125 * 44100))) }).measure(file, M),
-    ).toMatchObject({ ok: true });
-    expect(await scripted({ code: 0, stderr: line(String(600 * 44100 + 1)) }).measure(file, M)).toEqual({
+    for (const decode of [
+      { code: 244 },
+      { code: 255 },
+      { code: 71 },
+      { code: null, signal: "SIGTERM" as const },
+    ])
+      expect(await scripted(decode).measure(file, M)).toEqual({ ok: false, reason: "failed" });
+    // ffprobe's report: cut off by its output bound, garbage, its own failure — not measured.
+    for (const probe of [
+      { code: 0, stdout: good, killed: "timeout" as const },
+      { code: 0, stdout: "not json" },
+      { code: 1, stdout: "" },
+    ])
+      expect(await scripted({ code: 0 }, probe).measure(file, M)).toEqual({ ok: false, reason: "failed" });
+    // The 600 s cap on decoded samples.
+    const long = (n: number) =>
+      JSON.stringify({
+        streams: [
+          { index: 0, codec_type: "audio", codec_name: "mp3", sample_rate: "8000", time_base: "1/8000" },
+        ],
+        frames: [{ stream_index: 0, channels: 1, nb_samples: n, duration: n }],
+      });
+    expect((await scripted({ code: 0 }, { code: 0, stdout: long(4_795_905) }).measure(file, M)).ok).toBe(
+      true,
+    );
+    expect(await scripted({ code: 0 }, { code: 0, stdout: long(600 * 8000 + 1) }).measure(file, M)).toEqual({
       ok: false,
       reason: "too_long",
     });
@@ -1611,9 +1664,7 @@ function tone(seconds: number, rate = 22050, freq = 440): Buffer {
 /** The frames' side information scrambled from frame `from` on (headers intact): the decoder errors there. */
 function scramble(b: Buffer, from: number, to = Infinity): Buffer {
   const out = Buffer.from(b);
-  const w = walkMp3(out);
-  if (!w.ok) throw new Error("not an mp3");
-  w.frames.forEach((f, i) => {
+  fixtureMp3Frames(out).forEach((f, i) => {
     if (i >= from && i < to)
       for (let k = f.start + 4; k < Math.min(f.end, f.start + 40); k++) out[k] = (k * 131 + 7) & 0xff;
   });
@@ -1741,20 +1792,19 @@ describe("speech_generate: the real sandboxed ffmpeg (#248, macOS)", () => {
   });
 
   realIt(
-    "corruption is found to the file's end (a good control first); over the cap is too_long, undecoded",
+    "corruption is found to the file's end (a good control first); over the cap is too_long",
     async () => {
       const { audio, put } = bench();
       const good = tone(60, 8000);
       // The control: this environment decodes the clean file.
       expect(await audio.measure(put(good), M)).toMatchObject({ ok: true });
       // Corrupt only in its last seconds.
-      const w = walkMp3(good);
-      const frames = w.ok ? w.frames.length : 0;
+      const frames = fixtureMp3Frames(good).length;
       expect(await audio.measure(put(scramble(good, frames - 40)), M)).toEqual({
         ok: false,
         reason: "corrupt",
       });
-      // Over the cap: refused from its frames alone.
+      // Over the cap (decoded samples): too_long.
       expect(await audio.measure(put(good), { maxSeconds: 30 })).toEqual({ ok: false, reason: "too_long" });
     },
   );
@@ -1892,7 +1942,10 @@ describe("speech_generate: the real sandboxed ffmpeg (#248, macOS)", () => {
         "-id3v2_version",
         "0",
       ]);
-      const pieces = splitSpeech(LONG, LIMITS);
+      // A text of exactly six pieces.
+      const text = [LONG, SENTENCES.slice(0, 4).join(" ")].join("\n\n");
+      const pieces = splitSpeech(text, LIMITS);
+      expect(pieces).toHaveLength(6);
       const t = await start({
         audio: realAudio(() => dataDir),
         // Each answer: the same frames repeated to about its expected length (no length header at all).
@@ -1905,9 +1958,9 @@ describe("speech_generate: the real sandboxed ffmpeg (#248, macOS)", () => {
           ),
       });
       dataDir = t.dataDir;
-      const r = await t.speak({ text: LONG });
+      const r = await t.speak({ text });
       expect(r.ok).toBe(true);
-      expect((r as { output: { chunks: number } }).output.chunks).toBe(pieces.length);
+      expect((r as { output: { chunks: number } }).output.chunks).toBe(6);
     },
   );
 
@@ -1942,38 +1995,132 @@ describe("speech_generate: the real sandboxed ffmpeg (#248, macOS)", () => {
     },
   );
 
-  realIt("599.49 s of audio is taken (the cap is on decoded samples); a remuxed long piece too", async () => {
-    const { audio, put } = bench();
-    const long = encode([
-      "-f",
-      "lavfi",
-      "-i",
-      "anullsrc=r=8000:cl=mono:d=599.488125",
-      "-c:a",
-      "libmp3lame",
-      "-b:a",
-      "8k",
-    ]);
-    const m = await audio.measure(put(long), M);
-    expect(m.ok && m.seconds).toBeGreaterThan(599);
-    expect(m.ok && m.seconds).toBeLessThan(600);
-    // Remuxed (stream copy, its length header dropped): its frames add up past 600 s, its decoded samples do not.
-    const dir = tmp();
-    fs.writeFileSync(path.join(dir, "a.mp3"), long);
-    const r = spawnSync(realTools!.ffmpeg.exe, [
-      "-nostdin",
-      "-v",
-      "error",
-      "-i",
-      path.join(dir, "a.mp3"),
-      "-c",
-      "copy",
-      "-write_xing",
-      "0",
-      path.join(dir, "b.mp3"),
-    ]);
-    expect(r.status).toBe(0);
-    const remuxed = await audio.measure(put(fs.readFileSync(path.join(dir, "b.mp3"))), M);
-    expect(remuxed.ok && remuxed.seconds).toBeLessThan(600.1);
-  });
+  realIt(
+    "599.49 s of decoded audio is taken; just over 600 s is too_long (the cap is on decoded samples)",
+    async () => {
+      const { audio, put } = bench();
+      const at = (d: number) =>
+        encode(["-f", "lavfi", "-i", `anullsrc=r=8000:cl=mono:d=${d}`, "-c:a", "libmp3lame", "-b:a", "8k"]);
+      const m = await audio.measure(put(at(599.488125)), M);
+      expect(m.ok && m.seconds).toBeGreaterThan(599.4);
+      expect(m.ok && m.seconds).toBeLessThan(600);
+      expect(await audio.measure(put(at(601)), M)).toEqual({ ok: false, reason: "too_long" });
+    },
+  );
+
+  realIt(
+    'metadata, short files and tags are not judged: titles with "[error]"/"exec", 2 frames + ID3v1, a leading APEv2',
+    async () => {
+      const { audio, put } = bench();
+      for (const title of ["Status [error]", "Executive summary"]) {
+        const b = encode([
+          "-f",
+          "lavfi",
+          "-i",
+          "sine=frequency=440:duration=1:sample_rate=44100",
+          "-ac",
+          "2",
+          "-c:a",
+          "libmp3lame",
+          "-metadata",
+          `title=${title}`,
+        ]);
+        expect(await audio.measure(put(b), M)).toMatchObject({ ok: true, samples: 44100 });
+      }
+      // Two frames (no length header), then an ID3v1 tag.
+      const two = encode([
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:duration=0.02:sample_rate=44100",
+        "-c:a",
+        "libmp3lame",
+        "-write_xing",
+        "0",
+        "-id3v2_version",
+        "0",
+      ]);
+      const id3v1 = Buffer.alloc(128);
+      id3v1.write("TAGTitle", 0, "latin1");
+      const twoTagged = await audio.measure(put(Buffer.concat([two, id3v1])), M);
+      expect(twoTagged.ok).toBe(true);
+      expect(twoTagged).toEqual(await audio.measure(put(two), M));
+    },
+  );
+
+  realIt(
+    "through the tool: a leading APEv2 answer is taken and stored; WAV, MP2 and a rate change are unsupported",
+    async () => {
+      const base = tone(3, 22050);
+      const item = Buffer.concat([
+        Buffer.from([5, 0, 0, 0, 0, 0, 0, 0]),
+        Buffer.from("Title\0Hello", "latin1"),
+      ]);
+      const apeBlock = (flags: number) => {
+        const f = Buffer.alloc(32);
+        f.write("APETAGEX", 0, "latin1");
+        f.writeUInt32LE(2000, 8);
+        f.writeUInt32LE(item.length + 32, 12);
+        f.writeUInt32LE(1, 16);
+        f.writeUInt32LE(flags >>> 0, 20);
+        return f;
+      };
+      const leading = Buffer.concat([apeBlock(0xa0000000), item, apeBlock(0x80000000), base]);
+      let d1 = "";
+      const ok = await start({ audio: realAudio(() => d1), answer: () => leading });
+      d1 = ok.dataDir;
+      const r = await ok.speak({ text: SENTENCES[0]! });
+      expect(r.ok).toBe(true);
+      expect(ok.files()).toHaveLength(1);
+      const wav = encode([
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:duration=3:sample_rate=22050",
+        "-c:a",
+        "pcm_s16le",
+        "-f",
+        "wav",
+      ]);
+      const mp2 = encode([
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=300:duration=3:sample_rate=44100",
+        "-c:a",
+        "mp2",
+        "-f",
+        "mp2",
+      ]);
+      const at = (rate: number, d: number) =>
+        encode([
+          "-f",
+          "lavfi",
+          "-i",
+          `sine=frequency=300:duration=${d}:sample_rate=${rate}`,
+          "-ac",
+          "1",
+          "-c:a",
+          "libmp3lame",
+          "-b:a",
+          "32k",
+          "-write_xing",
+          "0",
+          "-id3v2_version",
+          "0",
+        ]);
+      const rateChange = Buffer.concat([at(8000, 2), at(48000, 1)]);
+      for (const bad of [wav, mp2, rateChange]) {
+        let d = "";
+        const t = await start({ audio: realAudio(() => d), answer: () => bad });
+        d = t.dataDir;
+        expect(await t.speak({ text: SENTENCES[0]! })).toMatchObject({
+          ok: false,
+          code: "media_audio_unsupported",
+        });
+        expect(t.posts).toHaveLength(1);
+        expect(t.files()).toEqual([]);
+      }
+    },
+  );
 });

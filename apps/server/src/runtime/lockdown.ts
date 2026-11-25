@@ -13,9 +13,10 @@ export function speechCallBudgetMs(): number {
   return (
     l.speechCallTimeoutMs +
     l.speechTimeoutMs +
-    l.speechMeasureTimeoutMs +
+    // A measurement is two runs (the strict decode, then ffprobe's frame report): the last piece's and the result's.
+    2 * l.speechMeasureTimeoutMs +
     2 * l.speechJoinTimeoutMs +
-    l.speechMeasureTimeoutMs +
+    2 * l.speechMeasureTimeoutMs +
     l.costTries * (l.costWaitMs + 15_000)
   );
 }
