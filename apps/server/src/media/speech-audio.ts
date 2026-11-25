@@ -53,6 +53,12 @@ export type SpeechAudio = {
   ): Promise<string | undefined>;
 };
 
+/**
+ * #251 r10: how far an answer's length converted to the call's rate may be from its length at its own rate (the
+ * encoder's and resampler's edges are a few milliseconds; more is audio lost across rate changes inside it).
+ */
+export const CONVERSION_TOLERANCE_S = 0.25;
+
 export const SPEECH_AUDIO_LIMITS = {
   measureTimeoutMs: MEDIA_TOOL_LIMITS.speechMeasureTimeoutMs,
   joinTimeoutMs: MEDIA_TOOL_LIMITS.speechJoinTimeoutMs,
@@ -244,12 +250,20 @@ export function decodeOptions(
   };
 }
 
+/** The PCM files this server writes (`measure`): the only names the encoder is given. */
+export const PCM_NAME = /^pcm-\d{1,6}\.s16$/;
+
 /** The ffmpeg run that encodes the PCM files, in order, into one MP3 (exported for tests). */
 export function encodeOptions(
   tools: { ffmpeg: Ffmpeg },
   job: { workdir: string; pcms: string[]; bitrateK: number; sampleRate: number; out: string },
 ): RunIsolatedOptions {
   const outDir = path.join(job.workdir, "out");
+  // Only the server's own PCM names, relative to out/ (the encoder's cwd): `concat:` splits its list at "|", and a
+  // data folder's path may hold one (#251 r10).
+  const names = job.pcms.map((f) => path.basename(f));
+  if (job.pcms.some((f, i) => path.dirname(f) !== outDir || !PCM_NAME.test(names[i]!)))
+    throw new Error("not a PCM file of this call");
   return {
     command: tools.ffmpeg.exe,
     args: [
@@ -268,7 +282,7 @@ export function encodeOptions(
       "-protocol_whitelist",
       "concat,file",
       "-i",
-      `concat:${job.pcms.join("|")}`,
+      `concat:${names.join("|")}`,
       "-c:a",
       "libmp3lame",
       "-b:a",
@@ -280,7 +294,7 @@ export function encodeOptions(
       String(FILE_LIMITS.bytes + 1),
       "-f",
       "mp3",
-      job.out,
+      path.basename(job.out),
     ],
     cwd: outDir,
     env: { HOME: outDir, LANG: "en_US.UTF-8" },
@@ -298,15 +312,16 @@ export function encodeOptions(
 /**
  * The integrity verdict of a finished strict decode, from its exit status and the runner's own report only (never
  * its log): clean (`ok`); `failed` when it did not really run — not started, killed by a limit or the caller, a
- * signal, or an exit status that means one of those (sandbox-exec 71, 126 cannot execute, 127 not found, 244 ENOMEM,
- * 255 ffmpeg's "received a signal"); `corrupt` for any other non-zero status (the decoder stopped on the audio).
+ * signal, or an exit status that means one of those (sandbox-exec 71, 126 cannot execute, 127 not found, 228 ENOSPC
+ * and 229 EFBIG writing the PCM, 244 ENOMEM, 255 ffmpeg's "received a signal"); `corrupt` for any other non-zero
+ * status (the decoder stopped on the audio).
  */
 export function decodeVerdict(
   r: { code: number | null; signal?: NodeJS.Signals | null; killed?: unknown } | undefined,
 ): "ok" | "failed" | "corrupt" {
   if (!r || r.killed || r.signal || r.code === null) return "failed";
   if (r.code === 0) return "ok";
-  if ([71, 126, 127, 244, 255].includes(r.code)) return "failed";
+  if ([71, 126, 127, 228, 229, 244, 255].includes(r.code)) return "failed";
   return "corrupt";
 }
 
@@ -387,28 +402,57 @@ export function sandboxedSpeechAudio(o: {
       const gate = gv === "ok" ? judgeGate(g!.stdout) : { ok: false as const };
       if (!gate.ok) return { ok: false, reason: "unsupported" };
       // 2. The strict decode into PCM at the call's rate.
+      const out = path.join(path.dirname(path.dirname(file)), "out");
+      const decode = async (rate: number) => {
+        const pcm = path.join(out, `pcm-${++n}.s16`);
+        const verdict = decodeVerdict(
+          await attempt(
+            decodeOptions(tools, { file, pcm, sampleRate: rate, maxSeconds: m.maxSeconds }),
+            m.signal,
+          ),
+        );
+        const size = verdict === "ok" ? plainSize(pcm) : undefined;
+        if (verdict !== "ok" || size === undefined || size % 2) {
+          fs.rmSync(pcm, { force: true });
+          return {
+            ok: false as const,
+            reason: verdict === "corrupt" ? ("corrupt" as const) : ("failed" as const),
+          };
+        }
+        return { ok: true as const, pcm, samples: size / 2 };
+      };
       const sampleRate = m.sampleRate ?? gate.sampleRate;
-      const pcm = path.join(path.dirname(path.dirname(file)), "out", `pcm-${++n}.s16`);
-      const verdict = decodeVerdict(
-        await attempt(decodeOptions(tools, { file, pcm, sampleRate, maxSeconds: m.maxSeconds }), m.signal),
-      );
-      const size = verdict === "ok" ? plainSize(pcm) : undefined;
-      if (verdict !== "ok" || size === undefined || size % 2) {
-        fs.rmSync(pcm, { force: true });
-        return { ok: false, reason: verdict === "corrupt" ? "corrupt" : "failed" };
+      const d = await decode(sampleRate);
+      if (!d.ok) return d;
+      let seconds = d.samples / sampleRate;
+      // Converted from another rate (#251 r10): ffmpeg can lose audio converting across rate changes inside an
+      // answer. Its length at its own rate is decoded too and is the one judged; the two must agree.
+      if (sampleRate !== gate.sampleRate) {
+        const own = await decode(gate.sampleRate);
+        if (!own.ok) {
+          fs.rmSync(d.pcm, { force: true });
+          return own;
+        }
+        fs.rmSync(own.pcm, { force: true });
+        const native = own.samples / gate.sampleRate;
+        if (Math.abs(native - seconds) > CONVERSION_TOLERANCE_S) {
+          fs.rmSync(d.pcm, { force: true });
+          return { ok: false, reason: "unsupported" };
+        }
+        seconds = native;
       }
-      const samples = size / 2;
-      if (samples > m.maxSeconds * sampleRate) {
-        fs.rmSync(pcm, { force: true });
+      if (seconds > m.maxSeconds) {
+        fs.rmSync(d.pcm, { force: true });
         return { ok: false, reason: "too_long" };
       }
-      return { ok: true, samples, seconds: samples / sampleRate, sampleRate, pcm };
+      return { ok: true, samples: d.samples, seconds, sampleRate, pcm: d.pcm };
     },
     async encode(job, signal) {
       const outDir = path.join(job.workdir, "out");
       if (!job.pcms.length) return undefined;
       for (const f of job.pcms)
-        if (path.dirname(f) !== outDir || plainSize(f) === undefined) return undefined;
+        if (path.dirname(f) !== outDir || !PCM_NAME.test(path.basename(f)) || plainSize(f) === undefined)
+          return undefined;
       const out = path.join(outDir, `speech-${++n}.mp3`);
       const r = await attempt(encodeOptions(tools, { ...job, out }), signal);
       if (decodeVerdict(r) !== "ok") return undefined;

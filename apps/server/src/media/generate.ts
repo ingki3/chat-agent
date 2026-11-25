@@ -22,13 +22,7 @@ import { carriesSecret } from "../secrets/egress.js";
 import { MIN_KNOWN_LENGTH, scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 import type { UsageStore } from "../usage/store.js";
 import type { MediaBudget } from "./budget.js";
-import {
-  boundMicros,
-  imageCostBound,
-  MAX_IMAGE_PIXELS,
-  speechCostBound,
-  speechOutputPriced,
-} from "./cost.js";
+import { boundMicros, imageCostBound, MAX_IMAGE_PIXELS, speechCostBound, speechPricing } from "./cost.js";
 import type { OpenRouterKeys } from "./keys.js";
 import {
   GENERATION_ID,
@@ -704,18 +698,22 @@ export class MediaGenerator {
       this.lookup(modelEndpointsUrl(ctx.model), ctx.apiKey),
     ]);
     // A 200 is not a record: the model itself, with its speech output's parameters; its endpoints' prices.
-    const data = isObj(priced.data) ? priced.data : {};
-    const endpoints = Array.isArray(data.endpoints) ? data.endpoints : [];
+    // The price record judged as when the model was chosen (`speechPricing`, #251 r10).
+    const pricing = speechPricing(priced, ctx.model);
     if (
       answer.id !== ctx.model ||
       !Array.isArray(answer.output_modalities) ||
       !answer.output_modalities.some(
         (m) => isObj(m) && m.type === "speech" && isObj(m.supported_parameters),
       ) ||
-      data.id !== ctx.model ||
-      !endpoints.length
+      (!pricing.ok && pricing.reason === "invalid")
     )
       throw new MediaToolError("media_lookup_failed");
+    // Priced on its output (audio tokens or seconds): its cost has no bound — refused before anything is sent.
+    if (!pricing.ok && pricing.reason === "output_priced")
+      throw new MediaToolError("media_no_price", OUTPUT_PRICED);
+    if (!pricing.ok) throw new MediaToolError("media_no_price");
+    const endpoints = pricing.endpoints;
     const maps: unknown[] = [];
     const outs = [
       ...(Array.isArray(answer.output_modalities) ? answer.output_modalities : []),
@@ -756,8 +754,6 @@ export class MediaGenerator {
       ...(input.instructions ? { instructions: input.instructions } : {}),
       ...(moderation ? { moderation } : {}),
     });
-    // Priced on its output (audio tokens or seconds): its cost has no bound — refused before anything is sent.
-    if (speechOutputPriced(endpoints)) throw new MediaToolError("media_no_price", OUTPUT_PRICED);
     // Every bound as the integer micro-USD its row will hold: the check sums exactly what is reserved (#248).
     const microsOf = (text: string) => {
       const b = speechCostBound(endpoints, { text, instructions: input.instructions });
@@ -950,7 +946,6 @@ export class MediaGenerator {
     const made: Made[] = [];
     /** The call's PCM rate: the first answer's own (#251 re-plan 5). */
     let sampleRate: number | undefined;
-    let bytesSoFar = 0;
     let n = 0;
     const started = this.now();
     let workdir: string | undefined;
@@ -974,12 +969,11 @@ export class MediaGenerator {
               "글이 길어 정해진 시간 안에 다 읽지 못해 저장하지 않았어요. 더 짧게 나눠 요청해 주세요.",
             );
         }
-        const left = FILE_LIMITS.bytes - bytesSoFar;
-        if (left <= 0) throw new MediaToolError("media_failed");
         // Synchronously from here to the request: egress check, the row marked sent (its day: the call's start day).
         this.sending(ctx, plan, p);
         unsent.delete(p.callId);
-        const r = await this.piece(ctx, p, plan.body, left);
+        // Each answer read up to the file cap; the stored file's cap applies to this server's own encode (#251 r10).
+        const r = await this.piece(ctx, p, plan.body, FILE_LIMITS.bytes);
         costs.push(r.cost);
         if (!r.bytes) throw new MediaToolError("media_failed");
         // Empty: nothing to judge. Otherwise the answer's form is the decoder's verdict below (#251 re-plan 4 — no
@@ -1021,7 +1015,6 @@ export class MediaGenerator {
           continue;
         }
         made.push({ pcm: m.pcm, seconds: m.seconds, samples: m.samples, sampleRate: m.sampleRate });
-        bytesSoFar += r.bytes.length;
       }
       const joined = await this.joined(ctx, made, workdir);
       const file = await this.store(ctx, joined.bytes, "mp3", `speech-${stamp(this.now())}.mp3`);

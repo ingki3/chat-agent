@@ -180,6 +180,8 @@ export const MEDIA_ERRORS: Record<string, string> = {
   media_model_unknown: "고른 모델이 OpenRouter 목록에 없어요. 목록을 새로 불러와 다시 고르세요.",
   media_model_unsupported:
     "이 이미지 모델은 벡터(SVG)만 만들어 이 서버에 저장할 수 없어요. png·jpeg·webp를 내는 모델을 고르세요.",
+  media_model_no_price:
+    "이 음성 모델은 가격 정보가 없거나 읽을 수 없거나 변동 가격이라 한 번 호출의 최대 비용을 정할 수 없어요. 다른 모델을 고르세요.",
   media_model_output_priced:
     "이 음성 모델은 만든 음성의 양(오디오 토큰·초)으로 과금돼 한 번 호출의 최대 비용을 정할 수 없어요. 글자(입력) 기준으로 과금되는 모델을 고르세요.",
 };
@@ -211,8 +213,8 @@ export const MEDIA_TOOL_LIMITS = {
    */
   speechCallTimeoutMs: 30 * 60_000,
   /**
-   * #251 re-plans 2–4: one run of a measurement (the strict decode, or ffprobe's frame report — each decodes the
-   * whole file: a piece of ~290 s, a joined result of up to an hour).
+   * #251 re-plans 2–5: one run of a measurement — ffprobe's stream probe, or one strict PCM decode of the whole file
+   * (a piece of ~290 s, the stored result of up to an hour).
    */
   speechMeasureTimeoutMs: 60_000,
   /** #248: one ffmpeg join (it may run twice: once more at a lower rate when over 50MB). */

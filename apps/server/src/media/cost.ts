@@ -183,3 +183,21 @@ export function speechOutputPriced(endpoints: readonly unknown[]): boolean {
   }
   return false;
 }
+
+/**
+ * A speech model's price record judged (#251 r10 — the same verdict when it is chosen and before every call): the
+ * Models API answer for `/models/<id>/endpoints` must be that model's record with endpoints (`invalid` otherwise);
+ * priced on its output is `output_priced`; a price that gives no bound (missing, unreadable, variable `-1`) is
+ * `no_price`. `ok`: its endpoints, whose bound `speechCostBound` gives.
+ */
+export function speechPricing(
+  answer: unknown,
+  model: string,
+): { ok: true; endpoints: unknown[] } | { ok: false; reason: "invalid" | "output_priced" | "no_price" } {
+  const data = isObj(answer) && isObj(answer.data) ? answer.data : undefined;
+  const endpoints = data && Array.isArray(data.endpoints) ? data.endpoints : [];
+  if (!data || data.id !== model || !endpoints.length) return { ok: false, reason: "invalid" };
+  if (speechOutputPriced(endpoints)) return { ok: false, reason: "output_priced" };
+  if (speechCostBound(endpoints, { text: "가" }) === null) return { ok: false, reason: "no_price" };
+  return { ok: true, endpoints };
+}

@@ -1281,6 +1281,54 @@ describe("media tools: review round 1 regressions (#246)", () => {
     ).resolves.toBeTruthy();
   });
 
+  it("#251 r10: choosing a speech model checks its price record as a call does — the reason is shown", async () => {
+    const inner = fixtureOpenRouterFetch();
+    const withRecord = (record: unknown) =>
+      (async (url: string | URL | Request, init?: RequestInit) =>
+        String(url).endsWith("/models/fixture/voice-one/endpoints")
+          ? Response.json(record)
+          : inner(url, init)) as typeof fetch;
+    for (const [record, code] of [
+      [{ data: { id: "fixture/voice-one", endpoints: [] } }, "media_model_no_price"],
+      [
+        { data: { id: "other/model", endpoints: [{ pricing: { prompt: "0.00001", completion: "0" } }] } },
+        "media_model_no_price",
+      ],
+      [{ data: { id: "fixture/voice-one", endpoints: [{ pricing: {} }] } }, "media_model_no_price"],
+      [
+        {
+          data: {
+            id: "fixture/voice-one",
+            endpoints: [{ pricing: { prompt: "0.00001", completion: "-1" } }],
+          },
+        },
+        "media_model_no_price",
+      ],
+      [
+        {
+          data: { id: "fixture/voice-one", endpoints: [{ pricing: { prompt: "0", completion: "0.0001" } }] },
+        },
+        "media_model_output_priced",
+      ],
+    ] as const) {
+      const t = await start({ fetchImpl: withRecord(record) });
+      await expect(
+        t.app.media!.admin.saveSettings(
+          settingsWith({ speech: "fixture/voice-one" }),
+          t.app.media!.settings.revision(),
+          () => true,
+        ),
+      ).rejects.toMatchObject({ code });
+      // The same record refuses a call before anything is paid.
+      t.enable(settingsWith({ speech: "fixture/voice-one" }));
+      const conv = t.app.conversations!.create(t.f.users.owner.id);
+      const scope = await t.scopeOf(conv.id);
+      const r = await t.app.media!.tools.run("speech", scope, { text: "안녕" });
+      expect(r.ok).toBe(false);
+      expect(t.posts()).toEqual([]);
+    }
+  });
+
   it("P2: inline audio answers a single byte range (206), a suffix, and 416 beyond the end", async () => {
     const t = await start();
     t.enable(settingsWith({ speech: "fixture/voice-one" }));

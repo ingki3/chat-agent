@@ -692,7 +692,18 @@ describe("speech_generate: long scripts through the tool (#248)", () => {
     expect(e.args).toEqual(
       expect.arrayContaining(["libmp3lame", "64k", "-ac", "1", "-fs", "s16le", "22050"]),
     );
-    expect(e.args).toContain(`concat:${w}/out/pcm-1.s16|${w}/out/pcm-2.s16`);
+    // Plain names relative to out/ (the cwd): a "|" in the data folder's path cannot split the list.
+    expect(e.args).toContain("concat:pcm-1.s16|pcm-2.s16");
+    expect(e).toMatchObject({ cwd: `${w}/out` });
+    expect(() =>
+      encodeOptions(tools, {
+        workdir: w,
+        pcms: [`${w}/out/x|y.s16`],
+        out: `${w}/out/s.mp3`,
+        bitrateK: 64,
+        sampleRate: 22050,
+      }),
+    ).toThrow();
     expect(speechTools(undefined, "/data", "linux")).toBeUndefined();
     expect(speechTools("/nope/ffmpeg", "/data", "darwin")).toBeUndefined();
     expect(sandboxedSpeechAudio({ dataDir: "/data", platform: "linux" })).toBeUndefined();
@@ -1446,6 +1457,8 @@ describe("speech_generate: review rounds 5–6 re-plans — one form, exact deco
       { code: 71 },
       { code: 126 },
       { code: 127 },
+      { code: 228 },
+      { code: 229 },
       { code: 244 },
       { code: 255 },
       { code: null, signal: "SIGTERM" as const },
@@ -1473,6 +1486,8 @@ describe("speech_generate: review rounds 5–6 re-plans — one form, exact deco
       killed?: null | "timeout";
       /** Samples the scripted decode "writes". */
       samples?: number;
+      /** Samples by output rate (`-ar`), when they differ. */
+      samplesAt?: Record<number, number>;
     };
     const scripted = (decode: R, probe: R = { code: 0, stdout: good }) =>
       sandboxedSpeechAudio({
@@ -1482,7 +1497,12 @@ describe("speech_generate: review rounds 5–6 re-plans — one form, exact deco
         run: async (o) => {
           const r = o.command.endsWith("ffprobe") ? probe : decode;
           if (!o.command.endsWith("ffprobe") && r.code === 0 && !r.killed)
-            fs.writeFileSync(o.args.at(-1)!, Buffer.alloc((r.samples ?? 576) * 2));
+            fs.writeFileSync(
+              o.args.at(-1)!,
+              Buffer.alloc(
+                (r.samplesAt?.[Number(o.args[o.args.indexOf("-ar") + 1])] ?? r.samples ?? 576) * 2,
+              ),
+            );
           return { stdout: "", stderr: "", killed: null, signal: null, ...r };
         },
       })!;
@@ -1537,6 +1557,31 @@ describe("speech_generate: review rounds 5–6 re-plans — one form, exact deco
       ok: false,
       reason: "too_long",
     });
+    // Converted from its own rate (44.1 kHz) to the call's (8 kHz): judged at its own rate; audio lost converting
+    // (290.006 s at its own rate, 266.881 s converted) is unsupported, a few samples' edge is not.
+    const at441 = JSON.stringify({
+      format: { format_name: "mp3" },
+      streams: [{ codec_type: "audio", codec_name: "mp3", sample_rate: "44100", channels: 1 }],
+    });
+    const lost = {
+      code: 0,
+      samplesAt: { 8000: Math.round(266.881 * 8000), 44100: Math.round(290.006 * 44100) },
+    };
+    expect(
+      await scripted(lost, { code: 0, stdout: at441 }).measure(file, { ...M, sampleRate: 8000 }),
+    ).toEqual({
+      ok: false,
+      reason: "unsupported",
+    });
+    const kept = { code: 0, samplesAt: { 8000: 8000 * 100 - 3, 44100: 44100 * 100 } };
+    expect(
+      await scripted(kept, { code: 0, stdout: at441 }).measure(file, { ...M, sampleRate: 8000 }),
+    ).toMatchObject({
+      ok: true,
+      samples: 8000 * 100 - 3,
+      seconds: 100,
+      sampleRate: 8000,
+    });
     removeSpeechWorkdir(w);
   });
 
@@ -1584,6 +1629,37 @@ describe("speech_generate: review rounds 5–6 re-plans — one form, exact deco
     expect(r).toMatchObject({ ok: false, code: "media_measure_failed" });
     expect(!r.ok && r.hint).toMatch(/비용은 기록/);
     expect(joins).toBe(1);
+  });
+
+  it("#251 r10: the 50 MiB cap is on the stored file, not on the answers' sum (13 large answers are joined)", async () => {
+    const text = Array.from({ length: 4 }, () => SENTENCES.join(" ")).join("\n\n");
+    const split = { ...LIMITS, maxPieces: 16, maxRequests: 20 };
+    const pieces = splitSpeech(text, split);
+    expect(pieces.length).toBeGreaterThanOrEqual(11);
+    // Each answer about 5 MB (padding after its fake frames): more than 50 MB together.
+    const t = await start({
+      split,
+      answer: (input) =>
+        Buffer.concat([fakeMp3(speechSeconds(input, LIMITS.typical)), Buffer.alloc(5_000_000)]),
+    });
+    const r = await t.speak({ text });
+    expect(r.ok).toBe(true);
+    expect(t.posts).toHaveLength(pieces.length);
+    expect(t.files()).toHaveLength(1);
+  });
+
+  it("#251 r10: the fake refuses mixed layers it cannot count like the real decoder", async () => {
+    const dir = tmp();
+    fs.mkdirSync(path.join(dir, "in"));
+    fs.mkdirSync(path.join(dir, "out"));
+    const f = path.join(dir, "in", "piece-000.mp3");
+    const mp2 = mp3Frame(9);
+    mp2[1] = 0xfd;
+    fs.writeFileSync(f, Buffer.concat([mp3Frame(9), mp3Frame(9), mp2, mp3Frame(9)]));
+    expect(await fixtureSpeechAudio(dir).measure(f, { maxSeconds: 600 })).toEqual({
+      ok: false,
+      reason: "unsupported",
+    });
   });
 
   it("estimates and limits compare in whole microseconds: 20 s exactly is 20 s, whatever the classes", () => {
@@ -2193,6 +2269,98 @@ describe("speech_generate: the real sandboxed ffmpeg (#248, macOS)", () => {
         expect(d).toBeGreaterThan(2.5);
         expect(d).toBeLessThan(3.5);
       } else expect(["media_audio_corrupt", "media_audio_unsupported"]).toContain(r.code);
+    },
+  );
+
+  realIt(
+    "#251 r10: answers converted from many rate changes are never stored shortened (8 kHz call)",
+    async () => {
+      let dataDir = "";
+      const at = (rate: number, d: number) =>
+        encode([
+          "-f",
+          "lavfi",
+          "-i",
+          `sine=frequency=300:duration=${d}:sample_rate=${rate}`,
+          "-ac",
+          "1",
+          "-c:a",
+          "libmp3lame",
+          "-b:a",
+          "64k",
+          "-write_xing",
+          "0",
+          "-id3v2_version",
+          "0",
+        ]);
+      const a = at(44100, 0.25);
+      const b = at(48000, 0.25);
+      // About 15 s of 44.1/48 kHz alternating every quarter second: past the mark at its own rate.
+      const alternating = Buffer.concat(Array.from({ length: 30 }, () => [a, b]).flat());
+      const pieces = splitSpeech(LONG, LIMITS);
+      const t = await start({
+        audio: realAudio(() => dataDir),
+        answer: (input, n) =>
+          n === 0 ? tone(Math.round(speechSeconds(input, LIMITS.typical) * 10) / 10, 8000) : alternating,
+      });
+      dataDir = t.dataDir;
+      const r = await t.speak({ text: LONG });
+      // Either refused as converted with a loss, or judged at its own length (past the mark) and re-split — never a
+      // file holding the shortened audio.
+      if (r.ok) expect(t.posts.length).toBeGreaterThan(pieces.length);
+      else
+        expect(r).toMatchObject({ code: expect.stringMatching(/media_audio_unsupported|media_truncated/) });
+    },
+  );
+
+  realIt(
+    "#251 r10: near 290 s, 290 rate changes lose ~0.5 s converted to 8 kHz — that answer is unsupported",
+    async () => {
+      const { audio, put } = bench();
+      const at = (rate: number) =>
+        encode([
+          "-f",
+          "lavfi",
+          "-i",
+          `sine=frequency=300:duration=1:sample_rate=${rate}`,
+          "-ac",
+          "1",
+          "-c:a",
+          "libmp3lame",
+          "-b:a",
+          "64k",
+          "-write_xing",
+          "0",
+          "-id3v2_version",
+          "0",
+        ]);
+      const a = at(44100);
+      const b = at(48000);
+      const long = Buffer.concat(Array.from({ length: 145 }, () => [a, b]).flat());
+      // At its own rate it measures (about 301 s: 290 s and every part's encoder padding)…
+      const own = await audio.measure(put(long), M);
+      expect(own.ok && own.seconds).toBeGreaterThan(300);
+      // …converted to an 8 kHz call it loses audio at the rate changes: refused, never judged on the shorter length.
+      expect(await audio.measure(put(long), { ...M, sampleRate: 8000 })).toEqual({
+        ok: false,
+        reason: "unsupported",
+      });
+    },
+  );
+
+  realIt(
+    '#251 r10: a data folder whose path holds "|" still stores (the encoder is given plain names)',
+    async () => {
+      let dataDir = "";
+      const root = path.join(tmp(), "a|b c");
+      fs.mkdirSync(root);
+      const t = await start({ audio: realAudio(() => dataDir), answer: () => tone(2, 22050) });
+      // A working folder under that path, through the real ffmpeg.
+      dataDir = path.join(root, "data");
+      fs.mkdirSync(dataDir);
+      const r = await t.speak({ text: SENTENCES[0]! });
+      expect(r.ok).toBe(true);
+      expect(t.files()).toHaveLength(1);
     },
   );
 });

@@ -290,7 +290,7 @@ function silentFrame(rate: number): Buffer {
 /**
  * A scripted ffprobe/ffmpeg (measure, encode) for the FAKE_RUNTIME (e2e) server and tests, with the real one's
  * semantics (#251 re-plan 5) on its own small model (`fixtureMp3Frames`): `corrupt` for `FIXTURE_CORRUPT_MARK`;
- * `unsupported` when there is no Layer III frame at all; the "decode" converts every frame's samples to the call's
+ * `unsupported` when there is no Layer III frame at all, or another layer among the frames it follows; the "decode" converts every frame's samples to the call's
  * rate (the first answer's) and writes that many PCM samples (silence) into `out/`; `too_long` over the cap. The
  * "encode" writes silent frames for the PCM files' samples. It does not model the decoder's delay/padding trimming
  * or Xing/Info frames — boundary tests use counts the real decoder confirmed. No program runs.
@@ -302,9 +302,11 @@ export function fixtureSpeechAudio(dataDir: string): SpeechAudio {
     async measure(file, m): Promise<Measured> {
       const b = fs.readFileSync(file);
       if (b.includes(FIXTURE_CORRUPT_MARK, 0, "latin1")) return { ok: false, reason: "corrupt" };
-      const frames = fixtureMp3Frames(b).filter((f) => f.layer === 1);
+      const frames = fixtureMp3Frames(b);
       const first = frames[0];
-      if (!first) return { ok: false, reason: "unsupported" };
+      // No Layer III frame, or another layer among them: the fake does not model how the real decoder plays mixed
+      // layers (it cannot even follow MP2 frames' lengths) — it refuses them; real-decoder tests cover that case.
+      if (!first || frames.some((f) => f.layer !== 1)) return { ok: false, reason: "unsupported" };
       const sampleRate = m.sampleRate ?? first.rate;
       const samples = Math.round(frames.reduce((a, f) => a + (f.samples * sampleRate) / f.rate, 0));
       if (samples > m.maxSeconds * sampleRate) return { ok: false, reason: "too_long" };
