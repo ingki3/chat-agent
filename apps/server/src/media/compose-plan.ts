@@ -24,7 +24,7 @@ import {
  * - **the sound**: the clips' PCM crossfaded where their pictures are, the narration placed at its samples (both mixed by
  *   `compose-run.ts`, sample-exact), then one ffmpeg graph — the clips' own sound and the music ducked under the
  *   narration (`sidechaincompress`), the music looped and faded, `loudnorm` — to AAC of exactly the picture's samples;
- * - **the file**: picture copied + AAC + the subtitles as a `mov_text` track.
+ * - **the file**: picture copied + AAC + the subtitles (ASS, `toAss`) as a `mov_text` track.
  */
 
 export const FPS = COMPOSE_LIMITS.fps;
@@ -202,7 +202,8 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
     const length = info.durationSec ?? 0;
     const start = c.trim?.startSec ?? 0;
     const end = c.trim ? Math.min(c.trim.endSec, length) : length;
-    if (start >= length - 1 / FPS)
+    // Review r2: the start must be inside the source; whether the selection makes a frame is checked below.
+    if (start >= length - 1e-6)
       return err(
         "compose_invalid_timeline",
         `${where}.trim.startSec: the video is ${length.toFixed(2)} s long`,
@@ -342,7 +343,8 @@ export function cueText(raw: string): string {
       .replace(/\r\n?/g, "\n")
       // eslint-disable-next-line no-control-regex -- control characters are not part of a cue
       .replace(/[\0-\x09\x0b-\x1f\x7f-\x9f]/g, "")
-      .replace(/<[^>]*>/g, "")
+      // Only real markup (`<b>`, `</i>`, `<font color=…>`, `<br>` …) is removed — a plain "<" or ">" is text (review r2).
+      .replace(/<\/?(?:b|i|u|s|font|br)(?:\s[^<>]*)?\/?>/gi, "")
       // Only an override block (`{\an8}`, `{\i1}`) is control syntax; plain braces are text (review r1).
       .replace(/\{\\[^}]*\}/g, "")
       .replace(/\\/g, "＼")
@@ -367,11 +369,41 @@ type Cue = { startSec: number; endSec: number; text: string };
 const cues = (subs: readonly Cue[]) =>
   subs.map((s) => ({ ...s, text: cueText(s.text) })).filter((s) => s.text);
 
-/** The SRT the mux turns into the MP4's `mov_text` track. */
-export function toSrt(subs: readonly Cue[]): string {
-  return cues(subs)
-    .map((s, i) => `${i + 1}\n${clock(s.startSec, ",")} --> ${clock(s.endSec, ",")}\n${s.text}\n`)
-    .join("\n");
+/** ASS time: `H:MM:SS.cc`. */
+const assClock = (sec: number) => {
+  const cs = Math.max(0, Math.round(sec * 100));
+  const h = Math.floor(cs / 360_000);
+  const m = Math.floor((cs % 360_000) / 6000);
+  const s = Math.floor((cs % 6000) / 100);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${h}:${p(m)}:${p(s)}.${p(cs % 100)}`;
+};
+
+/**
+ * The subtitles the mux turns into the MP4's `mov_text` track (review r2): ASS, because its decoder takes text as it is
+ * — "<", ">" and "&" are plain characters there (ffmpeg's SRT decoder drops anything that looks like a tag, its WebVTT
+ * decoder mangles braces). The cue text has no backslash (`cueText`) and no override block, so nothing in it is ASS
+ * syntax; its lines are joined with ASS's own line break.
+ */
+export function toAss(subs: readonly Cue[]): string {
+  return [
+    "[Script Info]",
+    "ScriptType: v4.00+",
+    "PlayResX: 384",
+    "PlayResY: 288",
+    "",
+    "[V4+ Styles]",
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+    "Style: Default,Arial,16,&Hffffff,&Hffffff,&H0,&H0,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,0",
+    "",
+    "[Events]",
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ...cues(subs).map(
+      (s) =>
+        `Dialogue: 0,${assClock(s.startSec)},${assClock(s.endSec)},Default,,0,0,0,,${s.text.split("\n").join("\\N")}`,
+    ),
+    "",
+  ].join("\n");
 }
 
 /** The WebVTT of the card's player (`<track>`): the same cues, `&`, `<` and `>` escaped. */
@@ -469,6 +501,9 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
       ? `scale=${w}:${h}:force_original_aspect_ratio=increase:force_divisible_by=2,crop=${w}:${h}`
       : `scale=${w}:${h}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black`;
   const exact = `trim=end_frame=${N},settb=1/${FPS},setpts=N,fps=${FPS}`;
+  // Review r2: an image's transparent parts are black (its colour multiplied by its alpha) — never the hidden colour
+  // under them.
+  const opaque = "format=rgba,premultiply=inplace=1";
   let picture: string;
   if (c.kind === "image") {
     // A Ken Burns move takes the clip's own frames; frames held for the narration repeat its last one (review r1).
@@ -482,12 +517,19 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
       right: `z='1.15':x='(iw-iw/zoom)*on/${last}':y='ih/2-(ih/zoom/2)'`,
     };
     picture = c.kenBurns
-      ? `[0:v]trim=end_frame=1,${square},${fit(W * 2, H * 2)},setsar=1,format=yuv420p,zoompan=${kb[c.kenBurns]}:d=${moving}:s=${W}x${H}:fps=${FPS},tpad=stop_mode=clone:stop=-1,${exact}`
-      : `[0:v]trim=end_frame=1,${square},${fit(W, H)},setsar=1,format=yuv420p,loop=loop=${N - 1}:size=1:start=0,${exact}`;
+      ? `[0:v]trim=end_frame=1,${opaque},${square},${fit(W * 2, H * 2)},setsar=1,format=yuv420p,zoompan=${kb[c.kenBurns]}:d=${moving}:s=${W}x${H}:fps=${FPS},tpad=stop_mode=clone:stop=-1,${exact}`
+      : `[0:v]trim=end_frame=1,${opaque},${square},${fit(W, H)},setsar=1,format=yuv420p,loop=loop=${N - 1}:size=1:start=0,${exact}`;
   } else {
-    // One time origin for picture and sound (review r1): the seek point is 0 for both — a picture that starts late
-    // repeats its first frame from 0 (`fps` `start_time`), a sound that starts late is preceded by silence.
-    picture = `[0:v]fps=${FPS}:start_time=0,${square},${fit(W, H)},setsar=1,format=yuv420p,tpad=stop_mode=clone:stop=-1,${exact}`;
+    // The trim on one timeline (reviews r1–r2). The input is opened at the keyframe before the trim's start (`-ss`
+    // without accurate seeking), and the trim's start is 0 for picture and sound alike. The picture: its last frame
+    // repeated past its end (a picture that ends before the trim's start, or inside it, holds), then 30 fps from 0 —
+    // each slot shows the frame on screen at that moment, also the one already showing at the start (a slide of a
+    // 1 fps video) and the first one when the picture starts late —, the trim's own frames, then held to the clip's
+    // length. The sound: cut exactly at the trim (0 … its length), silence before a sound that starts late.
+    const own = Math.max(1, Math.round(c.useSec * FPS));
+    picture =
+      `[0:v]tpad=stop_mode=clone:stop=-1,fps=${FPS}:start_time=0,trim=end_frame=${own},` +
+      `${square},${fit(W, H)},setsar=1,format=yuv420p,tpad=stop_mode=clone:stop=-1,${exact}`;
   }
   const outs: { label: string; from: number; to: number; args: string[] }[] = [];
   if (c.head) outs.push({ label: "hv", from: 0, to: c.head, args: [...LOSSLESS, p.head] });
@@ -501,10 +543,11 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
       : `${picture},split=${outs.length}${outs.map((_, k) => `[s${k}]`).join("")}`,
     ...outs.map((o, k) => `[s${k}]trim=start_frame=${o.from}:end_frame=${o.to},setpts=N[${o.label}]`),
     c.kind === "video" && c.hasAudio
-      ? `[0:a:0]aresample=${RATE}:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,volume=${num(c.volume)},apad,atrim=end_sample=${N * SPF}[a]`
+      ? `[0:a:0]atrim=start=0:end=${num(Math.max(c.useSec, 1 / FPS))},aresample=${RATE}:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,volume=${num(c.volume)},apad,atrim=end_sample=${N * SPF}[a]`
       : `anullsrc=r=${RATE}:cl=stereo,atrim=end_sample=${N * SPF},aformat=sample_fmts=s16[a]`,
   ].join(";");
-  const seek = c.kind === "video" ? ["-ss", num(c.startSec), "-t", num(Math.max(c.useSec, 1 / FPS))] : [];
+  // No input duration: the graph's trims end the run (an input `-t` would also cut what precedes the seek point).
+  const seek = c.kind === "video" ? ["-noaccurate_seek", "-ss", num(c.startSec)] : [];
   return [
     ...FF_COMMON,
     ...PROGRESS,
@@ -667,7 +710,7 @@ export function muxArgs(o: { subtitles: boolean; out: string; maxBytes: number }
     "mov",
     "-i",
     "audio.m4a",
-    ...(o.subtitles ? ["-protocol_whitelist", "file,pipe", "-f", "srt", "-i", "subs.srt"] : []),
+    ...(o.subtitles ? ["-protocol_whitelist", "file,pipe", "-f", "ass", "-i", "subs.ass"] : []),
     "-map",
     "0:v:0",
     "-map",

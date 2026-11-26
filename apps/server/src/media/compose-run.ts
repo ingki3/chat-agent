@@ -18,6 +18,7 @@ import {
   planTimeline,
   probeArgs,
   SPF,
+  toAss,
   transitionArgs,
   verifyArgs,
   workUnits,
@@ -52,7 +53,8 @@ export type Composer = {
   compose(job: {
     dir: string;
     plan: Plan;
-    srt: string | null;
+    /** The subtitles as ASS (`toAss`), or null without any. */
+    subs: string | null;
     signal: AbortSignal;
     deadlineAt: number;
     onProgress: (fraction: number) => void;
@@ -515,10 +517,10 @@ export function sandboxedComposer(o: {
       return { ok: false, code: "compose_failed" };
     }
     // 4. The file.
-    if (job.srt) fs.writeFileSync(path.join(work, "subs.srt"), job.srt, { flag: "wx", mode: 0o600 });
+    if (job.subs) fs.writeFileSync(path.join(work, "subs.ass"), job.subs, { flag: "wx", mode: 0o600 });
     const result = path.join(outDir, "result.mp4");
     const code = await step(
-      muxArgs({ subtitles: !!job.srt, out: result, maxBytes: COMPOSE_LIMITS.maxBytes }),
+      muxArgs({ subtitles: !!job.subs, out: result, maxBytes: COMPOSE_LIMITS.maxBytes }),
       units.mux,
       plan.frames / 30,
       { read: [work], write: [outDir] },
@@ -539,7 +541,7 @@ export function sandboxedComposer(o: {
       signal: job.signal,
       maxOutputBytes: 64 * 1024,
     });
-    if (decodeVerdict(v) !== "ok" || !judgeResult(v!.stdout, plan, !!job.srt))
+    if (decodeVerdict(v) !== "ok" || !judgeResult(v!.stdout, plan, !!job.subs))
       return { ok: false, code: "compose_verify_failed" };
     return { ok: true, file: result, bytes };
   };
@@ -574,7 +576,7 @@ async function readyOf(c: Composer, signal?: AbortSignal): Promise<boolean> {
     const r = await c.compose({
       dir,
       plan,
-      srt: "1\n00:00:00,000 --> 00:00:00,400\nok\n",
+      subs: toAss([{ startSec: 0, endSec: 0.4, text: "ok" }]),
       signal: signal ?? new AbortController().signal,
       deadlineAt: Date.now() + 120_000,
       onProgress: () => {},

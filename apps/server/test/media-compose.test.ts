@@ -30,7 +30,7 @@ import {
   cueText,
   isPlanError,
   planTimeline,
-  toSrt,
+  toAss,
   toVtt,
   type InputInfo,
   type Plan,
@@ -91,7 +91,14 @@ let media:
       | "shortSound"
       | "anamorphic"
       | "long"
-      | "n3",
+      | "n3"
+      | "rgb1fps"
+      | "vfr"
+      | "bframes"
+      | "v1a4"
+      | "frame30"
+      | "alphaBlue"
+      | "alphaRed",
       string
     >
   | undefined;
@@ -173,12 +180,111 @@ function inputs() {
     ...["-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "10", path.join(dir, "long.mp4")],
   );
   ff("-f", "lavfi", "-i", "sine=f=330:r=48000:d=3", "-c:a", "libmp3lame", path.join(dir, "n3.mp3"));
+  // Review r2 inputs. Colours by time: red, then blue, then green (the frame on screen decides a trim's first frame).
+  const rgb = (cut1: number, cut2: number) =>
+    `format=rgb24,geq=r='if(lt(T\\,${cut1})\\,255\\,0)':g='if(gte(T\\,${cut2})\\,255\\,0)':b='if(between(T\\,${cut1}\\,${cut2 - 0.001})\\,255\\,0)'`;
+  // 1 fps (a slide every second), one keyframe.
+  ff(
+    "-f",
+    "lavfi",
+    "-i",
+    `nullsrc=s=64x64:r=1:d=3,${rgb(1, 2)}`,
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-g",
+    "30",
+    path.join(dir, "rgb1fps.mp4"),
+  );
+  // Variable frame rate: frames at 0, 0.7 and 2.3 s (red, blue, green), kept as they are.
+  const vfr = path.join(dir, "vfr");
+  fs.mkdirSync(vfr);
+  for (const [c, n] of [
+    ["red", "r"],
+    ["blue", "b"],
+    ["lime", "g"],
+  ] as const)
+    ff("-f", "lavfi", "-i", `color=c=${c}:s=64x64`, "-frames:v", "1", path.join(vfr, `${n}.png`));
+  fs.writeFileSync(
+    path.join(vfr, "list.txt"),
+    "ffconcat version 1.0\nfile 'r.png'\nduration 0.7\nfile 'b.png'\nduration 1.6\nfile 'g.png'\nduration 1\nfile 'g.png'\n",
+  );
+  ff(
+    "-f",
+    "concat",
+    "-i",
+    path.join(vfr, "list.txt"),
+    "-fps_mode",
+    "vfr",
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    path.join(dir, "vfr.mp4"),
+  );
+  // 30 fps with B-frames (x264's default), red until 1 s, then blue (green never).
+  ff(
+    "-f",
+    "lavfi",
+    "-i",
+    `nullsrc=s=64x64:r=30:d=2,${rgb(1, 9)}`,
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-bf",
+    "3",
+    path.join(dir, "bframes.mp4"),
+  );
+  // 1 s of picture with 4 s of sound; exactly 1 s at 30 fps (30 frames).
+  ff(
+    ...["-f", "lavfi", "-i", "testsrc2=s=64x64:r=30:d=1", "-f", "lavfi", "-i", "sine=f=440:r=48000:d=4"],
+    ...["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", path.join(dir, "v1a4.mp4")],
+  );
+  ff(
+    "-f",
+    "lavfi",
+    "-i",
+    `nullsrc=s=64x64:r=30:d=1,${rgb(0.95, 9)}`,
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    path.join(dir, "frame30.mp4"),
+  );
+  // Fully transparent PNGs whose hidden colours differ.
+  ff(
+    "-f",
+    "lavfi",
+    "-i",
+    "color=c=blue@0.0:s=64x64,format=rgba",
+    "-frames:v",
+    "1",
+    path.join(dir, "alpha-blue.png"),
+  );
+  ff(
+    "-f",
+    "lavfi",
+    "-i",
+    "color=c=red@0.0:s=64x64,format=rgba",
+    "-frames:v",
+    "1",
+    path.join(dir, "alpha-red.png"),
+  );
   media = {
     late: path.join(dir, "late.mov"),
     shortSound: path.join(dir, "short.mp4"),
     anamorphic: path.join(dir, "ana.mp4"),
     long: path.join(dir, "long.mp4"),
     n3: path.join(dir, "n3.mp3"),
+    rgb1fps: path.join(dir, "rgb1fps.mp4"),
+    vfr: path.join(dir, "vfr.mp4"),
+    bframes: path.join(dir, "bframes.mp4"),
+    v1a4: path.join(dir, "v1a4.mp4"),
+    frame30: path.join(dir, "frame30.mp4"),
+    alphaBlue: path.join(dir, "alpha-blue.png"),
+    alphaRed: path.join(dir, "alpha-red.png"),
     png: path.join(dir, "a.png"),
     wide: path.join(dir, "wide.png"),
     video: path.join(dir, "v.mp4"),
@@ -487,10 +593,14 @@ describe("the plan (review R1–R3)", () => {
       { startSec: 61.5, endSec: 3725.004, text: "<i></i>" },
       { startSec: 62, endSec: 63, text: "끝" },
     ];
-    // A cue that is only tags is dropped; a lone "<" is text.
-    expect(toSrt(subs)).toBe(
-      "1\n00:00:00,250 --> 00:00:01,000\nA & B < C\n\n2\n00:01:02,000 --> 00:01:03,000\n끝\n",
-    );
+    // A cue that is only tags is dropped; a lone "<" is text; lines joined with ASS's own break (review r2: the mux
+    // reads ASS, which takes "<", ">" and "&" as they are).
+    const ass = toAss([...subs, { startSec: 64, endSec: 65, text: "첫 줄\n둘째, 줄" }]);
+    expect(ass.split("\n").filter((l) => l.startsWith("Dialogue:"))).toEqual([
+      "Dialogue: 0,0:00:00.25,0:00:01.00,Default,,0,0,0,,A & B < C",
+      "Dialogue: 0,0:01:02.00,0:01:03.00,Default,,0,0,0,,끝",
+      "Dialogue: 0,0:01:04.00,0:01:05.00,Default,,0,0,0,,첫 줄\\N둘째, 줄",
+    ]);
     expect(toVtt([{ startSec: 0, endSec: 1, text: "A & B > C" }])).toBe(
       "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nA &amp; B &gt; C\n",
     );
@@ -1059,6 +1169,117 @@ describe("review r1: the engine's state (fixture composer)", () => {
   });
 });
 
+describe("review r2: the engine's one running slot", () => {
+  it("a read that fails at any step of a run never leaves the slot held: the next user's job still runs", async () => {
+    // Fail the k-th database read the engine makes after a job is queued — each k is another step of the run loop
+    // (the pass, the reap, the queue's next, the cards told, the run's reads, the store's guard…).
+    for (let k = 1; k <= 14; k++) {
+      const t = await start({ composer: (d) => fixtureComposer(d, { stepMs: 1 }) });
+      const a = await t.scopeOf("owner");
+      const b = await t.scopeOf("shared");
+      const ia = await t.putFile(a, inputsOrFake().png, "png");
+      const ib = await t.putFile(b, inputsOrFake().png, "png");
+      const ja = await t.queue(a, { clips: [{ fileId: ia, durationSec: 1 }] });
+      // Right after the call: the engine's pass it scheduled has not run yet.
+      const orig = t.db.select.bind(t.db);
+      let n = 0;
+      const spy = vi.spyOn(t.db, "select").mockImplementation(((...args: Parameters<typeof orig>) => {
+        n += 1;
+        if (n === k) throw new Error("synthetic read failure");
+        return orig(...args);
+      }) as typeof t.db.select);
+      await t.jobs.idle();
+      await new Promise((r) => setTimeout(r, 20));
+      await t.jobs.idle();
+      spy.mockRestore();
+      // A few passes later, A has ended one way or the other — and B runs to its end.
+      for (let i = 0; i < 4; i++) await t.drive();
+      const jb = await t.queue(b, { clips: [{ fileId: ib, durationSec: 1 }] });
+      for (let i = 0; i < 4; i++) await t.drive();
+      expect([k, ["done", "failed"].includes(t.job(ja).status)]).toEqual([k, true]);
+      expect([k, t.job(jb).status]).toEqual([k, "done"]);
+      expect(
+        t.db.$client.prepare("SELECT count(*) n FROM compose_jobs WHERE status = 'running'").get(),
+      ).toEqual({ n: 0 });
+      await t.app.close();
+    }
+  }, 300_000);
+
+  it("a waiting job's card hears it moved up when the one before it is deleted", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => (release = r));
+    const t = await start({
+      composer: (d) => {
+        const base = fixtureComposer(d, { stepMs: 1 });
+        return { ...base, compose: async (job) => (await gate, base.compose(job)) };
+      },
+    });
+    const run = await t.scopeOf("owner");
+    const first = await t.scopeOf("shared");
+    const second = await t.scopeOf("stranger");
+    const [ir, i1, i2] = [
+      await t.putFile(run, inputsOrFake().png, "png"),
+      await t.putFile(first, inputsOrFake().png, "png"),
+      await t.putFile(second, inputsOrFake().png, "png"),
+    ];
+    await t.queue(run, { clips: [{ fileId: ir, durationSec: 1 }] });
+    await new Promise((r) => setTimeout(r, 20));
+    await t.queue(first, { clips: [{ fileId: i1, durationSec: 1 }] });
+    const j2 = await t.queue(second, { clips: [{ fileId: i2, durationSec: 1 }] });
+    expect(t.jobs.view(t.job(j2)).queuePosition).toBe(2);
+    const heard: (number | null)[] = [];
+    const off = t.jobs.subscribe(j2, () => heard.push(t.jobs.view(t.job(j2)).queuePosition));
+    expect(
+      (await t.api(t.f.cookies.shared, "DELETE", `/api/conversations/${first.conversationId}`)).statusCode,
+    ).toBeLessThan(300);
+    off();
+    expect(heard).toContain(1);
+    release!();
+    await t.jobs.idle();
+  });
+});
+
+describe("review r2: the plan (pure)", () => {
+  it("the last frame of a video is a valid trim; a start at the source's end is not", () => {
+    const I = ins(info("v", { kind: "video", durationSec: 1 }));
+    expect(
+      planTimeline({ clips: [{ fileId: "v", trim: { startSec: 29 / 30, endSec: 1 } }] }, I),
+    ).toMatchObject({
+      frames: 1,
+    });
+    expect(planTimeline({ clips: [{ fileId: "v", trim: { startSec: 1, endSec: 1.01 } }] }, I)).toMatchObject({
+      hint: expect.stringContaining("trim.startSec"),
+    });
+  });
+
+  it("only real markup leaves a cue; plain < > stay (both tracks)", () => {
+    expect(cueText("1 < 2 이고 4 > 3")).toBe("1 < 2 이고 4 > 3");
+    expect(cueText('<b>굵게</b> <I>기울임</I> <font color="red">빨강</font> 줄<br>바꿈 <3')).toBe(
+      "굵게 기울임 빨강 줄바꿈 <3",
+    );
+    expect(toVtt([{ startSec: 0, endSec: 1, text: "1 < 2 & 4 > 3" }])).toContain(
+      "\n1 &lt; 2 &amp; 4 &gt; 3\n",
+    );
+  });
+
+  it("a trimmed video is opened at the keyframe before its start, and its frames counted from that start", () => {
+    const p = planTimeline(
+      { clips: [{ fileId: "v", trim: { startSec: 2, endSec: 3 } }] },
+      ins(info("v", { kind: "video", durationSec: 4 })),
+    ) as Plan;
+    const a = clipArgs(p, 0, "/in");
+    expect(a.slice(a.indexOf("-noaccurate_seek"), a.indexOf("-noaccurate_seek") + 3)).toEqual([
+      "-noaccurate_seek",
+      "-ss",
+      "2",
+    ]);
+    expect(a).not.toContain("-t");
+    const g = a[a.indexOf("-filter_complex") + 1]!;
+    expect(g).toContain("fps=30:start_time=0,trim=end_frame=30,");
+    expect(g).toContain("atrim=start=0:end=1,");
+  });
+});
+
 describe("review r1: the plan (pure)", () => {
   it("trims point into the source by its own length; a short video clip is fine; 0.5 s is an image's minimum", () => {
     const I = ins(
@@ -1144,6 +1365,13 @@ function inputsOrFake() {
     anamorphic: w("an.mp4", "mp4"),
     long: w("lo.mp4", "mp4"),
     n3: w("n3.mp3", "mp3"),
+    rgb1fps: w("r1.mp4", "mp4"),
+    vfr: w("vf.mp4", "mp4"),
+    bframes: w("bf.mp4", "mp4"),
+    v1a4: w("v14.mp4", "mp4"),
+    frame30: w("f30.mp4", "mp4"),
+    alphaBlue: w("ab.png", "png"),
+    alphaRed: w("ar.png", "png"),
   };
 }
 
@@ -1414,6 +1642,150 @@ describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", 
     // 30 + 30 + 21 + 9 − 15 − 15 frames.
     const v = probeJson(out2).streams.find((x) => x.codec_type === "video")!;
     expect(Number(v.nb_read_packets)).toBe(60);
+  });
+
+  // ---- review r2, with the real ffmpeg
+  const colourOf = (px: number[]) =>
+    px[0]! > 150 && px[1]! < 90 && px[2]! < 90
+      ? "red"
+      : px[2]! > 150 && px[0]! < 90 && px[1]! < 90
+        ? "blue"
+        : px[1]! > 150 && px[0]! < 90 && px[2]! < 90
+          ? "green"
+          : px[0]! < 30 && px[1]! < 30 && px[2]! < 30
+            ? "black"
+            : `other(${px.join(",")})`;
+  /** The colour at the centre of every frame of the result (decoded outside the server). */
+  const colours = (file: string) => {
+    const b = execFileSync(FFMPEG, [
+      ...[
+        "-hide_banner",
+        "-v",
+        "error",
+        "-i",
+        file,
+        "-vf",
+        "scale=16:16",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-",
+      ],
+    ]);
+    const n = b.length / (16 * 16 * 3);
+    return Array.from({ length: n }, (_, i) => {
+      const o = i * 16 * 16 * 3 + (8 * 16 + 8) * 3;
+      return colourOf([b[o]!, b[o + 1]!, b[o + 2]!]);
+    });
+  };
+
+  it("review r2: a trim starts with the frame on screen at its start — 1 fps, variable frame rate, B-frames, the last frame", async () => {
+    const t = await start({ composer: real });
+    const m = inputs();
+    // `null`: the frame at a change itself (within one 1/30 s slot of it) may be either.
+    const cases: { src: string; trim: [number, number]; want: (string | null)[] }[] = [
+      { src: m.rgb1fps, trim: [0.1, 0.4], want: Array(9).fill("red") },
+      { src: m.rgb1fps, trim: [1.1, 1.4], want: Array(9).fill("blue") },
+      { src: m.rgb1fps, trim: [2.1, 2.4], want: Array(9).fill("green") },
+      { src: m.rgb1fps, trim: [0.9, 1.1], want: [...Array(3).fill("red"), ...Array(3).fill("blue")] },
+      { src: m.vfr, trim: [0.5, 0.6], want: Array(3).fill("red") },
+      { src: m.vfr, trim: [0.8, 0.9], want: Array(3).fill("blue") },
+      { src: m.vfr, trim: [2.2, 2.4], want: [...Array(3).fill("blue"), null, "green", "green"] },
+      { src: m.bframes, trim: [0.9, 1.1], want: [...Array(3).fill("red"), ...Array(3).fill("blue")] },
+      // The last frame of an exactly-1 s, 30 fps video (review r2, P3).
+      { src: m.frame30, trim: [29 / 30, 1], want: ["blue"] },
+    ];
+    for (const c of cases) {
+      const scope = await t.scopeOf();
+      const f = await t.putFile(scope, c.src, "mp4");
+      const out = await composeOne(t, scope, {
+        clips: [{ fileId: f, trim: { startSec: c.trim[0], endSec: c.trim[1] } }],
+      });
+      const got = colours(out);
+      expect([path.basename(c.src), c.trim, got]).toEqual([
+        path.basename(c.src),
+        c.trim,
+        c.want.map((w, k) => w ?? got[k]),
+      ]);
+    }
+  });
+
+  it("review r2: a trim past a picture that ended holds its last frame, the sound cut exactly at the trim", async () => {
+    const t = await start({ composer: real });
+    const scope = await t.scopeOf();
+    const f = await t.putFile(scope, inputs().v1a4, "mp4");
+    const out = await composeOne(t, scope, { clips: [{ fileId: f, trim: { startSec: 2, endSec: 3 } }] });
+    const v = probeJson(out).streams.find((x) => x.codec_type === "video")!;
+    expect(Number(v.nb_read_packets)).toBe(30);
+    // The last frame of the picture (0.967 s), held: every frame alike.
+    const [f0, f1, f2] = [0.1, 0.5, 0.9].map((sec) => frameAt(out, sec));
+    const diff = (a: Buffer, b: Buffer) => a.reduce((n, v, i) => n + Math.abs(v - b[i]!), 0) / a.length;
+    expect(diff(f0!, f1!)).toBeLessThan(2);
+    expect(diff(f0!, f2!)).toBeLessThan(2);
+    // The sine of 2–3 s plays from the very start to the end (no silence before or after).
+    const pcm = pcmOf(out);
+    const loud = (from: number, to: number) =>
+      Math.max(...pcm.slice(Math.round(from * 48_000), Math.round(to * 48_000)).map(Math.abs));
+    expect(loud(0, 0.05)).toBeGreaterThan(1000);
+    expect(loud(0.9, 0.98)).toBeGreaterThan(1000);
+  });
+
+  it("review r2: transparent PNGs are black where transparent — never their hidden colours", async () => {
+    const t = await start({ composer: real });
+    const scope = await t.scopeOf();
+    const a = await t.putFile(scope, inputs().alphaBlue, "png");
+    const b = await t.putFile(scope, inputs().alphaRed, "png");
+    const out = await composeOne(t, scope, {
+      clips: [
+        { fileId: a, durationSec: 0.5 },
+        { fileId: b, durationSec: 0.5, kenBurns: "in" },
+      ],
+    });
+    expect(new Set(colours(out))).toEqual(new Set(["black"]));
+  });
+
+  it("review r2: subtitles keep plain < > & and braces — the MP4's track and the card's VTT decode to the text given", async () => {
+    const t = await start({ composer: real });
+    const scope = await t.scopeOf();
+    const img = await t.putFile(scope, inputs().png, "png");
+    const texts = ["1 < 2 이고 4 > 3", "집합 {1, 2}와 A & B", "<3 하트 -> 끝"];
+    const id = await t.queue(scope, {
+      clips: [{ fileId: img, durationSec: 3 }],
+      subtitles: texts.map((text, i) => ({ startSec: i, endSec: i + 0.9, text })),
+    });
+    await t.drive();
+    const done = t.job(id);
+    expect(done.status, String(done.errorCode)).toBe("done");
+    const out = t.app.files!.pathOf(t.app.files!.get(done.fileId!)!);
+    const srt = execFileSync(FFMPEG, [
+      "-hide_banner",
+      "-v",
+      "error",
+      "-i",
+      out,
+      "-map",
+      "0:s:0",
+      "-f",
+      "srt",
+      "-",
+    ]).toString();
+    const fromMp4 = srt
+      .split(/\r?\n\r?\n/)
+      .map((b) => b.split(/\r?\n/).slice(2).join("\n"))
+      .filter(Boolean);
+    expect(fromMp4).toEqual(texts);
+    const vtt = (await t.api(t.f.cookies.owner, "GET", `/api/compose-jobs/${id}/subtitles.vtt`)).body;
+    const fromVtt = vtt
+      .split("\n\n")
+      .slice(1)
+      .map((b) => b.split("\n").slice(1).filter(Boolean).join("\n"))
+      .filter(Boolean)
+      .map((x) => x.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&"));
+    expect(fromVtt).toEqual(texts);
+    // Escaped in the VTT itself: no raw "<", ">" or bare "&" in a cue.
+    const cueLines = vtt.split("\n").filter((l) => l && !l.includes("-->") && l !== "WEBVTT");
+    expect(cueLines.join("\n")).not.toMatch(/[<>]|&(?!lt;|gt;|amp;)/);
   });
 
   it("readiness: a tiny composition checked in the same sandbox", async () => {

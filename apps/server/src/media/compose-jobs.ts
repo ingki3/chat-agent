@@ -36,7 +36,7 @@ import {
   inputKindOf,
   isPlanError,
   planTimeline,
-  toSrt,
+  toAss,
   toVtt,
   type InputInfo,
   type Plan,
@@ -164,7 +164,12 @@ export class ComposeJobs {
   private stopping = false;
   private recovered = false;
   private swept = false;
-  private running: string | undefined;
+  /**
+   * The engine's one running slot (review r2): the live executor of a job — set in the same synchronous step as the
+   * row becomes `running`, cleared only by that executor's own end. Nothing else decides whether the engine is busy, so
+   * a failure anywhere in a run cannot leave the slot held by a job no executor runs.
+   */
+  private executor: { id: string; done: Promise<void> } | undefined;
   private ready: { ok: boolean | null; at: number | null; checking?: Promise<boolean> } = {
     ok: null,
     at: null,
@@ -197,7 +202,23 @@ export class ComposeJobs {
         else removeComposeWorkdir(this.folderOf(id));
         this.changed(id);
       }
+      // The jobs still waiting may have moved up (review r2).
+      if (ids.length) this.queuedChanged();
     });
+  }
+
+  /** Every waiting job's card hears that its place in the queue may have changed. Never throws. */
+  private queuedChanged(): void {
+    try {
+      for (const q of this.o.db
+        .select({ id: composeJobs.id })
+        .from(composeJobs)
+        .where(eq(composeJobs.status, "queued"))
+        .all())
+        this.changed(q.id);
+    } catch {
+      // the cards read their state again on their own (stream or polling)
+    }
   }
 
   /** A job's working folder (`compose-scratch/<id>`). */
@@ -807,7 +828,7 @@ export class ComposeJobs {
       .from(composeJobs)
       .where(and(inArray(composeJobs.status, ["preparing", "running"]), eq(composeJobs.boot, this.boot)))
       .all()) {
-      if (this.work.has(r.id)) continue;
+      if (this.work.has(r.id) || this.executor?.id === r.id) continue;
       if (r.status === "preparing") this.discard(r.id, this.folderOf(r.id));
       else this.finish(r.id, "compose_failed");
     }
@@ -815,7 +836,7 @@ export class ComposeJobs {
 
   /** The oldest queued job of this process, running — when none runs (one at a time in all). */
   private startNext(): Promise<unknown> | undefined {
-    if (!this.recovered || this.running || this.stopping) return undefined;
+    if (!this.recovered || this.executor || this.stopping) return undefined;
     const busy = this.o.db
       .select({ id: composeJobs.id })
       .from(composeJobs)
@@ -842,37 +863,44 @@ export class ComposeJobs {
       .where(and(eq(composeJobs.id, next.id), eq(composeJobs.status, "queued")))
       .run();
     if (r.changes !== 1) return undefined;
-    this.running = next.id;
-    // The others' queue positions moved too.
-    this.changed(next.id);
-    for (const q of this.o.db
-      .select({ id: composeJobs.id })
-      .from(composeJobs)
-      .where(eq(composeJobs.status, "queued"))
-      .all())
-      this.changed(q.id);
-    logEvent(this.o.log, "info", "compose.started", {
-      userId: next.ownerId,
-      conversationId: next.conversationId,
-      composeJobId: next.id,
-    });
+    // The row is `running`: its executor takes the slot in this same synchronous step (nothing between can throw).
     const stop = new AbortController();
-    const done = this.run(next.id, stop.signal)
-      .catch((e: unknown) => {
-        logEvent(this.o.log, "warn", "error", { composeJobId: next.id, err: e });
-        try {
-          this.finish(next.id, "compose_failed");
-        } catch {
-          // the next start interrupts it
-        }
-      })
-      .finally(() => {
-        this.work.delete(next.id);
-        if (this.running === next.id) this.running = undefined;
-        if (!this.stopping) setImmediate(() => void this.tick());
-      });
+    const done = this.execute(next, stop.signal);
+    this.executor = { id: next.id, done };
     this.work.set(next.id, { stop, done });
     return done;
+  }
+
+  /**
+   * A job's executor: everything after the row became `running` — the cards told, the composition, its file — and,
+   * whatever fails on the way, its end and the slot's release. Never rejects.
+   */
+  private async execute(next: ComposeJobRow, signal: AbortSignal): Promise<void> {
+    const id = next.id;
+    try {
+      // After the slot is taken (`startNext` registers it right after this call returns).
+      await Promise.resolve();
+      this.changed(id);
+      // The others' queue positions moved too.
+      this.queuedChanged();
+      logEvent(this.o.log, "info", "compose.started", {
+        userId: next.ownerId,
+        conversationId: next.conversationId,
+        composeJobId: id,
+      });
+      await this.run(id, signal);
+    } catch (e) {
+      logEvent(this.o.log, "warn", "error", { composeJobId: id, err: e });
+      try {
+        this.finish(id, "compose_failed");
+      } catch {
+        // reaped by a later pass (or interrupted by the next start)
+      }
+    } finally {
+      this.work.delete(id);
+      if (this.executor?.id === id) this.executor = undefined;
+      if (!this.stopping) setImmediate(() => void this.tick());
+    }
   }
 
   /** One job: the composition, its check and its file — or why not. Its folder goes at the end, whatever happened. */
@@ -891,16 +919,16 @@ export class ComposeJobs {
       if (!row || row.status !== "running") return;
       if (!composer || !row.planJson) return void this.finish(id, "compose_failed");
       const plan = JSON.parse(row.planJson) as Plan;
-      let srt: string | null = null;
+      let subs: string | null = null;
       if (row.subtitles) {
         const t = ComposeTimeline.safeParse(scrubKnownDeep(JSON.parse(row.timelineJson) as unknown));
-        srt = t.success && t.data.subtitles?.length ? toSrt(t.data.subtitles) || null : null;
+        subs = t.success && t.data.subtitles?.some((x) => cueText(x.text)) ? toAss(t.data.subtitles) : null;
       }
       const deadlineAt = this.now() + this.limits.timeoutMs;
       const deadline = new AbortController();
-      // Review r1: the deadline holds until the file is committed — its moment ends the job at once (the slot and the
-      // file place free, the engine goes on); the work stops, and a store still waiting for the file lock finds the
-      // job no longer running (nothing is committed late).
+      // Review r1: the deadline holds until the file is committed — its moment ends the job at once (its row: the
+      // users' slots and the file place free); the work stops, and a store still waiting for the file lock finds the
+      // job no longer running (nothing is committed late). The engine's slot is its executor's until that ends.
       const timer = setTimeout(
         () => {
           deadline.abort();
@@ -909,8 +937,6 @@ export class ComposeJobs {
           } catch {
             // reaped by a later pass
           }
-          if (this.running === id) this.running = undefined;
-          if (!this.stopping) setImmediate(() => void this.tick());
         },
         Math.max(1, deadlineAt - this.now()),
       );
@@ -920,7 +946,7 @@ export class ComposeJobs {
         const outcome = await composer.compose({
           dir: realDir,
           plan,
-          srt,
+          subs,
           signal: both,
           deadlineAt: Date.now() + (deadlineAt - this.now()),
           onProgress: (f) => {

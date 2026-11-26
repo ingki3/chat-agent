@@ -511,7 +511,7 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "video_jobs.lease_boot": { exempt: "a random process id the server made (the engine's lease)" },
   // 멀티미디어 합성 (#238 stage 4, review R12): the timeline's subtitle texts are the user's — checked by the egress
   // predicate at the call (a timeline carrying a known secret makes no job), scrubbed on write and again by the rescrub.
-  // The SRT and the WebVTT are made from this one column; `plan_json` holds no user text.
+  // The ASS (the MP4's track) and the WebVTT are made from this one column; `plan_json` holds no user text.
   "compose_jobs.id": ID,
   "compose_jobs.conversation_id": ID,
   "compose_jobs.owner_id": ID,
