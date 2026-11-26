@@ -201,3 +201,110 @@ export function speechPricing(
   if (speechCostBound(endpoints, { text: "가" }) === null) return { ok: false, reason: "no_price" };
   return { ok: true, endpoints };
 }
+
+// ---------------------------------------------------------------- video (#238 stage 3)
+
+/**
+ * SKUs of `/videos/models`' `pricing_skus` that bill inputs this server never sends (reference or first-frame images,
+ * a video input, a continuation of an earlier job): left out of a bound.
+ */
+const VIDEO_UNSENT =
+  /^(cents_per_image_input|reference_images|reference_input_images)$|_with_video_input|video_continuation/;
+/** A per-second SKU (USD per second; the `cents_*` ones in cents) and what follows its name. */
+const VIDEO_PER_SECOND = [
+  { re: /^(?:long_)?(?:reference_)?duration_seconds(.*)$/, cents: false },
+  { re: /^cents_per_(?:video_output_second|second_output)(.*)$/, cents: true },
+] as const;
+/** A resolution tier as OpenRouter suffixes it (`_720p`, `_1080p`, `_2k`, `_4k`, …). */
+const VIDEO_TIER = /^_(\d{3,4}p|\dk)$/;
+
+export type VideoPricing =
+  | { ok: true }
+  | {
+      ok: false;
+      /** `token_priced`: a `video_tokens*` price (no bound from a length); `no_price`: none usable or unreadable. */
+      reason: "token_priced" | "no_price";
+    };
+
+/**
+ * One SKU read: a per-second price (USD) and the resolution tier it is for (null: every tier, the unsuffixed one), or
+ * `ignored` (an input never sent), or `unknown` (a unit this server cannot bound: `video_tokens`, megapixels, …).
+ */
+function videoSku(
+  key: string,
+  value: unknown,
+): { usdPerSec: number; tier: string | null } | "ignored" | "unknown" | "min" {
+  const k = key.toLowerCase();
+  if (VIDEO_UNSENT.test(k)) return "ignored";
+  if (k === "minimum_cents_per_generation") return "min";
+  for (const { re, cents } of VIDEO_PER_SECOND) {
+    const m = re.exec(k);
+    if (!m) continue;
+    // Sound variants (with or without — the server never sends `generate_audio`, so both count), then the tier.
+    const rest = m[1]!.replace(/_(?:with|without|no)_audio|_audio/g, "");
+    const tier = rest === "" ? null : (VIDEO_TIER.exec(rest)?.[1] ?? undefined);
+    if (tier === undefined) return "unknown";
+    const v = price(value);
+    if (v === undefined || v < 0) return "unknown";
+    return { usdPerSec: cents ? v / 100 : v, tier };
+  }
+  return "unknown";
+}
+
+/**
+ * The per-second prices of `pricing_skus`, in USD per second (the `cents_*` ones divided by 100), with the resolution
+ * tier each is for (null: every tier) — what the admin's model list shows (review r1: never raw cents as dollars).
+ * Prices this server cannot read or that bill inputs never sent are left out.
+ */
+export function videoRates(skus: unknown): { usdPerSec: number; tier: string | null }[] {
+  if (!isObj(skus)) return [];
+  const out: { usdPerSec: number; tier: string | null }[] = [];
+  for (const [key, value] of Object.entries(skus)) {
+    const s = videoSku(key, value);
+    if (typeof s === "object") out.push(s);
+  }
+  return out;
+}
+
+/**
+ * A video job's upper bound (USD) from its model's `pricing_skus` (user decision 1: only models priced per second):
+ * the dearest per-second SKU that can apply to the resolution asked for — its own tier's and the unsuffixed ones,
+ * every sound and long-length variant (the server never says whether to make sound) — times the length, at least the
+ * model's `minimum_cents_per_generation`, times `COST_MARGIN`. SKUs of inputs never sent are left out. Any other SKU
+ * this server cannot read (`video_tokens*`, per megapixel, a price that is not a number or negative) means no bound
+ * (null): the model is refused when chosen and before any request.
+ */
+export function videoCostBound(skus: unknown, o: { resolution: string; durationSec: number }): number | null {
+  if (!isObj(skus)) return null;
+  const want = o.resolution.toLowerCase();
+  let perSec: number | undefined;
+  let min = 0;
+  for (const [key, value] of Object.entries(skus)) {
+    const s = videoSku(key, value);
+    if (s === "ignored") continue;
+    if (s === "unknown") return null;
+    if (s === "min") {
+      const v = price(value);
+      if (v === undefined || v < 0) return null;
+      min = Math.max(min, v / 100);
+      continue;
+    }
+    if (s.tier !== null && s.tier !== want) continue;
+    perSec = Math.max(perSec ?? 0, s.usdPerSec);
+  }
+  if (perSec === undefined || !Number.isFinite(o.durationSec) || o.durationSec <= 0) return null;
+  return Math.max(perSec * o.durationSec, min) * COST_MARGIN;
+}
+
+/**
+ * A video model's prices judged as a job judges them (the admin's choice and every card alike): `token_priced` for a
+ * `video_tokens` price, `no_price` when no bound can be given for any tier the model lists (or none at all).
+ */
+export function videoPricing(skus: unknown, resolutions: readonly string[]): VideoPricing {
+  if (!isObj(skus) || !Object.keys(skus).length) return { ok: false, reason: "no_price" };
+  if (Object.keys(skus).some((k) => /^video_tokens/i.test(k))) return { ok: false, reason: "token_priced" };
+  const tiers = resolutions.length ? resolutions : ["720p"];
+  return tiers.some((r) => videoCostBound(skus, { resolution: r, durationSec: 1 }) !== null)
+    ? { ok: true }
+    : { ok: false, reason: "no_price" };
+}

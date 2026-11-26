@@ -182,6 +182,12 @@ export const MEDIA_ERRORS: Record<string, string> = {
     "이 이미지 모델은 벡터(SVG)만 만들어 이 서버에 저장할 수 없어요. png·jpeg·webp를 내는 모델을 고르세요.",
   media_model_no_price:
     "이 음성 모델은 가격 정보가 없거나 읽을 수 없거나 변동 가격이라 한 번 호출의 최대 비용을 정할 수 없어요. 다른 모델을 고르세요.",
+  media_model_video_no_price:
+    "이 영상 모델은 초당 가격이 없거나 읽을 수 없는 가격 단위가 있어 한 번 생성의 최대 비용을 정할 수 없어요. 초당 가격이 있는 모델을 고르세요.",
+  media_model_video_token_priced:
+    "이 영상 모델은 토큰(video_tokens) 단위로 과금돼 한 번 생성의 최대 비용을 정할 수 없어요. 초당 가격이 있는 모델을 고르세요.",
+  media_model_video_unsupported:
+    "이 영상 모델은 이 서버가 쓰는 길이·해상도(1080p 이하) 조합을 알려 주지 않아요. 다른 모델을 고르세요.",
   media_model_output_priced:
     "이 음성 모델은 만든 음성의 양(오디오 토큰·초)으로 과금돼 한 번 호출의 최대 비용을 정할 수 없어요. 글자(입력) 기준으로 과금되는 모델을 고르세요.",
 };
@@ -219,6 +225,8 @@ export const MEDIA_TOOL_LIMITS = {
   speechMeasureTimeoutMs: 60_000,
   /** #248: one ffmpeg join (it may run twice: once more at a lower rate when over 50MB). */
   speechJoinTimeoutMs: 180_000,
+  /** `video_generate` (#238 stage 3): the prompt's length. */
+  videoPromptChars: 2000,
   /** Tries of `GET /generation?id=` after a speech call (its record can lag a little), and the wait between. */
   costTries: 3,
   costWaitMs: 1500,
@@ -265,6 +273,8 @@ export const MEDIA_TOOL_CODES = [
   "media_audio_unsupported",
   /** #251 re-plan 3: a piece could not be measured (the sandbox, a limit) — no file, no retry, its cost recorded. */
   "media_measure_failed",
+  /** Stage 3: the model lists no length, or no resolution at most 1080p, this server can ask for. */
+  "media_video_unsupported",
 ] as const;
 export type MediaToolCode = (typeof MEDIA_TOOL_CODES)[number];
 
@@ -304,6 +314,8 @@ export const MEDIA_TOOL_HINTS: Partial<Record<MediaToolCode, string>> = {
     "제공자가 보낸 음성의 형식이 이 서버가 받는 형식(MP3 오디오 스트림 하나뿐인 MP3 파일)이 아니어서 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 관리자에게 알려 주세요.",
   media_measure_failed:
     "만든 음성의 길이를 이 서버에서 확인하지 못해 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 잠시 뒤 다시 해 보거나 관리자에게 알려 주세요.",
+  media_video_unsupported:
+    "관리자가 고른 영상 모델이 이 서버가 쓰는 길이·해상도(1080p 이하)를 알려 주지 않아 만들 수 없어요. 관리자에게 다른 모델을 부탁하세요.",
   media_truncated:
     "음성이 제공자 쪽에서 중간에 끊겨 와서(더 잘게 나눠 다시 해도 끊김) 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 글을 더 짧게 나눠 요청해 주세요.",
 };

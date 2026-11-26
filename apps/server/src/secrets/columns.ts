@@ -488,4 +488,25 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "research_jobs.state": { write: "ResearchStore.update (scrubKnownDeep)", rescrub: "deep" },
   "research_jobs.result": { exempt: "ids, counts and flags only (JSON)" },
   "research_jobs.error_code": ENUM,
+  // 영상 생성 (#238 stage 3, review item 6): the prompt is the user's text — checked by the egress predicate before the
+  // card is stored (a prompt carrying a known secret makes no card), scrubbed on write and again by the rescrub.
+  "video_jobs.id": ID,
+  "video_jobs.conversation_id": ID,
+  "video_jobs.owner_id": ID,
+  "video_jobs.message_id": ID,
+  "video_jobs.run_id": ID,
+  "video_jobs.status": ENUM,
+  "video_jobs.model": {
+    exempt: "a model id from OpenRouter's video catalog (the admin's choice, checked there)",
+  },
+  "video_jobs.prompt": { write: "VideoJobs.card (carriesSecret, scrubKnown)", rescrub: "text" },
+  "video_jobs.resolution": { exempt: "a resolution from the model's record (`<n>p`)" },
+  "video_jobs.aspect_ratio": { exempt: "an aspect ratio from the model's record (`w:h`)" },
+  "video_jobs.settings_revision": { exempt: "a random token the server made (media.settings_revision)" },
+  "video_jobs.key_mark": { exempt: "`env` or `admin:<random token>` — never the key or derived from it" },
+  "video_jobs.usage_key": ID,
+  "video_jobs.remote_id": { exempt: "OpenRouter's job id (validated `gen-vid-…`)" },
+  "video_jobs.file_id": ID,
+  "video_jobs.error_code": ENUM,
+  "video_jobs.lease_boot": { exempt: "a random process id the server made (the engine's lease)" },
 };

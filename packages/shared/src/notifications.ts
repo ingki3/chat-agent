@@ -32,6 +32,10 @@ export const NotificationKind = z.enum([
   "research_done",
   /** 깊이 조사 failed, was stopped or reached the cap without anything verified — a fixed reason, no content. */
   "research_failed",
+  /** 영상 생성 (#238 stage 3): the video is ready — a fixed line, never the prompt. */
+  "video_done",
+  /** 영상 생성 failed, timed out or was not confirmed — a fixed reason, never the prompt. */
+  "video_failed",
 ]);
 export type NotificationKind = z.infer<typeof NotificationKind>;
 
@@ -68,6 +72,9 @@ export const NotificationPrefs = z
     /** 깊이 조사 notifications (#211): "완료" and "실패·중지" — on unless off. */
     researchDone: z.boolean().optional(),
     researchFailed: z.boolean().optional(),
+    /** 영상 생성 notifications (#238 stage 3): "완성" and "실패" — on unless off. */
+    videoDone: z.boolean().optional(),
+    videoFailed: z.boolean().optional(),
     /** The settings' revision (+1 on every write, #188 review 9) — in responses; ignored when saving. */
     rev: z.number().int().nonnegative().optional(),
   })
@@ -89,6 +96,8 @@ export const SaveNotificationPrefsRequest = z
     memoryFailed: z.boolean(),
     researchDone: z.boolean(),
     researchFailed: z.boolean(),
+    videoDone: z.boolean(),
+    videoFailed: z.boolean(),
     /** A page may send back the revision it read; it is ignored (the server counts). */
     rev: z.number().int().nonnegative(),
   })

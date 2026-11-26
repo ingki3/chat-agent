@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { MediaCatalog, MediaKind, MediaModel } from "@agentlee/shared";
 import { carriesSecret } from "../secrets/egress.js";
+import { videoRates } from "./cost.js";
 
 /**
  * The OpenRouter reads of 미디어 생성 stage 1 (#238): the key check and the per-kind model catalogs. Same rules as
@@ -58,6 +59,17 @@ export const modelEndpointsUrl = (id: string): string | null => {
 };
 export const OPENROUTER_IMAGES_URL = `${OPENROUTER_API}/images`;
 export const OPENROUTER_SPEECH_URL = `${OPENROUTER_API}/audio/speech`;
+/** `POST /videos` (#238 stage 3): submits a video job (202 with its id). */
+export const OPENROUTER_VIDEOS_URL = `${OPENROUTER_API}/videos`;
+/**
+ * A video job's id as OpenRouter writes it (API reference, 2026-11-26: `gen-vid-1789480874-Ab3dEf9hIjKlMnOpQrSt`): the
+ * only shape put into a status or content URL — never the answer's `polling_url` or `unsigned_urls`.
+ */
+export const VIDEO_JOB_ID = /^gen-vid-\d{1,20}-[0-9A-Za-z]{20}$/;
+export const videoStatusUrl = (id: string): string | null =>
+  VIDEO_JOB_ID.test(id) ? `${OPENROUTER_VIDEOS_URL}/${id}` : null;
+export const videoContentUrl = (id: string): string | null =>
+  VIDEO_JOB_ID.test(id) ? `${OPENROUTER_VIDEOS_URL}/${id}/content?index=0` : null;
 /** `GET /generation?id=` (a generation's cost, `data.total_cost`); the id as OpenRouter writes it. */
 export const GENERATION_ID = /^gen-[0-9A-Za-z-]{1,124}$/;
 export const generationUrl = (id: string): string | null =>
@@ -277,7 +289,10 @@ function parseEntry(kind: MediaKind, e: Json): MediaModel | null {
     return {
       id,
       name,
-      price: priceText(e.pricing_skus, (k) => k.replace(/^per-/, "")) ?? priceText(e.pricing),
+      price:
+        videoPriceText(e.pricing_skus) ??
+        priceText(e.pricing_skus, (k) => k.replace(/^per-/, "")) ??
+        priceText(e.pricing),
       options: options.map((o) => clip(o)),
       maxDurationSec: durations.length ? Math.max(...durations) : null,
     };
@@ -309,6 +324,24 @@ function parseEntry(kind: MediaKind, e: Json): MediaModel | null {
     options: [...(vectorOnly ? [VECTOR_ONLY_NOTE] : []), ...optionTexts(e.supported_parameters)].slice(0, 12),
     ...(vectorOnly ? { vectorOnly: true } : {}),
   };
+}
+
+/**
+ * A video model's per-second prices as the list shows them (#238 stage 3, review r1): "$0.12/초, $0.3/초 (4k)" —
+ * USD per second whatever the SKU's own unit (cents are divided by 100), the highest per tier, at most 4.
+ */
+export function videoPriceText(skus: unknown): string | null {
+  const byTier = new Map<string, number>();
+  for (const r of videoRates(skus)) {
+    const k = r.tier ?? "";
+    byTier.set(k, Math.max(byTier.get(k) ?? 0, r.usdPerSec));
+  }
+  const texts = [...byTier]
+    .filter(([, v]) => v > 0)
+    .sort(([a], [b]) => (a === "" ? -1 : b === "" ? 1 : a.localeCompare(b, "en", { numeric: true })))
+    .slice(0, 4)
+    .map(([tier, v]) => `${usd(v)}/초${tier ? ` (${clip(tier, 10)})` : ""}`);
+  return texts.length ? texts.join(", ") : null;
 }
 
 /** Raster formats this server stores (`output_format` values as OpenRouter names them). */
@@ -417,14 +450,28 @@ export async function fetchCatalog(
 // ---------------------------------------------------------------- generation requests
 
 /**
- * One POST of a generation (`/images`, `/audio/speech`) to its fixed URL: JSON body, key only in `Authorization`,
- * redirects refused, every text of the body checked by the caller first. The `Response` when OK (the caller reads
- * it with `readLimited` / `readBytes`); otherwise `MediaHttpError` with the status (the body is not read).
+ * One POST of a generation (`/images`, `/audio/speech`, `/videos`) to its fixed URL: JSON body, key only in
+ * `Authorization`, redirects refused, every text of the body checked by the caller first. The `Response` when OK (the
+ * caller reads it with `readLimited` / `readBytes`); otherwise `MediaHttpError` with the status (the body is not
+ * read): `0` sent but no answer (network, timeout, a redirect), `-1` refused here before anything was sent (another
+ * URL, a URL carrying a secret).
  */
 export class MediaHttpError extends Error {
-  constructor(readonly status: number) {
+  constructor(
+    readonly status: number,
+    /** `Retry-After` of a refusal, in ms (429/503), when it gave one. */
+    readonly retryAfterMs?: number,
+  ) {
     super(`http_${status}`);
   }
+}
+
+/** `Retry-After` (seconds or an HTTP date) in ms; undefined when absent or unreadable. */
+export function retryAfterMs(h: string | null, now: number = Date.now()): number | undefined {
+  if (!h) return undefined;
+  if (/^\d{1,7}$/.test(h.trim())) return Number(h.trim()) * 1000;
+  const t = Date.parse(h);
+  return Number.isFinite(t) ? Math.max(0, t - now) : undefined;
 }
 
 export async function openRouterPost(
@@ -435,10 +482,18 @@ export async function openRouterPost(
     fetchImpl?: typeof fetch | undefined;
     timeoutMs: number;
     signal?: AbortSignal | undefined;
+    /**
+     * #238 stage 3 (review r9): told the answer's status as soon as its headers came — before a refusal's body is let
+     * go (which may take a while), so the caller knows the outcome at once.
+     */
+    onStatus?: (status: number) => void;
   },
 ): Promise<Response> {
-  if ((url !== OPENROUTER_IMAGES_URL && url !== OPENROUTER_SPEECH_URL) || carriesSecret([url]))
-    throw new MediaHttpError(0);
+  if (
+    (url !== OPENROUTER_IMAGES_URL && url !== OPENROUTER_SPEECH_URL && url !== OPENROUTER_VIDEOS_URL) ||
+    carriesSecret([url])
+  )
+    throw new MediaHttpError(-1);
   const doFetch = o.fetchImpl ?? fetch;
   const timeout = AbortSignal.timeout(o.timeoutMs);
   let res: Response;
@@ -453,9 +508,60 @@ export async function openRouterPost(
   } catch {
     throw new MediaHttpError(0);
   }
+  try {
+    o.onStatus?.(res.status);
+  } catch {
+    // the caller's own business
+  }
   if (!res.ok) {
     await res.body?.cancel().catch(() => {});
-    throw new MediaHttpError(res.status);
+    throw new MediaHttpError(res.status, retryAfterMs(res.headers.get("retry-after")));
+  }
+  return res;
+}
+
+/**
+ * A GET of a video job (`/videos/<id>` or its content, #238 stage 3): only URLs built here from a validated id
+ * (`videoStatusUrl` / `videoContentUrl`), the key only in `Authorization`, redirects refused (a redirect is an error,
+ * never followed — the content is not fetched from anywhere else). Unlike `openRouterGet` the status and
+ * `Retry-After` are kept: a 429 backs off, a 404 means the job is gone. The `Response` of a 2xx (the caller reads its
+ * body), else `MediaHttpError` (0: no answer; -1: refused here; -2: a redirect).
+ */
+export async function videoGet(
+  url: string,
+  o: {
+    apiKey: string;
+    fetchImpl?: typeof fetch | undefined;
+    timeoutMs: number;
+    signal?: AbortSignal | undefined;
+  },
+): Promise<Response> {
+  const ok =
+    url.startsWith(`${OPENROUTER_VIDEOS_URL}/`) &&
+    VIDEO_JOB_ID.test(url.slice(OPENROUTER_VIDEOS_URL.length + 1).replace(/\/content\?index=0$/, "")) &&
+    !carriesSecret([url]);
+  if (!ok) throw new MediaHttpError(-1);
+  const doFetch = o.fetchImpl ?? fetch;
+  const timeout = AbortSignal.timeout(o.timeoutMs);
+  let res: Response;
+  try {
+    res = await doFetch(url, {
+      method: "GET",
+      headers: { Accept: "application/json, video/mp4", Authorization: `Bearer ${o.apiKey}` },
+      // Never followed: a redirect is seen as one (-2) and refused — the video is fetched from nowhere else.
+      redirect: "manual",
+      signal: o.signal ? AbortSignal.any([o.signal, timeout]) : timeout,
+    });
+  } catch {
+    throw new MediaHttpError(0);
+  }
+  if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
+    await res.body?.cancel().catch(() => {});
+    throw new MediaHttpError(-2);
+  }
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    throw new MediaHttpError(res.status, retryAfterMs(res.headers.get("retry-after")));
   }
   return res;
 }

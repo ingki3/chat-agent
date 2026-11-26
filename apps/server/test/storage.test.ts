@@ -138,6 +138,7 @@ describe("database", () => {
       "upload_cancellations",
       "usage_records",
       "users",
+      "video_jobs",
       "watchlist_items",
     ]);
     expect(db.$client.pragma("foreign_keys", { simple: true })).toBe(1);

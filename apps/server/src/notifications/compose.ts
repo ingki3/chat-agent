@@ -76,7 +76,14 @@ export type PublishInput =
    */
   | { kind: "research_done"; topic: string; url: string; ref?: ResourceRefInput }
   /** 깊이 조사 failed, was stopped, or found nothing verified: the topic line with a fixed reason. */
-  | { kind: "research_failed"; topic: string; reason: string; url: string; ref?: ResourceRefInput };
+  | { kind: "research_failed"; topic: string; reason: string; url: string; ref?: ResourceRefInput }
+  /**
+   * 영상 생성 (#238 stage 3): the job's video is in its card. Fixed words only — never the prompt (a lock screen
+   * shows it to anyone nearby).
+   */
+  | { kind: "video_done"; url: string; ref?: ResourceRefInput }
+  /** 영상 생성 failed, timed out or was not confirmed: a fixed reason only. */
+  | { kind: "video_failed"; reason: string; url: string; ref?: ResourceRefInput };
 
 export type ResourceRefInput = { kind: string; id: string };
 
@@ -276,6 +283,20 @@ export function compose(input: PublishInput): Composed {
           `깊이 조사를 마치지 못했어요: ${oneLine(input.topic, 24)} — ${oneLine(input.reason, 40)}`,
           LINE_MAX,
         ),
+        url: safePath(input.url),
+      };
+    case "video_done":
+      return {
+        kind: input.kind,
+        title: "영상 생성",
+        body: "영상이 완성됐어요. 눌러서 대화에서 보세요.",
+        url: safePath(input.url),
+      };
+    case "video_failed":
+      return {
+        kind: input.kind,
+        title: "영상 생성",
+        body: oneLine(`영상을 만들지 못했어요 — ${oneLine(input.reason, 40)}`, LINE_MAX),
         url: safePath(input.url),
       };
     case "dreaming_failed":

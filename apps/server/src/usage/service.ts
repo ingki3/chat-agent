@@ -48,7 +48,9 @@ export const isPending = (r: Pick<UsageRow, "purpose" | "pricedCostMicros" | "me
   r.pricedCostMicros === null &&
   (r.mediaSettlement === "pending_send" ||
     r.mediaSettlement === "reserved" ||
-    r.mediaSettlement === "awaiting_cost");
+    r.mediaSettlement === "awaiting_cost" ||
+    // #238 stage 3: an approved video job still running.
+    r.mediaSettlement === "video_job");
 
 export function emptyTotals(): UsageTotals {
   return {
