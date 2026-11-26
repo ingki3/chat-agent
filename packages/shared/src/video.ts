@@ -204,4 +204,6 @@ export const VIDEO_JOB_ERRORS: Record<string, string> = {
   video_budget: "오늘 남은 미디어 생성 예산이 이 영상의 최대 비용보다 적어요. 내일 다시 해 주세요.",
   video_recovering: "서버가 지난번 미디어 비용 기록을 정리하는 중이에요. 잠시 뒤 다시 승인해 주세요.",
   video_lookup_failed: "OpenRouter에서 모델 정보를 확인하지 못했어요. 잠시 뒤 다시 승인해 주세요.",
+  video_key_unavailable:
+    "지금 이 카드를 만든 OpenRouter 키를 읽을 수 없어 보내지 않았어요(비용 없음). 잠시 뒤 다시 승인해 주세요.",
 };

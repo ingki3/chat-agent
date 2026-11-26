@@ -36,20 +36,34 @@ export class OpenRouterKeys {
   }
 
   /**
-   * The key's mark (#238 stage 3): `<source>:<revision>` — the revision a random token written with every save or
-   * delete of the admin's key (`OPENROUTER_KEY_REVISION_SETTING`), so a mark never comes back: a key saved and deleted
-   * again leaves `.env`'s key with a new mark too. Never the key or derived from it. Undefined without a key.
+   * The key and its mark from **one** read (#238 stage 3, review r4): `<source>:<revision>`, the revision a random
+   * token written with every save or delete of the admin's key (`OPENROUTER_KEY_REVISION_SETTING`) — so a mark never
+   * comes back (a key saved and deleted again leaves `.env`'s key with a new mark too); never the key or derived from
+   * it. `ok: false` when the settings could not be read (an error, a row that does not decrypt) — unlike `resolve`,
+   * which then falls back to `.env`'s key: a video job is never sent, polled or downloaded with another account's key
+   * than the one it was approved under. `key` undefined: no key at all.
    */
-  mark(): string | undefined {
-    const r = this.resolve();
-    if (!r) return undefined;
+  snapshot(): { ok: true; key: (ResolvedKey & { mark: string }) | undefined } | { ok: false } {
+    let saved: string | undefined;
     let rev: string | undefined;
     try {
+      saved = this.settings?.get(OPENROUTER_KEY_SETTING);
       rev = this.settings?.get(OPENROUTER_KEY_REVISION_SETTING);
     } catch {
-      rev = undefined;
+      return { ok: false };
     }
-    return `${r.source}:${rev || "initial"}`;
+    const r: ResolvedKey | undefined = saved
+      ? { key: saved, source: "admin" }
+      : this.envKey
+        ? { key: this.envKey, source: "env" }
+        : undefined;
+    return { ok: true, key: r && { ...r, mark: `${r.source}:${rev || "initial"}` } };
+  }
+
+  /** The key's mark (`snapshot`); undefined without a key or when it could not be read. */
+  mark(): string | undefined {
+    const s = this.snapshot();
+    return s.ok ? s.key?.mark : undefined;
   }
 
   source(): MediaKeySource {

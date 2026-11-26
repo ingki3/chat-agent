@@ -82,8 +82,8 @@ export const makeVideoWorkdir = (dataDir: string): string =>
   makeScratchDir(dataDir, storagePaths(dataDir).videoScratch);
 export const removeVideoWorkdir = (dir: string): boolean => removeTree(dir);
 /** The folders of the last process (the engine's start; nothing is downloading then). */
-export const sweepVideoScratch = (dataDir: string): boolean =>
-  sweepScratch(dataDir, storagePaths(dataDir).videoScratch);
+export const sweepVideoScratch = (dataDir: string, keep?: (name: string) => boolean): boolean =>
+  sweepScratch(dataDir, storagePaths(dataDir).videoScratch, keep);
 
 const Report = z.object({
   format: z

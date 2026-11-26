@@ -45,6 +45,10 @@ import {
 import { RuntimeRegistry } from "../src/runtime/adapter.js";
 import { FakeRuntime } from "../src/runtime/fake.js";
 import { createFamily } from "./helpers/permission-matrix.js";
+import crypto from "node:crypto";
+import { SettingsStore } from "../src/db/settings-store.js";
+import { OPENROUTER_KEY_SETTING } from "../src/media/keys.js";
+import { newestJob } from "../../web/src/chat/video-card.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -1218,8 +1222,8 @@ describe("video jobs — review r1 regressions", () => {
 // ---------------------------------------------------------------- review round 2 (#255)
 
 describe("video jobs — review r2 regressions", () => {
-  it("A: a 202 whose `pending` write fails: no 500; the next pass ends it video_unconfirmed (bound kept), never resent", async () => {
-    const t = await start();
+  it("A: a 202 whose `pending` write fails: no 500; the received id is written once the database is back, never resent", async () => {
+    const t = await start({ limits: { retryMs: 20 } });
     const { jobId } = await t.card();
     t.db.$client.exec(
       "CREATE TRIGGER r2_fail_pending BEFORE UPDATE OF status ON video_jobs WHEN NEW.status='pending' BEGIN SELECT RAISE(ABORT,'transient write failure'); END",
@@ -1227,11 +1231,15 @@ describe("video jobs — review r2 regressions", () => {
     const r = await t.approve(jobId, 0);
     expect(r.statusCode).toBe(200);
     expect(r.json()).toMatchObject({ status: "submitting" });
-    t.db.$client.exec("DROP TRIGGER r2_fail_pending");
+    // Its submit's work is still under way (it keeps the id): a pass leaves it alone.
     t.dueNow();
     await t.video.tick();
-    expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_unconfirmed", remoteId: null });
-    expect(t.usage()).toEqual([expect.objectContaining({ s: "unconfirmed", e: VEO_8S_MICROS })]);
+    expect(t.job(jobId).status).toBe("submitting");
+    t.db.$client.exec("DROP TRIGGER r2_fail_pending");
+    await vi.waitFor(() => expect(t.job(jobId)).toMatchObject({ status: "pending", remoteId: rid(1) }), {
+      timeout: 5000,
+    });
+    expect(await t.drive(jobId)).toMatchObject({ status: "done" });
     expect(t.server.posts()).toHaveLength(1);
   });
 
@@ -1574,6 +1582,271 @@ describe("video jobs — review r3 regressions (the engine's state is the rows)"
     off.kinds.video = { enabled: false, model: VEO.id };
     await expect(m.admin.saveSettings(off, m.settings.revision(), () => true)).resolves.toMatchObject({
       settings: { kinds: { video: { enabled: false } } },
+    });
+  });
+});
+
+// ---------------------------------------------------------------- review round 4 (#255)
+
+describe("video jobs — review r4 regressions", () => {
+  const second = `${KEY}-second`;
+  /** Every request answered for `KEY` by the fake server; which key each video request carried, recorded. */
+  const recordingKeys = (base = fakeServer()) => {
+    const used: { url: string; key: string }[] = [];
+    const fetchImpl = (async (u: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      const auth = headers.get("authorization") ?? "";
+      if (String(u).startsWith(OPENROUTER_VIDEOS_URL))
+        used.push({
+          url: String(u),
+          key: auth === `Bearer ${second}` ? "second" : auth === `Bearer ${KEY}` ? "env" : "?",
+        });
+      headers.set("authorization", `Bearer ${KEY}`);
+      return base.fetchImpl(u, { ...init, headers });
+    }) as typeof fetch;
+    return { server: { ...base, fetchImpl }, used };
+  };
+
+  it("1 (P1): a key read that fails at approval refuses it — never another account's key; nothing reserved", async () => {
+    const { server, used } = recordingKeys();
+    let arm = false;
+    const t = await start({
+      server,
+      probe: () => ({
+        ...fixtureVideoProbe(),
+        ready: async () => {
+          arm = true;
+          return true;
+        },
+      }),
+    });
+    const { admin, keys } = t.app.media!;
+    await admin.registerKey(second, admin.generation(), () => true);
+    const { jobId } = await t.card();
+    expect(t.job(jobId).keyMark).toBe(keys.mark());
+    const original = SettingsStore.prototype.get;
+    let faults = 0;
+    const spy = vi.spyOn(SettingsStore.prototype, "get").mockImplementation(function (
+      this: SettingsStore,
+      k: string,
+    ) {
+      if (arm && faults < 2 && k === OPENROUTER_KEY_SETTING) {
+        faults++;
+        throw new Error("one transient read");
+      }
+      return original.call(this, k);
+    });
+    try {
+      expect((await t.approve(jobId, 0)).json()).toMatchObject({ error: "video_key_unavailable" });
+      expect(t.usage()).toHaveLength(0);
+      expect(used.filter((u) => u.url === OPENROUTER_VIDEOS_URL)).toEqual([]);
+      expect(t.job(jobId).status).toBe("awaiting_approval");
+    } finally {
+      spy.mockRestore();
+    }
+    // Read again: the card's own (admin) key, and only it.
+    expect((await t.approve(jobId, 0)).json()).toMatchObject({ status: "pending" });
+    expect(used.filter((u) => u.url === OPENROUTER_VIDEOS_URL).map((u) => u.key)).toEqual(["second"]);
+  });
+
+  it("2: a 402 whose refusal writes fail is kept by its submit's work — released once the database is back", async () => {
+    const clock = { t: Date.now() };
+    const t = await start({
+      clock,
+      limits: { retryMs: 20 },
+      server: fakeServer({ submit: () => new Response(null, { status: 402 }) }),
+    });
+    const { jobId } = await t.card();
+    t.db.$client.exec(
+      "CREATE TRIGGER temp_refuse BEFORE UPDATE OF status ON video_jobs WHEN NEW.error_code='video_payment' BEGIN SELECT RAISE(ABORT,'transient write'); END",
+    );
+    await t.approve(jobId, 0);
+    // Past its lease, still not judged "not under way" while its work keeps the refusal.
+    clock.t = t.due(jobId).at + 1;
+    await t.video.tick();
+    expect(t.job(jobId).status).toBe("submitting");
+    t.db.$client.exec("DROP TRIGGER temp_refuse");
+    await vi.waitFor(
+      () => expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_payment" }),
+      {
+        timeout: 5000,
+      },
+    );
+    expect(t.usage()).toEqual([]);
+    expect(t.server.posts()).toHaveLength(1);
+  });
+
+  it("3: the admin changes the key while the status is asked: the cost is settled, the content waits for its key", async () => {
+    let answer!: () => void;
+    const base = fakeServer({
+      poll: (id) =>
+        new Promise<Response>((r) => {
+          answer = () => r(Response.json({ id, status: "completed", usage: { cost: 0.8 } }));
+        }),
+    });
+    const other = `${KEY}-replacement`;
+    const check = fixtureOpenRouterFetch();
+    const server = {
+      ...base,
+      fetchImpl: (async (u: string | URL | Request, init?: RequestInit) =>
+        new Headers(init?.headers).get("authorization") === `Bearer ${other}`
+          ? check(u, init)
+          : base.fetchImpl(u, init)) as typeof fetch,
+    };
+    const t = await start({ server });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    t.dueNow();
+    const pass = t.video.tick();
+    await vi.waitFor(() => expect(answer).toBeTypeOf("function"));
+    const { admin } = t.app.media!;
+    await admin.registerKey(other, admin.generation(), () => true);
+    answer();
+    await pass;
+    await t.video.idle();
+    expect(base.requests.filter((r) => r.url.includes("/content?"))).toHaveLength(0);
+    expect(t.job(jobId)).toMatchObject({ status: "downloading", costMicros: 800_000 });
+  });
+
+  it("4: a `done` commit that fails once is not the job's end — it is stored by a later pass", async () => {
+    const t = await start({
+      server: fakeServer({ poll: (id) => Response.json({ id, status: "completed", usage: { cost: 0.8 } }) }),
+    });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    let once = true;
+    t.db.$client.function("r4_fault", () => {
+      if (once) {
+        once = false;
+        throw new Error("one transient commit failure");
+      }
+      return 0;
+    });
+    t.db.$client.exec(
+      "CREATE TRIGGER r4_bad_commit BEFORE UPDATE OF status ON video_jobs WHEN new.status='done' BEGIN SELECT r4_fault(); END",
+    );
+    t.dueNow();
+    await t.video.tick();
+    await t.video.idle();
+    expect(once).toBe(false);
+    expect(t.job(jobId)).toMatchObject({ status: "downloading", fileId: null });
+    t.db.$client.exec("DROP TRIGGER r4_bad_commit");
+    expect(await t.drive(jobId)).toMatchObject({ status: "done", costMicros: 800_000 });
+    expect(t.db.$client.prepare("SELECT count(*) n FROM files").get()).toEqual({ n: 1 });
+    expect(t.server.posts()).toHaveLength(1);
+  });
+
+  it("5: a download cut at the deadline ends as video_timeout (its settled cost kept)", async () => {
+    const base = fakeServer({
+      poll: (id) => Response.json({ id, status: "completed", usage: { cost: 0.8 } }),
+    });
+    const server = {
+      ...base,
+      fetchImpl: (async (u: string | URL | Request, init?: RequestInit) => {
+        if (String(u).includes("/content?"))
+          return new Response(
+            new ReadableStream({
+              start(c) {
+                init!.signal!.addEventListener("abort", () => c.error(new Error("connection aborted")), {
+                  once: true,
+                });
+              },
+            }),
+          );
+        return base.fetchImpl(u, init);
+      }) as typeof fetch,
+    };
+    const t = await start({ server, limits: { deadlineMs: 800, pollMs: 0 } });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    t.dueNow();
+    await t.video.tick();
+    await t.video.idle();
+    expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_timeout", costMicros: 800_000 });
+  });
+
+  it("6: a visible status or progress change is a new version (an older answer never wins on the card)", async () => {
+    const t = await start();
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    const before = t.video.view(t.job(jobId));
+    t.dueNow();
+    await t.video.tick();
+    const after = t.video.view(t.job(jobId));
+    expect(after).toMatchObject({ status: "in_progress", progress: 40 });
+    expect(after.version).toBeGreaterThan(before.version);
+    expect(newestJob(after, before).status).toBe("in_progress");
+  });
+
+  it("7: a key save that rolls back never shows the waiting card an expiry", async () => {
+    const t = await start();
+    const { jobId } = await t.card();
+    const seen: string[] = [];
+    const off = t.video.subscribe(jobId, () => seen.push(t.job(jobId).status));
+    const { admin, keys } = t.app.media!;
+    const mark = keys.mark();
+    t.db.$client.exec(`CREATE TABLE r4_parent (id INTEGER PRIMARY KEY);
+      CREATE TABLE r4_child (id INTEGER REFERENCES r4_parent(id) DEFERRABLE INITIALLY DEFERRED);
+      CREATE TRIGGER r4_defer AFTER UPDATE OF status ON video_jobs WHEN new.status='expired' BEGIN INSERT INTO r4_child VALUES(123); END`);
+    try {
+      await expect(admin.registerKey(KEY, admin.generation(), () => true)).rejects.toThrow();
+      await new Promise((r) => setImmediate(r));
+      expect(t.job(jobId)).toMatchObject({ status: "awaiting_approval", version: 0 });
+      expect(keys.mark()).toBe(mark);
+      expect(seen).toEqual([]);
+    } finally {
+      off();
+      t.db.$client.exec("DROP TRIGGER r4_defer");
+    }
+    // A save that commits: the card hears its expiry.
+    await admin.registerKey(KEY, admin.generation(), () => true);
+    await new Promise((r) => setImmediate(r));
+    expect(t.job(jobId).status).toBe("expired");
+  });
+
+  it("8: a start sweep that fails is tried again later — around the folders of downloads under way", async () => {
+    const t = await start({ engine: false });
+    const root = path.join(t.dataDir, "video-scratch");
+    const old = path.join(root, crypto.randomUUID());
+    fs.mkdirSync(old, { recursive: true });
+    fs.writeFileSync(path.join(old, "video.mp4"), "partial");
+    const orig = fs.readdirSync;
+    const spy = vi.spyOn(fs, "readdirSync").mockImplementation(function (p: fs.PathLike, ...args: unknown[]) {
+      if (p === root) throw new Error("one transient scratch read");
+      return (orig as (...a: unknown[]) => unknown)(p, ...args);
+    } as typeof fs.readdirSync);
+    try {
+      t.video.start();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.existsSync(old)).toBe(true);
+    // Approvals are taken (the recovery itself succeeded); the next pass removes the old folder.
+    const { jobId } = await t.card();
+    expect((await t.approve(jobId, 0)).statusCode).toBe(200);
+    await t.video.tick();
+    expect(fs.existsSync(old)).toBe(false);
+  });
+
+  it("9: settings saved with very many waiting cards: one statement, video turned off", async () => {
+    const t = await start();
+    const { jobId } = await t.card();
+    const db = t.db.$client;
+    const columns = (db.prepare("PRAGMA table_info(video_jobs)").all() as { name: string }[]).map(
+      (r) => r.name,
+    );
+    db.prepare(
+      `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<32766) INSERT INTO video_jobs (${columns.join(",")}) SELECT ${columns
+        .map((k) => (k === "id" ? "('copy-' || i)" : `s.${k}`))
+        .join(",")} FROM video_jobs s, n WHERE s.id=?`,
+    ).run(jobId);
+    const { settings, admin } = t.app.media!;
+    const off = settings.get();
+    off.kinds.video.enabled = false;
+    await expect(admin.saveSettings(off, settings.revision(), () => true)).resolves.toBeDefined();
+    expect(settings.get().kinds.video.enabled).toBe(false);
+    expect(db.prepare("SELECT count(*) n FROM video_jobs WHERE status = 'awaiting_approval'").get()).toEqual({
+      n: 0,
     });
   });
 });

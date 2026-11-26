@@ -134,7 +134,12 @@ export function sweepSpeechScratch(dataDir: string): boolean {
 }
 
 /** `sweepSpeechScratch`'s rules for any scratch root of the data folder (#238 stage 3: `video-scratch`). */
-export function sweepScratch(dataDir: string, rootPath: string): boolean {
+export function sweepScratch(
+  dataDir: string,
+  rootPath: string,
+  /** Working folders left alone (in use now). */
+  keep: (name: string) => boolean = () => false,
+): boolean {
   const root = scratchRoot(dataDir, rootPath);
   if (root === "missing") return true;
   if (root === "bad") return false;
@@ -148,6 +153,7 @@ export function sweepScratch(dataDir: string, rootPath: string): boolean {
   for (const n of names) {
     const p = path.join(root.ok, n);
     try {
+      if (keep(n)) continue;
       const st = fs.lstatSync(p);
       if (st.isDirectory() && !st.isSymbolicLink() && WORKDIR_NAME.test(n)) {
         if (!removeTree(p)) ok = false;
