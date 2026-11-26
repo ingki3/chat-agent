@@ -1877,11 +1877,15 @@ export const videoJobs = sqliteTable(
     submittedAt: integer("submitted_at"),
     /** Approval + 60 minutes: past it a running job is `video_timeout`, whatever it is doing. */
     deadlineAt: integer("deadline_at"),
-    /**
-     * When the engine handles the running job next (a poll, a retry, a lease while it is being handled): the engine
-     * picks due rows by it, oldest first. Null for a card or an ended job.
-     */
+    /** When the engine handles the running job next (a poll, a retry): due rows by it, oldest first. */
     nextAt: integer("next_at"),
+    /**
+     * The lease of the work handling the job now: the process (its boot id) and until when. A pass takes a row that is
+     * not leased, whose lease ran out, or whose lease is its own process's with no work of it under way (the work
+     * ended without clearing it); the start's recovery clears every lease (the last process's).
+     */
+    leaseBoot: text("lease_boot"),
+    leaseUntil: integer("lease_until"),
     /** Failed polls or downloads in a row (the backoff). */
     failures: integer("failures").notNull().default(0),
     endedAt: integer("ended_at"),

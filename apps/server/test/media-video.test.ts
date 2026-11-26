@@ -1041,21 +1041,27 @@ describe("video jobs — review r1 regressions", () => {
     expect(dueOf(t, jobId)!.failures).toBeGreaterThanOrEqual(1);
   });
 
-  it("P2: a refused submit whose release fails still ends; its bound is released on the next pass", async () => {
+  it("P2: a refused submit whose release fails is held by its work until the release is committed", async () => {
     const t = await start({
+      limits: { retryMs: 20 },
       server: fakeServer({ submit: () => Response.json({ error: { code: 402 } }, { status: 402 }) }),
     });
     const { jobId } = await t.card();
-    const release = vi.spyOn(t.app.usageStore!, "releaseMedia").mockImplementation(() => {
+    const release = vi.spyOn(t.app.usageStore!, "releaseVideoMedia").mockImplementation(() => {
       throw new Error("SQLITE_BUSY");
     });
-    expect((await t.approve(jobId, 0)).json()).toMatchObject({
-      status: "failed",
-      errorCode: "video_payment",
-    });
+    expect((await t.approve(jobId, 0)).json()).toMatchObject({ status: "submitting" });
     expect(t.usage()).toEqual([expect.objectContaining({ s: "video_job" })]);
-    release.mockRestore();
+    // Never ended without its release: a pass leaves it to the work holding the refusal.
     await t.video.tick();
+    expect(t.job(jobId).status).toBe("submitting");
+    release.mockRestore();
+    await vi.waitFor(
+      () => expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_payment" }),
+      {
+        timeout: 5000,
+      },
+    );
     expect(t.usage()).toEqual([]);
   });
 
@@ -1944,12 +1950,12 @@ describe("video jobs — review r5 regressions", () => {
       await t.video.idle();
     }
     expect(t.job(jobId)).toMatchObject({ status: "done", costMicros: 800_000 });
-    // An orphaned lease (its work ended without writing its next time) is due at once.
+    // This process's own lease with no work of it under way (its work ended without clearing it) is taken at once.
     const other = await t.card();
     await t.approve(other.jobId, 0);
     t.db.$client
-      .prepare("UPDATE video_jobs SET next_at = ? WHERE id = ?")
-      .run(clock.t + 17 * 60_000, other.jobId);
+      .prepare("UPDATE video_jobs SET next_at = ?, lease_boot = ?, lease_until = ? WHERE id = ?")
+      .run(clock.t + 60_000, t.video.boot, clock.t + 17 * 60_000, other.jobId);
     await t.video.tick();
     await t.video.idle();
     expect(t.job(other.jobId).status).not.toBe("pending");
@@ -2029,6 +2035,159 @@ describe("video jobs — review r5 regressions", () => {
     });
     try {
       await t.drive(jobId);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.readdirSync(root)).toHaveLength(1);
+    await t.video.tick();
+    expect(fs.readdirSync(root)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------- review round 6 (#255)
+
+describe("video jobs — review r6 regressions (explicit leases, one end judgement)", () => {
+  const completed = (id: string) => Response.json({ id, status: "completed", usage: { cost: 0.8 } });
+  const mp4 = () => new Response(new Uint8Array(fixtureMp4()), { headers: { "content-type": "video/mp4" } });
+  const contents = (server: ReturnType<typeof fakeServer>) =>
+    server.requests.filter((r) => r.url.includes("/content?")).length;
+
+  it("A: a lease of this process whose work ended without clearing it is taken by the next pass, whatever its time left", async () => {
+    const base = Date.now();
+    const min = 60_000;
+    const clock = { t: base };
+    const server = fakeServer({
+      poll: (id) => completed(id),
+      content: () => {
+        clock.t = base + 56 * min;
+        return mp4();
+      },
+    });
+    const t = await start({ clock, server });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    t.db.$client.exec(`
+      CREATE TRIGGER r6_commit BEFORE UPDATE OF status ON video_jobs WHEN NEW.status='done' BEGIN SELECT RAISE(ABORT,'temporary commit failure'); END;
+      CREATE TRIGGER r6_backoff BEFORE UPDATE OF failures ON video_jobs WHEN NEW.failures>0 BEGIN SELECT RAISE(ABORT,'temporary schedule write failure'); END;
+    `);
+    clock.t = base + 43 * min;
+    t.dueNow();
+    await t.video.tick();
+    await t.video.idle();
+    t.db.$client.exec("DROP TRIGGER r6_commit; DROP TRIGGER r6_backoff");
+    expect(t.job(jobId)).toMatchObject({ status: "downloading", leaseBoot: t.video.boot, fileId: null });
+    clock.t += 5000;
+    await t.video.tick();
+    await t.video.idle();
+    expect(t.job(jobId)).toMatchObject({ status: "done", costMicros: 800_000, leaseBoot: null });
+    expect(contents(server)).toBe(2);
+    expect(server.posts()).toHaveLength(1);
+  });
+
+  it("B: a held refusal wins over the deadline — released, its own code, never charged", async () => {
+    const base = Date.now();
+    const clock = { t: base };
+    const t = await start({
+      clock,
+      server: fakeServer({ submit: () => new Response(null, { status: 402 }) }),
+      limits: { retryMs: 60_000 },
+    });
+    const { jobId, scope } = await t.card();
+    t.db.$client.exec(
+      "CREATE TRIGGER r6_refusal BEFORE UPDATE OF status ON video_jobs WHEN NEW.error_code='video_payment' BEGIN SELECT RAISE(ABORT,'transient write'); END",
+    );
+    expect((await t.approve(jobId, 0)).json().status).toBe("submitting");
+    t.db.$client.exec("DROP TRIGGER r6_refusal");
+    clock.t = base + 3_600_000;
+    await t.video.tick();
+    expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_payment" });
+    expect(t.usage()).toEqual([]);
+    t.app.conversations!.delete(scope.conversationId);
+    expect(t.usage()).toEqual([]);
+  });
+
+  it("B: a submit still without its answer when the conversation goes keeps its bound", async () => {
+    let deliver!: (r: Response) => void;
+    const t = await start({
+      server: fakeServer({ submit: () => new Promise<Response>((r) => (deliver = r)) }),
+    });
+    const { jobId, scope } = await t.card();
+    const sending = t.approve(jobId, 0);
+    await vi.waitFor(() => expect(deliver).toBeDefined());
+    t.app.conversations!.delete(scope.conversationId);
+    deliver(Response.json({ id: rid(1) }, { status: 202 }));
+    await sending;
+    await t.video.idle();
+    await t.video.tick();
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "unconfirmed", e: VEO_8S_MICROS })]);
+    expect(t.server.posts()).toHaveLength(1);
+  });
+
+  it("B: an HTTP 410 handled at the deadline ends as video_timeout", async () => {
+    const base = Date.now();
+    const clock = { t: base };
+    const t = await start({
+      clock,
+      server: fakeServer({
+        poll: () => {
+          clock.t = base + 3_600_000;
+          return new Response(null, { status: 410 });
+        },
+      }),
+    });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    clock.t = base + 3_600_000 - 1;
+    t.dueNow();
+    await t.video.tick();
+    await t.video.idle();
+    expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_timeout" });
+    expect(t.usage()[0]?.s).toBe("unconfirmed");
+  });
+
+  it("C: an event that cannot be built closes its stream (never left open behind the job)", async () => {
+    const clock = { t: Date.now() };
+    const t = await start({ clock, server: fakeServer({ poll: (id) => completed(id) }) });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    const watching = vi.spyOn(t.video, "subscribe");
+    let ended = false;
+    const sse = t.api(t.f.cookies.owner, "GET", `/api/video-jobs/${jobId}/events`).then((r) => {
+      ended = true;
+      return r;
+    });
+    await vi.waitFor(() => expect(watching).toHaveBeenCalled());
+    const get = vi.spyOn(t.app.files!, "get").mockImplementationOnce(() => {
+      throw new Error("temporary file lookup failure");
+    });
+    t.dueNow();
+    await t.video.tick();
+    await t.video.idle();
+    get.mockRestore();
+    expect(t.job(jobId).status).toBe("done");
+    await vi.waitFor(() => expect(ended).toBe(true));
+    const frames = (await sse).body
+      .split("\n")
+      .filter((l) => l.startsWith("data: "))
+      .map((l) => (JSON.parse(l.slice(6)) as { status: string }).status);
+    expect(frames[0]).toBe("pending");
+    // A new read (the card's fallback) has the end.
+    expect((await t.api(t.f.cookies.owner, "GET", `/api/video-jobs/${jobId}`)).json().status).toBe("done");
+  });
+
+  it("D: a readiness check's folder whose removal failed is swept by a later pass", async () => {
+    const slot = { dir: "" };
+    const t = await start({ probe: () => fixtureVideoProbe(slot.dir) });
+    slot.dir = t.dataDir;
+    const { jobId } = await t.card();
+    const root = path.join(t.dataDir, "video-scratch");
+    const rm = fs.rmSync;
+    const spy = vi.spyOn(fs, "rmSync").mockImplementation((f, ...args) => {
+      if (typeof f === "string" && path.dirname(f) === root) throw new Error("temporary cleanup error");
+      return rm(f, ...args);
+    });
+    try {
+      expect((await t.approve(jobId, 0)).json().status).toBe("pending");
     } finally {
       spy.mockRestore();
     }

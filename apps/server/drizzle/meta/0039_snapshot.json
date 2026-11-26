@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "12498ce7-feb6-473c-b944-fed882a68a9c",
+  "id": "3db5373c-1ac7-42f2-bc1f-b38b87918984",
   "prevId": "dc60569c-1195-4be4-b728-bf56476142e0",
   "tables": {
     "access_syncs": {
@@ -6109,6 +6109,20 @@
         },
         "next_at": {
           "name": "next_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "lease_boot": {
+          "name": "lease_boot",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "lease_until": {
+          "name": "lease_until",
           "type": "integer",
           "primaryKey": false,
           "notNull": false,

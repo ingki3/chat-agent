@@ -63,11 +63,17 @@ export function registerVideoRoutes(
     const stopWatching = watchAccess(app, req, () => stream.close());
     stream.onClose(stopWatching);
     if (stream.closed) return;
+    // An event that cannot be built or sent closes the stream (review r6): the card then reads the job itself (it polls,
+    // or opens a new stream) — never an open stream left behind the job.
     const push = () => {
-      const row = jobs.get(req.params.id);
-      if (!row) return stream.close();
-      stream.send("job", jobs.view(row));
-      if (VIDEO_ENDED.has(row.status)) stream.close();
+      try {
+        const row = jobs.get(req.params.id);
+        if (!row) return stream.close();
+        stream.send("job", jobs.view(row));
+        if (VIDEO_ENDED.has(row.status)) stream.close();
+      } catch {
+        stream.close();
+      }
     };
     const off = jobs.subscribe(req.params.id, push);
     stream.onClose(off);

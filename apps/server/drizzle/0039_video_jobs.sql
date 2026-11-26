@@ -28,6 +28,8 @@ CREATE TABLE `video_jobs` (
 	`submitted_at` integer,
 	`deadline_at` integer,
 	`next_at` integer,
+	`lease_boot` text,
+	`lease_until` integer,
 	`failures` integer DEFAULT 0 NOT NULL,
 	`ended_at` integer,
 	`notified_at` integer,

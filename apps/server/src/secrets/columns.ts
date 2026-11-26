@@ -508,4 +508,5 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "video_jobs.remote_id": { exempt: "OpenRouter's job id (validated `gen-vid-…`)" },
   "video_jobs.file_id": ID,
   "video_jobs.error_code": ENUM,
+  "video_jobs.lease_boot": { exempt: "a random process id the server made (the engine's lease)" },
 };

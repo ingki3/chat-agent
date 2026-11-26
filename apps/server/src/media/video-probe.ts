@@ -83,6 +83,10 @@ export const VIDEO_PROBE_LIMITS = { timeoutMs: 60_000, memoryBytes: 1024 * 1024 
  * no job's state depends on it. A folder whose removal failed leaves it and is swept later (review r5).
  */
 const inUse = new Set<string>();
+/** A working folder's removal failed since the last full sweep (the engine's next pass sweeps — review r6). */
+let dirty = false;
+/** Whether some working folder could not be removed (and is left for a sweep). */
+export const scratchDirty = (): boolean => dirty;
 export const makeVideoWorkdir = (dataDir: string): string => {
   const dir = makeScratchDir(dataDir, storagePaths(dataDir).videoScratch);
   inUse.add(path.basename(dir));
@@ -97,11 +101,15 @@ export const removeVideoWorkdir = (dir: string): boolean => {
     ok = false;
   }
   inUse.delete(path.basename(dir));
+  if (!ok) dirty = true;
   return ok;
 };
 /** The folders not in use here (the last process's, and removals that failed) — never one in use now. */
-export const sweepVideoScratch = (dataDir: string): boolean =>
-  sweepScratch(dataDir, storagePaths(dataDir).videoScratch, (name) => inUse.has(name));
+export const sweepVideoScratch = (dataDir: string): boolean => {
+  const ok = sweepScratch(dataDir, storagePaths(dataDir).videoScratch, (name) => inUse.has(name));
+  if (ok) dirty = false;
+  return ok;
+};
 
 const Report = z.object({
   format: z
