@@ -1850,3 +1850,190 @@ describe("video jobs — review r4 regressions", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------- review round 5 (#255)
+
+describe("video jobs — review r5 regressions", () => {
+  const refuseWrite = (t: Awaited<ReturnType<typeof start>>) =>
+    t.db.$client.exec(
+      "CREATE TRIGGER r5_refusal BEFORE UPDATE OF status ON video_jobs WHEN NEW.error_code='video_payment' BEGIN SELECT RAISE(ABORT,'transient write'); END",
+    );
+
+  it("1: a conversation deleted while its known 402 is still being recorded: the reservation is released", async () => {
+    const t = await start({
+      limits: { retryMs: 150 },
+      server: fakeServer({ submit: () => new Response(null, { status: 402 }) }),
+    });
+    const { jobId, scope } = await t.card();
+    refuseWrite(t);
+    expect((await t.approve(jobId, 0)).json().status).toBe("submitting");
+    t.db.$client.exec("DROP TRIGGER r5_refusal");
+    const del = await t.app.inject({
+      method: "DELETE",
+      url: `/api/conversations/${scope.conversationId}`,
+      headers: { ...WRITE, cookie: t.f.cookies.owner },
+    });
+    expect(del.statusCode).toBeLessThan(300);
+    expect(t.video.get(jobId)).toBeUndefined();
+    await t.video.idle();
+    expect(t.usage()).toEqual([]);
+    expect(t.server.posts()).toHaveLength(1);
+  });
+
+  it("2: a read that fails inside a retry is that retry's failure — the refusal is still recorded, nothing rejects", async () => {
+    const t = await start({
+      limits: { retryMs: 100 },
+      server: fakeServer({ submit: () => new Response(null, { status: 402 }) }),
+    });
+    const { jobId } = await t.card();
+    refuseWrite(t);
+    expect((await t.approve(jobId, 0)).json().status).toBe("submitting");
+    t.db.$client.exec("DROP TRIGGER r5_refusal");
+    const read = t.video.get.bind(t.video);
+    const spy = vi
+      .spyOn(t.video, "get")
+      .mockImplementationOnce(() => {
+        throw new Error("transient read");
+      })
+      .mockImplementation(read);
+    try {
+      await expect(t.video.idle()).resolves.toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_payment" });
+    expect(t.usage()).toEqual([]);
+  });
+
+  it("3: a state read that fails in the file lock's guard: the job stays downloading and is stored by a later pass", async () => {
+    const clock = { t: Date.now() };
+    const t = await start({
+      clock,
+      server: fakeServer({ poll: (id) => Response.json({ id, status: "completed", usage: { cost: 0.8 } }) }),
+    });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    const approved = clock.t;
+    const store = t.app.files!;
+    const add = store.addGenerated.bind(store);
+    const spy = vi.spyOn(store, "addGenerated").mockImplementationOnce((input) =>
+      add({
+        ...input,
+        guard: () => {
+          const once = vi.spyOn(t.video, "get").mockImplementationOnce(() => {
+            throw new Error("temporary DB read failure in file guard");
+          });
+          try {
+            return input.guard!();
+          } finally {
+            once.mockRestore();
+          }
+        },
+      }),
+    );
+    clock.t = approved + 45 * 60_000;
+    await t.video.tick();
+    await t.video.idle();
+    spy.mockRestore();
+    expect(t.job(jobId)).toMatchObject({ status: "downloading", fileId: null });
+    // A short backoff, not the lease.
+    expect(t.due(jobId).at - clock.t).toBeLessThanOrEqual(5 * 60_000);
+    for (let i = 0; i < 80 && t.job(jobId).status === "downloading"; i++) {
+      clock.t += 5_000;
+      await t.video.tick();
+      await t.video.idle();
+    }
+    expect(t.job(jobId)).toMatchObject({ status: "done", costMicros: 800_000 });
+    // An orphaned lease (its work ended without writing its next time) is due at once.
+    const other = await t.card();
+    await t.approve(other.jobId, 0);
+    t.db.$client
+      .prepare("UPDATE video_jobs SET next_at = ? WHERE id = ?")
+      .run(clock.t + 17 * 60_000, other.jobId);
+    await t.video.tick();
+    await t.video.idle();
+    expect(t.job(other.jobId).status).not.toBe("pending");
+  });
+
+  it("4: a terminal answer handled at the deadline ends as video_timeout", async () => {
+    const clock = { t: Date.now() };
+    const deadline = clock.t + 3_600_000;
+    const t = await start({
+      clock,
+      server: fakeServer({
+        poll: (id) => {
+          clock.t = deadline;
+          return Response.json({ id, status: "expired" });
+        },
+      }),
+    });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    clock.t = deadline - 1;
+    t.dueNow();
+    await t.video.tick();
+    await t.video.idle();
+    expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_timeout" });
+    expect(t.usage()[0]?.s).toBe("unconfirmed");
+  });
+
+  it("5: a retried sweep never removes a readiness check's folder under way", async () => {
+    const slot: { probe?: VideoProbe } = {};
+    const t = await start({ engine: false, probe: () => slot.probe });
+    const root = path.join(t.dataDir, "video-scratch");
+    fs.mkdirSync(root, { recursive: true });
+    const original = fs.readdirSync;
+    const spy = vi.spyOn(fs, "readdirSync").mockImplementation(function (p: fs.PathLike, ...args: unknown[]) {
+      if (p === root) throw new Error("temporary scratch error");
+      return (original as (...a: unknown[]) => unknown)(p, ...args);
+    } as typeof fs.readdirSync);
+    try {
+      t.video.start();
+    } finally {
+      spy.mockRestore();
+    }
+    const probe = fixtureVideoProbe(t.dataDir);
+    slot.probe = probe;
+    const check = probe.check.bind(probe);
+    let readyFile: string | undefined;
+    let proceed!: () => void;
+    probe.check = async (file, signal) => {
+      readyFile = file;
+      await new Promise<void>((r) => (proceed = r));
+      return check(file, signal);
+    };
+    const { jobId } = await t.card();
+    const approval = t.approve(jobId, 0);
+    await vi.waitFor(() => expect(readyFile).toBeTruthy());
+    await t.video.tick();
+    expect(fs.existsSync(readyFile!)).toBe(true);
+    proceed();
+    expect((await approval).json()).toMatchObject({ status: "pending" });
+  });
+
+  it("6: a working folder whose removal failed is swept by a later pass", async () => {
+    const base = fakeServer({
+      poll: (id) => Response.json({ id, status: "completed", usage: { cost: 0.8 } }),
+    });
+    const t = await start({
+      server: base,
+      probe: () => ({ ready: async () => true, check: async () => "failed" }),
+    });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    const root = path.join(t.dataDir, "video-scratch");
+    const rm = fs.rmSync;
+    const spy = vi.spyOn(fs, "rmSync").mockImplementation((file, ...args) => {
+      if (typeof file === "string" && path.dirname(file) === root) throw new Error("transient cleanup error");
+      return rm(file, ...args);
+    });
+    try {
+      await t.drive(jobId);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.readdirSync(root)).toHaveLength(1);
+    await t.video.tick();
+    expect(fs.readdirSync(root)).toEqual([]);
+  });
+});

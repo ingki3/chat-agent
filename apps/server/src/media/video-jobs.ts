@@ -197,7 +197,15 @@ export class VideoJobs {
    * submit, a poll, a download), and its end. Never what decides a job's state — the row does (`next_at`,
    * `deadline_at`); a restart loses these and the rows say the same.
    */
-  private readonly inflight = new Map<string, { stop: AbortController; done: Promise<unknown> }>();
+  private readonly inflight = new Map<
+    string,
+    {
+      stop: AbortController;
+      done: Promise<unknown>;
+      /** A refusal (never billed) this work holds and is still recording: the reservation's usage key (review r5). */
+      refusal?: string;
+    }
+  >();
   private readonly streams = new Set<() => void>();
   /**
    * Job ids of a conversation being deleted, by conversation: only a delete that committed (`onDeleted`) stops them;
@@ -211,11 +219,10 @@ export class VideoJobs {
   /** The first pass's recovery succeeded (until then nothing is approved: `video_recovering`). */
   private recovered = false;
   /**
-   * Whether the last process's download folders are all gone (review r4: a sweep that failed is tried again by later
-   * passes — around the folders of downloads under way now, `workdirs`). Clean-up only: no job's state depends on it.
+   * Whether the `video-scratch` folders not in use are all gone: a sweep that failed, or a folder whose removal
+   * failed, is swept again by later passes (never a folder in use — `video-probe.ts`). Clean-up only.
    */
   private swept = false;
-  private readonly workdirs = new Set<string>();
   /** This process (the card keeps the newest of two equal versions from different processes). */
   readonly boot = crypto.randomBytes(6).toString("hex");
 
@@ -240,8 +247,11 @@ export class VideoJobs {
       // other still held is `unconfirmed` (kept for good), a settled cost stays (both only touch `video_job` rows).
       for (const r of rows) {
         if (!r.usageKey) continue;
-        if (r.status === "failed" && REFUSED.includes(r.errorCode as VideoJobCode))
-          this.o.usage?.releaseVideoMedia(r.usageKey);
+        // A refusal known here and still being recorded (review r5) is a refusal too: never billed.
+        const refused =
+          (r.status === "failed" && REFUSED.includes(r.errorCode as VideoJobCode)) ||
+          this.inflight.get(r.id)?.refusal === r.usageKey;
+        if (refused) this.o.usage?.releaseVideoMedia(r.usageKey);
         else this.o.usage?.unconfirmVideoMedia(r.usageKey);
       }
       this.deleting.set(
@@ -760,11 +770,19 @@ export class VideoJobs {
   }
 
   /** Work of a job under way here: its stop kept until it ends (the only in-memory state of a job). */
-  private track(id: string, stop: AbortController, work: Promise<unknown>): Promise<unknown> {
-    const done = work.finally(() => {
-      if (this.inflight.get(id)?.stop === stop) this.inflight.delete(id);
-    });
-    this.inflight.set(id, { stop, done });
+  private track(
+    id: string,
+    stop: AbortController,
+    work: Promise<unknown>,
+    refusal?: string,
+  ): Promise<unknown> {
+    // Never rejects (review r5): what failed is logged; the row says where the job stands.
+    const done = work
+      .catch((e: unknown) => logEvent(this.o.log, "warn", "error", { videoJobId: id, err: e }))
+      .finally(() => {
+        if (this.inflight.get(id)?.stop === stop) this.inflight.delete(id);
+      });
+    this.inflight.set(id, { stop, done, ...(refusal ? { refusal } : {}) });
     return done;
   }
 
@@ -808,7 +826,7 @@ export class VideoJobs {
         // kept trying while this job's work is still under way (a pass leaves it alone), until it is or the deadline.
         return (
           this.fail(id, code, { release: usageKey }) ??
-          this.retrying(id, () => this.fail(id, code, { release: usageKey }))
+          this.retrying(id, () => this.fail(id, code, { release: usageKey }), usageKey)
         );
       }
       // No answer, a timeout or a 5xx: it may have started and may bill — never sent again, its bound stays.
@@ -856,27 +874,24 @@ export class VideoJobs {
    * is no longer `submitting` or is gone, its deadline passed (the pass's timeout ends it), or the engine stops. The
    * approval does not wait for it: it answers with the row as it is now.
    */
-  private retrying(id: string, attempt: () => VideoJobRow | null): VideoJobRow | undefined {
+  private retrying(id: string, attempt: () => VideoJobRow | null, refusal?: string): VideoJobRow | undefined {
     const stop = new AbortController();
     const work = (async () => {
       for (let n = 0; ; n++) {
         await new Promise<void>((r) => setTimeout(r, Math.min(30_000, this.limits.retryMs * 2 ** n)).unref());
         if (stop.signal.aborted || this.stopping) return;
-        let row: VideoJobRow | undefined;
+        // One try, all of it inside: a read or a write that fails is the next try (review r5).
         try {
-          row = this.get(id);
-        } catch {
-          continue;
-        }
-        if (!row || row.status !== "submitting" || this.pastDeadline(id)) return;
-        try {
+          const row = this.get(id);
+          if (!row || row.status !== "submitting") return;
+          if (row.deadlineAt !== null && this.now() >= row.deadlineAt) return;
           if (attempt()) return;
         } catch {
           // tried again
         }
       }
     })();
-    void this.track(id, stop, work);
+    void this.track(id, stop, work, refusal);
     try {
       return this.get(id);
     } catch {
@@ -966,7 +981,7 @@ export class VideoJobs {
 
   /** The last process's download folders (never one of a download under way here). */
   private sweep(): void {
-    this.swept = sweepVideoScratch(this.o.dataDir, (name) => this.workdirs.has(name));
+    this.swept = sweepVideoScratch(this.o.dataDir);
     if (!this.swept) logEvent(this.o.log, "warn", "media.sweep_failed");
   }
 
@@ -1051,7 +1066,14 @@ export class VideoJobs {
     for (const r of this.o.db
       .select()
       .from(videoJobs)
-      .where(and(inArray(videoJobs.status, ACTIVE), sql`${videoJobs.nextAt} <= ${at}`))
+      // Due — or leased but no work of it under way here (its work ended without writing its next time, review r5):
+      // a scheduled time is never more than the backoff's maximum ahead, a lease always is.
+      .where(
+        and(
+          inArray(videoJobs.status, ACTIVE),
+          sql`(${videoJobs.nextAt} <= ${at} OR ${videoJobs.nextAt} > ${at + this.limits.maxBackoffMs})`,
+        ),
+      )
       .orderBy(asc(videoJobs.nextAt))
       .limit(20)
       .all()) {
@@ -1167,14 +1189,16 @@ export class VideoJobs {
         return this.later(row, this.limits.pollMs, changed ? { status, progress } : {});
       }
       if (status === "completed") return await this.complete(row, a, signal);
+      // An answer handled at or past the deadline: the deadline's reason first (review r5).
+      const late = row.deadlineAt !== null && this.now() >= row.deadlineAt;
       if (status === "failed" || status === "cancelled") {
         // The provider's words are never stored or shown: only whether they name its moderation.
         const moderated = typeof a.error === "string" && MODERATION.test(a.error);
-        this.fail(row.id, moderated ? "video_moderated" : "video_failed");
+        this.fail(row.id, late ? "video_timeout" : moderated ? "video_moderated" : "video_failed");
         return;
       }
       if (status === "expired") {
-        this.fail(row.id, "video_remote_expired");
+        this.fail(row.id, late ? "video_timeout" : "video_remote_expired");
         return;
       }
       // Anything else: asked again later.
@@ -1230,7 +1254,6 @@ export class VideoJobs {
     try {
       try {
         workdir = makeVideoWorkdir(this.o.dataDir);
-        this.workdirs.add(path.basename(workdir));
       } catch {
         this.fail(row.id, "video_store_failed");
         return;
@@ -1260,8 +1283,8 @@ export class VideoJobs {
       await this.store(settled, file, got);
     } finally {
       if (workdir) {
-        removeVideoWorkdir(workdir);
-        this.workdirs.delete(path.basename(workdir));
+        // Not all of it went: the next pass sweeps it (review r5).
+        if (!removeVideoWorkdir(workdir)) this.swept = false;
       }
     }
   }
@@ -1349,8 +1372,14 @@ export class VideoJobs {
         tmp: file,
         // Inside the file-write lock: the job is still this one, downloading, without a file.
         guard: () => {
-          const r = this.get(row.id);
-          return !!r && r.status === "downloading" && r.fileId === null && !this.pastDeadline(row.id);
+          try {
+            const r = this.get(row.id);
+            return !!r && r.status === "downloading" && r.fileId === null && !this.pastDeadline(row.id);
+          } catch {
+            // Its state could not be read (review r5): not the job's end — stored again by a later pass.
+            transient = true;
+            return false;
+          }
         },
         video: {
           jobId: row.id,
@@ -1366,21 +1395,11 @@ export class VideoJobs {
         },
       });
     } catch (e) {
-      // The job went (its conversation deleted) or changed under it: nothing is stored, nothing more to do.
-      if (e instanceof FileAddCancelledError && !this.get(row.id)) return;
-      if (e instanceof FileAddCancelledError && this.get(row.id)?.status !== "downloading") return;
-      // Past its deadline while waiting for the lock: the next pass's timeout.
-      if (e instanceof FileAddCancelledError && this.pastDeadline(row.id)) return;
-      // The job is still the one downloading (only the commit's write failed) or another write failed: below.
-      if (e instanceof FileAddCancelledError && !transient) return;
-      // For good: no place left (the conversation's files), a store folder that is a link.
-      if (e instanceof FileLimitError || e instanceof StoreLinkError) {
-        this.fail(row.id, "video_store_failed");
-        return;
+      try {
+        this.storeFailed(row, e, transient);
+      } catch {
+        // Its lease runs out and a later pass takes it up again (an orphaned lease is due at once).
       }
-      // Anything else (the commit's write, the insert, the rename — the database or the disk for now): the job stays
-      // `downloading` and is downloaded and stored again by a later pass, until its deadline (its cost is settled).
-      this.backoff(row);
       return;
     }
     this.changed(row.id);
@@ -1392,6 +1411,24 @@ export class VideoJobs {
       videoJobId: done.id,
     });
     this.notify(done);
+  }
+
+  /** What a store that did not commit means for the job: nothing (gone, ended), for good, or again later. */
+  private storeFailed(row: VideoJobRow, e: unknown, transient: boolean): void {
+    if (e instanceof FileAddCancelledError && !transient) {
+      // The job went (its conversation deleted), changed under it, or passed its deadline while waiting for the lock
+      // (the next pass's timeout): nothing is stored, nothing more to do here.
+      return;
+    }
+    // For good: no place left (the conversation's files), a store folder that is a link.
+    if (e instanceof FileLimitError || e instanceof StoreLinkError) {
+      this.fail(row.id, "video_store_failed");
+      return;
+    }
+    // Anything else (its state not read, the commit's write, the insert, the rename — the database or the disk for
+    // now): the job stays `downloading` and is downloaded and stored again by a later pass, until its deadline (its
+    // cost is settled). Should this write fail too, the orphaned lease makes it due at once (`startDue`).
+    this.backoff(row);
   }
 
   /** `done` with its file, in the file row's own transaction (false: the job is no longer the one downloading). */

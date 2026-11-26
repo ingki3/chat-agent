@@ -78,12 +78,30 @@ export const MP4_BRANDS: ReadonlySet<string> = new Set([
 
 export const VIDEO_PROBE_LIMITS = { timeoutMs: 60_000, memoryBytes: 1024 * 1024 * 1024 } as const;
 
-export const makeVideoWorkdir = (dataDir: string): string =>
-  makeScratchDir(dataDir, storagePaths(dataDir).videoScratch);
-export const removeVideoWorkdir = (dir: string): boolean => removeTree(dir);
-/** The folders of the last process (the engine's start; nothing is downloading then). */
-export const sweepVideoScratch = (dataDir: string, keep?: (name: string) => boolean): boolean =>
-  sweepScratch(dataDir, storagePaths(dataDir).videoScratch, keep);
+/**
+ * The `video-scratch` folders in use in this process (a download, a readiness check): never swept. Clean-up only —
+ * no job's state depends on it. A folder whose removal failed leaves it and is swept later (review r5).
+ */
+const inUse = new Set<string>();
+export const makeVideoWorkdir = (dataDir: string): string => {
+  const dir = makeScratchDir(dataDir, storagePaths(dataDir).videoScratch);
+  inUse.add(path.basename(dir));
+  return dir;
+};
+/** Removes a working folder; false (left for a later sweep) when it could not all go. */
+export const removeVideoWorkdir = (dir: string): boolean => {
+  let ok: boolean;
+  try {
+    ok = removeTree(dir);
+  } catch {
+    ok = false;
+  }
+  inUse.delete(path.basename(dir));
+  return ok;
+};
+/** The folders not in use here (the last process's, and removals that failed) — never one in use now. */
+export const sweepVideoScratch = (dataDir: string): boolean =>
+  sweepScratch(dataDir, storagePaths(dataDir).videoScratch, (name) => inUse.has(name));
 
 const Report = z.object({
   format: z
