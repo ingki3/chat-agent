@@ -72,6 +72,11 @@ export type InputInfo = {
   durationSec: number | null;
   /** Where its sound ends, from the file's start (estimated, then decoded); null without sound. */
   audioSec?: number | null;
+  /**
+   * Review r4: an MP4/MOV's first sound track ends here on the presentation timeline (its edit list — exact, not an
+   * estimate): the decoded sound is cut there (an AAC's last frame is padding past it). Null for other kinds.
+   */
+  audioEndSec?: number | null;
   hasVideo: boolean;
   hasAudio: boolean;
   width: number | null;
@@ -160,17 +165,96 @@ export function checkTimeline(t: ComposeTimeline): PlanError | null {
   return null;
 }
 
-/** The plan of a checked timeline over its probed inputs (by fileId), or why it does not hold. */
-export function planTimeline(
-  t: ComposeTimeline,
-  inputs: ReadonlyMap<string, InputInfo>,
-  /**
-   * `runtime`: the lengths are decoded truths, not estimates — a trim may end past a picture that ended (it holds),
-   * and subtitles past the end are cut when they are written (`timedCues`), not refused.
-   */
-  o: { runtime?: boolean } = {},
-): Plan | PlanError {
+/**
+ * A clip's frames when the timeline alone says it (an image's `durationSec`, a video's `durationSec` or trim) — null
+ * when it is the video's own length (known only once decoded).
+ */
+const statedFrames = (c: ComposeTimeline["clips"][number], kind: InputKind): number | null =>
+  kind === "image"
+    ? frames(c.durationSec ?? 0)
+    : c.durationSec !== undefined
+      ? frames(c.durationSec)
+      : c.trim
+        ? frames(c.trim.endSec - c.trim.startSec)
+        : null;
+
+/**
+ * What the call can judge without any media length (review r4 — every length-dependent judgement waits for the run's
+ * decoded lengths, `planTimeline`): the timeline's own rules (`checkTimeline`), every fileId an input of a kind for its
+ * place, the options of its kind (an image's 0.5–30 s, no trim or volume; no Ken Burns on a video), transitions against
+ * the lengths the timeline states, and the 5-minute cap when every clip's length is stated.
+ */
+export function checkInputs(t: ComposeTimeline, inputs: ReadonlyMap<string, InputInfo>): PlanError | null {
   const early = checkTimeline(t);
+  if (early) return early;
+  const stated: (number | null)[] = [];
+  for (const [i, c] of t.clips.entries()) {
+    const info = inputs.get(c.fileId);
+    const where = `clips[${i}]`;
+    if (!info) return err("compose_input_missing", `${where}.fileId`);
+    if (info.kind === "image") {
+      if (c.durationSec === undefined)
+        return err("compose_invalid_timeline", `${where}.durationSec: required for an image`);
+      if (c.durationSec > 30 || c.durationSec < COMPOSE_LIMITS.minImageSeconds)
+        return err("compose_invalid_timeline", `${where}.durationSec: an image shows 0.5–30 s`);
+      if (c.trim) return err("compose_invalid_timeline", `${where}.trim: only for a video`);
+      if (c.volume !== undefined)
+        return err("compose_invalid_timeline", `${where}.volume: an image has no sound`);
+    } else {
+      if (info.kind !== "video" || !info.hasVideo)
+        return err(
+          "compose_input_kind",
+          `${where}.fileId: a clip is an image (png/jpg/webp) or a video (mp4/mov)`,
+        );
+      if (c.kenBurns) return err("compose_invalid_timeline", `${where}.kenBurns: only for an image`);
+      const n = statedFrames(c, "video");
+      if (n !== null && n < 1)
+        return err("compose_invalid_timeline", `${where}: a clip is at least one frame (1/30 s)`);
+    }
+    stated.push(statedFrames(c, info.kind));
+  }
+  // The clips' total when every length is stated (else null: judged at the run).
+  let total: number | null = 0;
+  for (const [i, c] of t.clips.entries()) {
+    const a = stated[i] ?? null;
+    total = total === null || a === null ? null : total + a;
+    if (!c.transition) continue;
+    const d = frames(c.transition.durationSec);
+    const b = stated[i + 1] ?? null;
+    if ((a !== null && d >= a) || (b !== null && d >= b))
+      return err(
+        "compose_invalid_timeline",
+        `clips[${i}].transition.durationSec: shorter than both clips it joins`,
+      );
+    if (total !== null) total -= d;
+  }
+  if (total !== null && total > COMPOSE_LIMITS.maxSeconds * FPS)
+    return err(
+      "compose_too_long",
+      `the clips are ${(total / FPS).toFixed(1)} s (at most ${COMPOSE_LIMITS.maxSeconds})`,
+    );
+  for (const [i, n] of (t.narration ?? []).entries()) {
+    const info = inputs.get(n.fileId);
+    if (!info) return err("compose_input_missing", `narration[${i}].fileId`);
+    if (!info.hasAudio || info.kind === "image")
+      return err("compose_input_kind", `narration[${i}].fileId: audio (mp3/m4a/wav) or a video with sound`);
+  }
+  if (t.music) {
+    const info = inputs.get(t.music.fileId);
+    if (!info) return err("compose_input_missing", "music.fileId");
+    if (!info.hasAudio || info.kind === "image")
+      return err("compose_input_kind", "music.fileId: audio (mp3/m4a/wav) or a video with sound");
+  }
+  return null;
+}
+
+/**
+ * The plan of a timeline over its inputs' lengths (by fileId) — the run's decoded ones (an estimate when the call shows
+ * one) — or why it does not hold: every length-dependent rule is judged here (the 5-minute cap, trims, transitions,
+ * fades and subtitles against the real lengths). A trim that ends past its picture holds the last frame.
+ */
+export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, InputInfo>): Plan | PlanError {
+  const early = checkInputs(t, inputs);
   if (early) return early;
   const { width, height } = composeFrame(t.output?.resolution ?? "720p", t.output?.aspectRatio ?? "16:9");
   const clips: PlanClip[] = [];
@@ -212,17 +296,14 @@ export function planTimeline(
     if (c.kenBurns) return err("compose_invalid_timeline", `${where}.kenBurns: only for an image`);
     const length = info.durationSec ?? 0;
     const start = c.trim?.startSec ?? 0;
-    const end = c.trim ? Math.min(c.trim.endSec, length) : length;
+    // A trim is its own length (review r4: what lies past the picture's end holds its last frame, silence after the
+    // sound's) — never cut to a length.
+    const end = c.trim ? c.trim.endSec : length;
     // Review r2: the start must be inside the source; whether the selection makes a frame is checked below.
     if (start >= length - 1e-6)
       return err(
         "compose_invalid_timeline",
         `${where}.trim.startSec: the video is ${length.toFixed(2)} s long`,
-      );
-    if (!o.runtime && c.trim && c.trim.endSec > length + 0.05)
-      return err(
-        "compose_invalid_timeline",
-        `${where}.trim.endSec: the video is ${length.toFixed(2)} s long`,
       );
     const source = end - start;
     const dur = c.durationSec ?? source;
@@ -293,10 +374,7 @@ export function planTimeline(
     needed = Math.max(needed, Math.ceil((n.startSec + sound) * FPS - 1e-6));
   }
   const max = COMPOSE_LIMITS.maxSeconds * FPS;
-  // When the tool is called the narration's length is ffprobe's estimate (a VBR MP3 without a length header can be off
-  // either way — re-plan r3): it is refused only when clearly over (10 %); the run checks the decoded length exactly.
-  const narrationMax = o.runtime ? max : Math.ceil(max * 1.1);
-  if (needed > narrationMax || total > max)
+  if (needed > max || total > max)
     return err(
       "compose_too_long",
       `the video would be ${(Math.max(needed, total) / FPS).toFixed(1)} s (at most ${COMPOSE_LIMITS.maxSeconds})`,
@@ -329,7 +407,7 @@ export function planTimeline(
   }
   const subs = t.subtitles ?? [];
   for (const [i, s] of subs.entries())
-    if (!o.runtime && s.endSec > total / FPS + 1e-6)
+    if (s.endSec > total / FPS + 1e-6)
       return err(
         "compose_invalid_timeline",
         `subtitles[${i}].endSec: the video is ${(total / FPS).toFixed(2)} s long`,
@@ -350,7 +428,7 @@ export function planTimeline(
 // ---------------------------------------------------------------- subtitles
 
 /**
- * A cue's text (review r3): the text as given — NFC, line breaks as "\n", control characters and empty lines out
+ * A cue's text (review r3): the text as given — NFC, line breaks as "\n", control characters (not tabs) and empty lines out
  * (neither track can carry them) — and nothing else changed. Each format escapes only its own syntax (`toAss`,
  * `toVtt`).
  */
@@ -359,8 +437,9 @@ export function cueText(raw: string): string {
     raw
       .normalize("NFC")
       .replace(/\r\n?/g, "\n")
+      // A tab is text (review r4: "항목\t값"); other control characters are not part of a cue.
       // eslint-disable-next-line no-control-regex -- control characters are not part of a cue
-      .replace(/[\0-\x09\x0b-\x1f\x7f-\x9f]/g, "")
+      .replace(/[\0-\x08\x0b-\x1f\x7f-\x9f]/g, "")
       .split("\n")
       .filter((l) => l.trim())
       .join("\n")
@@ -382,10 +461,13 @@ export function timedCues(subs: readonly Cue[], unit: number, totalSec?: number)
   for (const s of subs) {
     const text = cueText(s.text);
     if (!text) continue;
-    const start = Math.max(Math.round(s.startSec * unit), prev);
-    let end = Math.min(Math.max(Math.round(s.endSec * unit), start + 1), total);
+    // A cue that starts inside the video keeps at least its last unit (review r4: 0.996–0.999 s of a 1 s video).
+    const start = Math.max(
+      s.startSec * unit < total ? Math.min(Math.round(s.startSec * unit), total - 1) : total,
+      prev,
+    );
+    const end = Math.min(Math.max(Math.round(s.endSec * unit), start + 1), total);
     if (start >= total || end <= start) continue;
-    end = Math.max(end, start + 1);
     out.push({ start, end, text });
     prev = end;
   }
@@ -471,8 +553,14 @@ export const FF_COMMON = [
   "-filter_complex_threads",
   "1",
 ];
-/** One input, read from its start (never an input seek — re-plan r3), with its demuxer named. */
+/**
+ * One input, read from its start (never an input seek — re-plan r3), with its demuxer named. An MP4/MOV keeps its
+ * presentation timeline (review r4: `-copyts` — ffmpeg would otherwise shift it so the earliest stream starts at 0,
+ * dropping a leading empty edit): its 0 is the movie's 0, the same origin for the ingest and every clip, picture and
+ * sound; what lies before 0 (a negative preroll, AAC priming) is cut by the graph.
+ */
 const input = (o: { demuxer: string; file: string }) => [
+  ...(o.demuxer === "mov" ? ["-copyts"] : []),
   "-protocol_whitelist",
   "file,pipe",
   "-threads",
@@ -558,17 +646,20 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
       ? `[0:v]trim=end_frame=1,${opaque},${square},${fit(W * 2, H * 2)},setsar=1,format=yuv420p,zoompan=${kb[c.kenBurns]}:d=${moving}:s=${W}x${H}:fps=${FPS},tpad=stop_mode=clone:stop=-1,${exact}`
       : `[0:v]trim=end_frame=1,${opaque},${square},${fit(W, H)},setsar=1,format=yuv420p,loop=loop=${N - 1}:size=1:start=0,${exact}`;
   } else {
-    // The trim on the container's own timeline (the re-plan after review r3: no input seeking — a seek to the picture's
-    // keyframe would skip sound and frames before it). Decoded from the start: the picture's last frame repeated past
-    // its end (a picture that ends before or inside the trim holds), then 30 fps from the container's start — each
-    // slot shows the frame on screen at that moment (the one already showing at the trim's start; the first one when
-    // the picture starts late) —, the trim's frames by number, then held to the clip's length. The graph's trim ends
-    // the run (nothing after it is decoded).
+    // The trim on the file's presentation timeline (re-plan r3, review r4). Decoded from its start (no input seeking —
+    // a seek to the picture's keyframe would skip sound and frames before it), the picture is laid on a black 30 fps
+    // canvas from the timeline's 0 (`overlay`): each slot shows the frame on screen at that moment — the one already
+    // showing at the trim's start, nothing (black) before the first frame (a leading empty edit, a picture that
+    // starts late), the last one repeated after the picture ends. A picture with alpha (ProRes 4444, QuickTime
+    // Animation) is blended over that black by the overlay itself. Then the trim's frames by number, the output size,
+    // and held to the clip's length. The graph's trim ends the run (nothing after it is decoded).
     const from = Math.round(c.startSec * FPS);
     const own = Math.max(1, Math.round(c.useSec * FPS));
     picture =
-      `[0:v]tpad=stop_mode=clone:stop=-1,fps=${FPS}:start_time=0,trim=start_frame=${from}:end_frame=${from + own},setpts=N,` +
-      `${square},${fit(W, H)},setsar=1,format=yuv420p,tpad=stop_mode=clone:stop=-1,${exact}`;
+      `[0:v]${square},split[src][ref];color=c=black:s=16x16:r=${FPS},format=yuv420p[canvas];` +
+      `[canvas][ref]scale=rw:rh[bg];[bg][src]overlay=eof_action=repeat:repeatlast=1,` +
+      `trim=start_frame=${from}:end_frame=${from + own},setpts=N,` +
+      `${fit(W, H)},setsar=1,format=yuv420p,tpad=stop_mode=clone:stop=-1,${exact}`;
   }
   const outs: { label: string; from: number; to: number; args: string[] }[] = [];
   if (c.head) outs.push({ label: "hv", from: 0, to: c.head, args: [...LOSSLESS, p.head] });
@@ -638,6 +729,8 @@ export function ingestArgs(o: {
   sound: boolean;
   countPicture: boolean;
   capSec: number;
+  /** An MP4/MOV sound track's presentation end (`InputInfo.audioEndSec`): nothing past it (its codec's padding). */
+  soundEndSec?: number | null;
 }): string[] {
   const cap = num(Math.max(1, o.capSec));
   return [
@@ -649,7 +742,9 @@ export function ingestArgs(o: {
           "-map",
           "0:a:0",
           "-af",
-          `aresample=${RATE}:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo`,
+          `aresample=${RATE}:async=1:first_pts=0${
+            o.soundEndSec ? `,atrim=end=${num(o.soundEndSec)}` : ""
+          },aformat=sample_fmts=s16:channel_layouts=stereo`,
           "-t",
           cap,
           ...PCM,
@@ -711,7 +806,7 @@ export function audioArgs(plan: Plan, o: { narration: boolean; music: string | n
     mix.push("[mus]");
   }
   // loudnorm needs 3 s to measure: a shorter (or silent) sound is padded first (else it gives NaN), then cut back.
-  const tail = `apad=whole_len=${Math.max(T, 3 * RATE)},loudnorm=I=-16:TP=-1.5:LRA=11,aresample=${RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=end_sample=${T}[out]`;
+  const tail = `apad=whole_len=${Math.max(T, 3 * RATE)},loudnorm=I=-16:TP=-1.5:LRA=11,aresample=${RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=end_sample=${T},asetpts=N/SR/TB[out]`;
   graph.push(
     mix.length === 1
       ? `${mix[0]}${tail}`

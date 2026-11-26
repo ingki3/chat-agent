@@ -11,6 +11,7 @@ import {
   audioArgs,
   clipArgs,
   concatList,
+  cueText,
   FPS,
   ingestArgs,
   inputKindOf,
@@ -18,6 +19,7 @@ import {
   pieces,
   planTimeline,
   probeArgs,
+  DEMUXER,
   RATE,
   sourcePcm,
   SPF,
@@ -151,6 +153,13 @@ export function judgeInput(stdout: string, fileKind: FileKind): ProbeOutcome {
     : Number.isFinite(a.duration) && a.duration! > 0
       ? Math.max(0, (Number.isFinite(a.start_time) ? a.start_time! : origin) - origin) + a.duration!
       : duration;
+  // Review r4: an MP4/MOV's sound track ends where its presentation timeline says (its edit list — exact): an AAC's
+  // last frame decodes past it (padding). Read on the same timeline the ingest uses (`-copyts`).
+  const audioEndSec =
+    DEMUXER[fileKind] === "mov" && a && Number.isFinite(a.duration) && a.duration! > 0
+      ? (Number.isFinite(a.start_time) ? a.start_time! : 0) + a.duration!
+      : null;
+
   if (kind === "image") {
     if (!v || !side(v.width) || !side(v.height)) return { ok: false, reason: "unreadable" };
     return {
@@ -180,6 +189,7 @@ export function judgeInput(stdout: string, fileKind: FileKind): ProbeOutcome {
         hasVideo: !!v,
         hasAudio: audio.length > 0,
         audioSec,
+        audioEndSec,
         width: v?.width ?? null,
         height: v?.height ?? null,
       },
@@ -193,6 +203,7 @@ export function judgeInput(stdout: string, fileKind: FileKind): ProbeOutcome {
       kind,
       durationSec: duration,
       audioSec,
+      audioEndSec,
       hasVideo: false,
       hasAudio: true,
       width: null,
@@ -254,7 +265,8 @@ export function judgeResult(stdout: string, plan: Plan, subtitles: boolean): boo
   if (v.codec_name !== "h264" || v.width !== plan.width || v.height !== plan.height) return false;
   if (v.nb_read_packets === undefined || Math.abs(v.nb_read_packets - plan.frames) > 1) return false;
   if (a.codec_name !== "aac" || a.duration === undefined) return false;
-  if (Math.abs(a.duration - plan.samples / (SPF * 30)) > 0.1) return false;
+  // Review r4: picture and sound end together — the sound within one frame of the picture's frames.
+  if (Math.abs(a.duration - plan.samples / (SPF * 30)) > 1 / 30 + 1e-3) return false;
   if (subtitles && subs[0]!.codec_name !== "mov_text") return false;
   return true;
 }
@@ -463,7 +475,10 @@ export function sandboxedComposer(o: {
       const info = byId.get(c.fileId);
       if (!info || info.kind !== "video") continue;
       // What the clip takes from its source: up to the trim's end, or its length from the start (else all of it).
-      const end = c.trim ? c.trim.endSec : (c.durationSec ?? longest);
+      // Review r4: with a trim and a length, only up to the earlier of the two.
+      const end = c.trim
+        ? Math.min(c.trim.endSec, c.trim.startSec + (c.durationSec ?? Infinity))
+        : (c.durationSec ?? longest);
       use(c.fileId, Math.min(end, COMPOSE_LIMITS.maxSourceSeconds) + 1, true);
     }
     for (const n of t.narration ?? []) use(n.fileId, longest, false);
@@ -482,6 +497,7 @@ export function sandboxedComposer(o: {
           sound: info.hasAudio,
           countPicture: u.count && info.hasVideo,
           capSec: u.cap,
+          soundEndSec: info.audioEndSec ?? null,
         }),
         0,
         0,
@@ -508,7 +524,7 @@ export function sandboxedComposer(o: {
     }
     // 2. The plan from the decoded lengths (a narration that is really longer holds the last picture; the 5-minute cap
     //    on the real total).
-    const plan = planTimeline(t, truth, { runtime: true });
+    const plan = planTimeline(t, truth);
     if (isPlanError(plan))
       return {
         ok: false,
@@ -596,6 +612,10 @@ export function sandboxedComposer(o: {
     // 6. The file (the subtitles cut to the real length — `timedCues`).
     const subs = (t.subtitles ?? []).length ? toAss(t.subtitles ?? [], plan.frames / FPS) : null;
     const hasSubs = !!subs && subs.includes("\nDialogue:");
+    // Review r4: every cue asked for is in the track (none lost to rounding) — else the result is not what was asked.
+    const asked = (t.subtitles ?? []).filter((x) => cueText(x.text)).length;
+    if (asked !== (subs?.split("\nDialogue:").length ?? 1) - 1)
+      return { ok: false, code: "compose_verify_failed" };
     if (hasSubs) fs.writeFileSync(path.join(work, "subs.ass"), subs!, { flag: "wx", mode: 0o600 });
     const result = path.join(outDir, "result.mp4");
     const code = await step(
@@ -700,9 +720,7 @@ export function fixtureComposer(
       const forced = o.outcome?.();
       if (forced && !forced.ok) return forced;
       // The lengths it was given stand for decoded ones.
-      const plan = planTimeline(job.timeline, new Map(job.inputs.map((i) => [i.fileId, i])), {
-        runtime: true,
-      });
+      const plan = planTimeline(job.timeline, new Map(job.inputs.map((i) => [i.fileId, i])));
       if (isPlanError(plan))
         return {
           ok: false,

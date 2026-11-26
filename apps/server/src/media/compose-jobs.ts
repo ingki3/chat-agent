@@ -11,6 +11,7 @@ import {
   COMPOSE_FAILURE_SHORT,
   COMPOSE_LIMITS,
   ComposeTimeline,
+  composeFrame,
   FILE_KINDS,
   FILE_LIMITS,
   MEDIA_TOOL_HINTS,
@@ -30,6 +31,7 @@ import { carriesSecret } from "../secrets/egress.js";
 import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 import { storagePaths } from "../storage/paths.js";
 import {
+  checkInputs,
   checkTimeline,
   cueText,
   FPS,
@@ -206,8 +208,21 @@ export class ComposeJobs {
     });
   }
 
-  /** Every waiting job's card hears that its place in the queue may have changed. Never throws. */
+  /**
+   * Every waiting job's card hears that its place in the queue may have changed — its version raised first (review r4:
+   * a card keeps the newest version, so a read started before the change and answered after it cannot put the old
+   * place back). Never throws.
+   */
   private queuedChanged(): void {
+    try {
+      this.o.db
+        .update(composeJobs)
+        .set({ version: sql`${composeJobs.version} + 1`, updatedAt: this.now() })
+        .where(eq(composeJobs.status, "queued"))
+        .run();
+    } catch {
+      // the cards read their state again on their own
+    }
     try {
       for (const q of this.o.db
         .select({ id: composeJobs.id })
@@ -462,7 +477,7 @@ export class ComposeJobs {
       stop.abort();
     }, this.limits.prepareTimeoutMs);
     this.work.set(id, { stop });
-    let outcome: { plan: Plan; inputs: InputInfo[] } | ToolError;
+    let outcome: { plan: Plan | null; inputs: InputInfo[] } | ToolError;
     try {
       outcome = await this.prepare(id, dir, composer, files, inputs, timeline, stop.signal);
     } catch {
@@ -487,6 +502,7 @@ export class ComposeJobs {
     // The call's plan is an estimate (ffprobe's lengths — re-plan after review r3): the job keeps its inputs and is
     // planned again from their decoded lengths when it runs.
     const { plan, inputs: probed } = outcome;
+    const frame = composeFrame(timeline.output?.resolution ?? "720p", timeline.output?.aspectRatio ?? "16:9");
     let queued: { changes: number };
     try {
       queued = this.o.db
@@ -494,10 +510,10 @@ export class ComposeJobs {
         .set({
           status: "queued",
           planJson: JSON.stringify({ inputs: probed }),
-          durationMs: Math.round((plan.frames / FPS) * 1000),
-          width: plan.width,
-          height: plan.height,
-          clips: plan.clips.length,
+          durationMs: plan ? Math.round((plan.frames / FPS) * 1000) : 0,
+          width: frame.width,
+          height: frame.height,
+          clips: timeline.clips.length,
           subtitles: (timeline.subtitles ?? []).some((s) => cueText(s.text)),
           version: sql`${composeJobs.version} + 1`,
           updatedAt: this.now(),
@@ -530,12 +546,13 @@ export class ComposeJobs {
       status: row?.status === "running" ? "running" : "queued",
       jobId: id,
       queuePosition: row ? this.position(row) : null,
-      durationSec: plan.frames / FPS,
-      width: plan.width,
-      height: plan.height,
-      clips: plan.clips.length,
-      heldLastFrameSec: plan.held / FPS,
-      note: "Not finished yet: the video is being put together on the server. A card under your reply shows its progress and then plays it — tell the user to check the card; never say the video is finished.",
+      // Estimates (ffprobe's lengths); null when they do not fit — the run decides on the real ones.
+      durationSec: plan ? plan.frames / FPS : null,
+      width: frame.width,
+      height: frame.height,
+      clips: timeline.clips.length,
+      heldLastFrameSec: plan ? plan.held / FPS : null,
+      note: "Not finished yet: the video is being put together on the server. The lengths here are estimates — the server decodes the files and checks the real lengths (the 5-minute cap, trims, fades, subtitles) when it runs, and the card says so if they do not fit. A card under your reply shows its progress and then plays it — tell the user to check the card; never say the video is finished.",
     };
   }
 
@@ -667,7 +684,7 @@ export class ComposeJobs {
     rows: FileRow[],
     timeline: ComposeTimeline,
     signal: AbortSignal,
-  ): Promise<{ plan: Plan; inputs: InputInfo[] } | ToolError> {
+  ): Promise<{ plan: Plan | null; inputs: InputInfo[] } | ToolError> {
     const infos = new Map<string, InputInfo>();
     for (const [k, f] of rows.entries()) {
       if (signal.aborted) return new ToolError("media_cancelled");
@@ -683,9 +700,12 @@ export class ComposeJobs {
       infos.set(f.id, { ...p.info, fileId: f.id, name });
     }
     if (!this.get(id)) return new ToolError("media_cancelled");
-    const plan = planTimeline(timeline, infos);
-    if (isPlanError(plan)) return new ToolError(plan.code, plan.hint);
-    return { plan, inputs: [...infos.values()] };
+    // Only what needs no media length is judged now (review r4); the length-dependent rules wait for the run's decoded
+    // lengths. The plan over ffprobe's lengths is only the answer's estimate (none when they do not fit).
+    const bad = checkInputs(timeline, infos);
+    if (bad) return new ToolError(bad.code, bad.hint);
+    const estimate = planTimeline(timeline, infos);
+    return { plan: isPlanError(estimate) ? null : estimate, inputs: [...infos.values()] };
   }
 
   /** A preparation that did not end queued: its row (still preparing) and its folder go. */
