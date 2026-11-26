@@ -174,10 +174,8 @@ const DEFAULTS: Limits = {
 
 const ACTIVE = [...VIDEO_ACTIVE] as VideoJobStatus[];
 const POLLED: VideoJobStatus[] = ["pending", "in_progress", "downloading"];
-/** How long a stop may take — waiting for submits under way and recording held outcomes. */
+/** How long a stop may take — waiting for submits under way and recording held outcomes, in one loop. */
 const STOP_BUDGET_MS = 10_000;
-/** The part of it kept for recording held outcomes (submits are waited for at most the rest). */
-const STOP_FLUSH_MS = 3_000;
 /** How long a job's work may hold it (a poll, a download, its check, the file lock) before a pass picks it again. */
 const LEASE_MS = (l: { requestTimeoutMs: number; downloadTimeoutMs: number }) =>
   l.requestTimeoutMs + l.downloadTimeoutMs + 2 * 60_000;
@@ -1071,13 +1069,10 @@ export class VideoJobs {
     // Polls, downloads and retry waits stop now. A submit under way only finishes reading its answer: from here on it
     // writes nothing (review r10) — an outcome it receives is held and handed over to the flush below.
     for (const w of this.inflight.values()) if (w.kind !== "submit") w.stop.abort();
-    await Promise.race([
-      Promise.all([...this.inflight.values()].map((w) => w.done)),
-      new Promise<void>((r) => setTimeout(r, Math.max(0, left() - STOP_FLUSH_MS)).unref()),
-    ]);
-    // The final flush, until the budget ends: every outcome held — handed over by ended work, or still held by work
-    // under way — collected again on every round (one that arrived late included), written with the lock wait cut to
-    // the time left (that one write only), and let go only once its row reflects it.
+    // One loop from the start (review r11): every round (~200 ms) collects again every outcome held — handed over by
+    // ended work, or still held by work under way (a submit's answer that came meanwhile included) — and writes it at
+    // once, the lock wait cut to the time left for that one write; an outcome is let go only once its row reflects it.
+    // Until nothing is unrecorded and no submit is under way, or the budget ends.
     const unrecorded = new Set<string>();
     const round = () => {
       const held = new Map(this.handedOver);

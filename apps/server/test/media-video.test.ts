@@ -2900,3 +2900,41 @@ describe("video jobs — review r10 regressions (a closed shutdown path)", () =>
     });
   }, 40_000);
 });
+
+// ---------------------------------------------------------------- review round 11 (#255)
+
+describe("video jobs — review r11 regressions (the stop records from its first moment)", () => {
+  it("an accepted id that came early in the stop is stored before a lock taken later; a sibling submit still waits", async () => {
+    const DatabaseCtor = (await import("better-sqlite3")).default;
+    const pending: ((x: Response) => void)[] = [];
+    const server = fakeServer({ submit: () => new Promise<Response>((resolve) => pending.push(resolve)) });
+    const t = await start({ server, dbFile: true });
+    const a = await t.card();
+    const b = await t.card();
+    const first = t.approve(a.jobId, 0);
+    await vi.waitFor(() => expect(pending.length).toBe(1));
+    const second = t.approve(b.jobId, 0);
+    await vi.waitFor(() => expect(pending.length).toBe(2));
+    const writer = new DatabaseCtor(t.db.$client.name);
+    const begin = Date.now();
+    const stop = t.video.stop();
+    pending[0]!(Response.json({ id: rid(1) }, { status: 202 }));
+    await first;
+    // Well before the lock below: the flush has written it already.
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(t.job(a.jobId)).toMatchObject({ status: "pending", remoteId: rid(1) });
+    await new Promise((r) => setTimeout(r, 4400));
+    writer.exec("BEGIN IMMEDIATE");
+    try {
+      await stop;
+    } finally {
+      writer.exec("ROLLBACK");
+      writer.close();
+    }
+    expect(Date.now() - begin).toBeLessThan(11_500);
+    pending[1]!(new Response(null, { status: 503 }));
+    await second;
+    expect(t.job(a.jobId)).toMatchObject({ status: "pending", remoteId: rid(1) });
+    expect(server.posts()).toHaveLength(2);
+  }, 30_000);
+});
