@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "753df78c-13f9-4102-b728-09d58019686f",
+  "id": "12498ce7-feb6-473c-b944-fed882a68a9c",
   "prevId": "dc60569c-1195-4be4-b728-bf56476142e0",
   "tables": {
     "access_syncs": {
@@ -6107,6 +6107,21 @@
           "notNull": false,
           "autoincrement": false
         },
+        "next_at": {
+          "name": "next_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "failures": {
+          "name": "failures",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
         "ended_at": {
           "name": "ended_at",
           "type": "integer",
@@ -6120,6 +6135,21 @@
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "notify_next_at": {
+          "name": "notify_next_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "notify_tries": {
+          "name": "notify_tries",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
         }
       },
       "indexes": {
@@ -6131,6 +6161,11 @@
         "video_jobs_status_idx": {
           "name": "video_jobs_status_idx",
           "columns": ["status"],
+          "isUnique": false
+        },
+        "video_jobs_next_idx": {
+          "name": "video_jobs_next_idx",
+          "columns": ["status", "next_at"],
           "isUnique": false
         }
       },

@@ -1875,13 +1875,25 @@ export const videoJobs = sqliteTable(
     expiresAt: integer("expires_at").notNull(),
     approvedAt: integer("approved_at"),
     submittedAt: integer("submitted_at"),
+    /** Approval + 60 minutes: past it a running job is `video_timeout`, whatever it is doing. */
     deadlineAt: integer("deadline_at"),
+    /**
+     * When the engine handles the running job next (a poll, a retry, a lease while it is being handled): the engine
+     * picks due rows by it, oldest first. Null for a card or an ended job.
+     */
+    nextAt: integer("next_at"),
+    /** Failed polls or downloads in a row (the backoff). */
+    failures: integer("failures").notNull().default(0),
     endedAt: integer("ended_at"),
-    /** The end notification was published (a restart publishes only the missing ones). */
+    /** The end notification was published (or refused for good). */
     notifiedAt: integer("notified_at"),
+    /** When an end notification that failed is tried again, and how often it failed (its backoff). */
+    notifyNextAt: integer("notify_next_at"),
+    notifyTries: integer("notify_tries").notNull().default(0),
   },
   (t) => [
     index("video_jobs_conversation_idx").on(t.conversationId, t.createdAt),
     index("video_jobs_status_idx").on(t.status),
+    index("video_jobs_next_idx").on(t.status, t.nextAt),
   ],
 );

@@ -663,7 +663,11 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const mediaFetchImpl =
       opts.media?.fetchImpl ?? (config.fakeRuntime ? fixtureOpenRouterFetch() : undefined);
     const mediaFetch = mediaFetchImpl ? { fetchImpl: mediaFetchImpl } : {};
+    // video_generate (#238 stage 3): its cards and jobs (made below; the generator and the admin's writes ask for it).
+    const videoRef: { jobs?: VideoJobs } = {};
     const mediaAdmin = new MediaAdminService({
+      // A key or settings write expires the waiting video cards in its own transaction.
+      changed: () => videoRef.jobs?.expireWaiting(),
       settings: settingsStore,
       transaction: (fn) => opts.db!.transaction(() => fn()),
       // One statement: the key and its check go together, or neither does.
@@ -688,8 +692,6 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     });
     if (opts.dataLock || opts.media?.recoverAtStart) mediaRecovery.runAtStart();
     app.addHook("preClose", async () => mediaRecovery.stop());
-    // video_generate (#238 stage 3): its cards and jobs (made below; the generator asks for it per call).
-    const videoRef: { jobs?: VideoJobs } = {};
     // image_generate / speech_generate (#238 stage 2): offered while the kind is on (관리자 → 미디어 생성).
     const mediaTools = new MediaGenerator({
       video: () => videoRef.jobs,

@@ -27,8 +27,12 @@ CREATE TABLE `video_jobs` (
 	`approved_at` integer,
 	`submitted_at` integer,
 	`deadline_at` integer,
+	`next_at` integer,
+	`failures` integer DEFAULT 0 NOT NULL,
 	`ended_at` integer,
 	`notified_at` integer,
+	`notify_next_at` integer,
+	`notify_tries` integer DEFAULT 0 NOT NULL,
 	FOREIGN KEY (`conversation_id`) REFERENCES `conversations`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`owner_id`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`file_id`) REFERENCES `files`(`id`) ON UPDATE no action ON DELETE set null
@@ -36,6 +40,7 @@ CREATE TABLE `video_jobs` (
 --> statement-breakpoint
 CREATE INDEX `video_jobs_conversation_idx` ON `video_jobs` (`conversation_id`,`created_at`);--> statement-breakpoint
 CREATE INDEX `video_jobs_status_idx` ON `video_jobs` (`status`);--> statement-breakpoint
+CREATE INDEX `video_jobs_next_idx` ON `video_jobs` (`status`,`next_at`);--> statement-breakpoint
 ALTER TABLE `notification_prefs` ADD `video_done` integer DEFAULT true NOT NULL;--> statement-breakpoint
 ALTER TABLE `notification_prefs` ADD `video_failed` integer DEFAULT true NOT NULL;--> statement-breakpoint
 CREATE TRIGGER `video_jobs_prompt_changed` AFTER UPDATE OF `prompt` ON `video_jobs` WHEN OLD.`prompt` IS NOT NEW.`prompt` AND NEW.`status` = 'awaiting_approval' BEGIN UPDATE `video_jobs` SET `status` = 'failed', `error_code` = 'video_blocked', `ended_at` = CAST(strftime('%s', 'now') AS INTEGER) * 1000, `updated_at` = CAST(strftime('%s', 'now') AS INTEGER) * 1000, `version` = `version` + 1 WHERE `id` = NEW.`id`; END;

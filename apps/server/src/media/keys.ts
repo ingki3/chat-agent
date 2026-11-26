@@ -36,20 +36,20 @@ export class OpenRouterKeys {
   }
 
   /**
-   * The key's mark (#238 stage 3): `admin:<revision>` for the admin's key, `env` for `.env`'s (it changes only with a
-   * restart and its own configuration), undefined without a key.
+   * The key's mark (#238 stage 3): `<source>:<revision>` — the revision a random token written with every save or
+   * delete of the admin's key (`OPENROUTER_KEY_REVISION_SETTING`), so a mark never comes back: a key saved and deleted
+   * again leaves `.env`'s key with a new mark too. Never the key or derived from it. Undefined without a key.
    */
   mark(): string | undefined {
     const r = this.resolve();
     if (!r) return undefined;
-    if (r.source === "env") return "env";
     let rev: string | undefined;
     try {
       rev = this.settings?.get(OPENROUTER_KEY_REVISION_SETTING);
     } catch {
       rev = undefined;
     }
-    return `admin:${rev || "initial"}`;
+    return `${r.source}:${rev || "initial"}`;
   }
 
   source(): MediaKeySource {

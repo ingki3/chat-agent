@@ -58,6 +58,11 @@ export type MediaAdminOptions = {
   catalogTtlMs?: number;
   /** Tests: the process id part of the key generation (default: random). */
   bootId?: string;
+  /**
+   * #238 stage 3: called inside every key save or delete and settings save transaction — the waiting video cards made
+   * under the old key or settings expire with it (`VideoJobs.expireWaiting`).
+   */
+  changed?: () => void;
 };
 
 const CATALOG_TTL_MS = 10 * 60_000;
@@ -178,6 +183,7 @@ export class MediaAdminService {
         this.o.settings.setSecret(OPENROUTER_KEY_SETTING, key);
         this.o.settings.set(OPENROUTER_KEY_STATUS_SETTING, JSON.stringify(stored));
         this.o.settings.set(OPENROUTER_KEY_REVISION_SETTING, crypto.randomUUID());
+        this.o.changed?.();
       });
       this.keyChanged();
       return this.view();
@@ -201,6 +207,7 @@ export class MediaAdminService {
         this.expectGeneration(expectedGeneration);
         this.o.remove([OPENROUTER_KEY_SETTING, OPENROUTER_KEY_STATUS_SETTING]);
         this.o.settings.set(OPENROUTER_KEY_REVISION_SETTING, crypto.randomUUID());
+        this.o.changed?.();
       });
       this.keyChanged();
       return this.view();
@@ -355,7 +362,10 @@ export class MediaAdminService {
         if (n.model === null) continue;
         const newModel = n.model !== c.model;
         const turnedOn = n.enabled && !c.enabled;
-        if (!newModel && !turnedOn) continue;
+        // #238 stage 3 (review r3): video, while on, is judged on every save — a model saved before its prices were
+        // judged so (or whose prices changed) is not kept on by an unrelated save. Turning it off needs no check.
+        const videoOn = kind === "video" && n.enabled;
+        if (!newModel && !turnedOn && !videoOn) continue;
         // Only whether the model is listed: the per-model price reads are not needed for that.
         const catalog = await this.catalog(kind, true, undefined, false);
         const listed = catalog.models.find((m) => m.id === n.model);
@@ -372,6 +382,7 @@ export class MediaAdminService {
       this.o.transaction(() => {
         expectVersion();
         this.o.store.set(next);
+        this.o.changed?.();
       });
       return this.view();
     });

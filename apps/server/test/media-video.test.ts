@@ -233,17 +233,29 @@ async function start(
       )
       .all() as { run_id: string; s: string; e: number; p: number | null; c: number }[];
   /** Polls until the job ends (or `n` passes), each pass a tick of the engine. */
+  /** Every running job and every waiting notification due now (the engine's state is the rows). */
+  const dueNow = () =>
+    db.$client
+      .prepare(
+        "UPDATE video_jobs SET next_at = CASE WHEN next_at IS NULL THEN NULL ELSE 0 END, notify_next_at = CASE WHEN notify_next_at IS NULL THEN NULL ELSE 0 END",
+      )
+      .run();
+  const due = (id: string) =>
+    db.$client.prepare("SELECT next_at AS at, failures FROM video_jobs WHERE id = ?").get(id) as {
+      at: number;
+      failures: number;
+    };
   const drive = async (id: string, n = 10) => {
     for (let i = 0; i < n; i++) {
       await video.tick();
       await video.idle();
       if (["done", "failed", "expired", "dismissed"].includes(job(id).status)) break;
-      // Every job is due again at once.
-      (video as unknown as { due: Map<string, { at: number }> }).due.forEach((d) => (d.at = 0));
+      // Every job (and notification) is due again at once.
+      dueNow();
     }
     return job(id);
   };
-  return { app, db, f, api, server, video, card, approve, job, usage, drive, scopeOf, dataDir };
+  return { app, db, f, api, server, video, card, approve, job, usage, drive, dueNow, due, scopeOf, dataDir };
 }
 
 // ---------------------------------------------------------------- the bound and the options (pure)
@@ -503,7 +515,7 @@ describe("video_generate and its jobs (#238 stage 3)", () => {
       {
         kind: "video_done",
         body: "영상이 완성됐어요. 눌러서 대화에서 보세요.",
-        url: `/c/${view.conversationId}#m-${view.messageId}`,
+        url: `/c/${view.conversationId}`,
       },
     ]);
     // The SSE stream of an ended job: its state once, then closed.
@@ -682,14 +694,14 @@ describe("video_generate and its jobs (#238 stage 3)", () => {
     ).not.toContain("rejected by content moderation");
   });
 
-  it("expired at OpenRouter, unknown there (404), and 429 backing off with Retry-After", async () => {
-    let mode: "expired" | "404" | "429" = "expired";
+  it("expired at OpenRouter, gone there (410), 404 retried, and 429 backing off with Retry-After", async () => {
+    let mode: "expired" | "404" | "410" | "429" = "expired";
     const server = fakeServer({
       poll: (id) =>
         mode === "expired"
           ? Response.json({ id, status: "expired", error: "Job exceeded maximum time to live" })
-          : mode === "404"
-            ? Response.json({ error: { code: 404 } }, { status: 404 })
+          : mode === "404" || mode === "410"
+            ? Response.json({ error: { code: Number(mode) } }, { status: Number(mode) })
             : Response.json({ error: { code: 429 } }, { status: 429, headers: { "retry-after": "90" } }),
     });
     const clock = { t: Date.UTC(2026, 10, 26, 3, 0, 0) };
@@ -700,6 +712,10 @@ describe("video_generate and its jobs (#238 stage 3)", () => {
     mode = "404";
     const b = await t.card();
     await t.approve(b.jobId, 0);
+    // A 404 may be another account's answer or not stored yet: tried again until the deadline.
+    t.dueNow();
+    expect(await t.drive(b.jobId, 3)).toMatchObject({ status: "pending", failures: 3 });
+    mode = "410";
     expect(await t.drive(b.jobId)).toMatchObject({ status: "failed", errorCode: "video_lost" });
     mode = "429";
     const c = await t.card();
@@ -707,10 +723,7 @@ describe("video_generate and its jobs (#238 stage 3)", () => {
     clock.t += 30_000;
     await t.video.tick();
     await t.video.idle();
-    const due = (t.video as unknown as { due: Map<string, { at: number; failures: number }> }).due.get(
-      c.jobId,
-    )!;
-    expect(due).toEqual({ at: clock.t + 90_000, failures: 1 });
+    expect(t.due(c.jobId)).toEqual({ at: clock.t + 90_000, failures: 1 });
     expect(t.job(c.jobId).status).toBe("pending");
   });
 
@@ -787,7 +800,7 @@ describe("video_generate and its jobs (#238 stage 3)", () => {
     expect(next.get(b.jobId)).toMatchObject({ status: "failed", errorCode: "video_unconfirmed" });
     await next.idle();
     for (let i = 0; i < 5 && next.get(a.jobId)!.status !== "done"; i++) {
-      (next as unknown as { due: Map<string, { at: number }> }).due.forEach((d) => (d.at = 0));
+      t.dueNow();
       await next.tick();
       await next.idle();
     }
@@ -936,7 +949,7 @@ describe("video_generate and its jobs (#238 stage 3)", () => {
   });
 
   it("notifications: fixed words only, never the prompt", () => {
-    expect(compose({ kind: "video_done", url: "/c/x#m-y" })).toMatchObject({
+    expect(compose({ kind: "video_done", url: "/c/x" })).toMatchObject({
       title: "영상 생성",
       body: "영상이 완성됐어요. 눌러서 대화에서 보세요.",
     });
@@ -949,8 +962,7 @@ describe("video_generate and its jobs (#238 stage 3)", () => {
 // ---------------------------------------------------------------- review round 1 (#255)
 
 describe("video jobs — review r1 regressions", () => {
-  const dueOf = (t: Awaited<ReturnType<typeof start>>, id: string) =>
-    (t.video as unknown as { due: Map<string, { at: number; failures: number }> }).due.get(id);
+  const dueOf = (t: Awaited<ReturnType<typeof start>>, id: string) => t.due(id);
 
   it("P1: a probe that cannot check a known-good MP4 here refuses the approval before anything is reserved or sent", async () => {
     let readyCalls = 0;
@@ -1017,7 +1029,7 @@ describe("video jobs — review r1 regressions", () => {
     const { jobId } = await t.card();
     await t.approve(jobId, 0);
     await t.video.tick();
-    (t.video as unknown as { due: Map<string, { at: number }> }).due.get(jobId)!.at = 0;
+    t.dueNow();
     await t.video.tick();
     await t.video.idle();
     expect(t.job(jobId)).toMatchObject({ status: "pending", costMicros: null });
@@ -1085,7 +1097,7 @@ describe("video jobs — review r1 regressions", () => {
       if (id === a.scope.conversationId) throw new Error("hook refused");
     });
     held = true;
-    (t.video as unknown as { due: Map<string, { at: number }> }).due.get(a.jobId)!.at = 0;
+    t.dueNow();
     const pass = t.video.tick();
     await new Promise((r) => setTimeout(r, 20));
     expect(() => t.app.conversations!.delete(a.scope.conversationId)).toThrow("hook refused");
@@ -1127,7 +1139,11 @@ describe("video jobs — review r1 regressions", () => {
     await t.drive(jobId);
     expect(t.job(jobId)).toMatchObject({ status: "done", notifiedAt: null });
     expect(t.db.$client.prepare("SELECT count(*) n FROM notifications").get()).toEqual({ n: 0 });
+    // Its own backoff: not before its retry time.
+    expect(t.job(jobId)).toMatchObject({ notifyTries: 1 });
     await t.video.tick();
+    expect(publish).toHaveBeenCalledTimes(1);
+    t.dueNow();
     await t.video.tick();
     expect(t.job(jobId).notifiedAt).not.toBeNull();
     expect(t.db.$client.prepare("SELECT kind FROM notifications").all()).toEqual([{ kind: "video_done" }]);
@@ -1147,7 +1163,7 @@ describe("video jobs — review r1 regressions", () => {
     const { jobId } = await t.card();
     await t.approve(jobId, 0);
     for (const n of [1, 2]) {
-      dueOf(t, jobId)!.at = 0;
+      t.dueNow();
       await t.video.tick();
       await t.video.idle();
       expect(dueOf(t, jobId)).toEqual({ at: clock.t + 90_000, failures: n });
@@ -1202,7 +1218,7 @@ describe("video jobs — review r1 regressions", () => {
 // ---------------------------------------------------------------- review round 2 (#255)
 
 describe("video jobs — review r2 regressions", () => {
-  it("A: a 202 whose `pending` write fails: no 500, the received id is written on the next pass, never resent", async () => {
+  it("A: a 202 whose `pending` write fails: no 500; the next pass ends it video_unconfirmed (bound kept), never resent", async () => {
     const t = await start();
     const { jobId } = await t.card();
     t.db.$client.exec(
@@ -1212,9 +1228,10 @@ describe("video jobs — review r2 regressions", () => {
     expect(r.statusCode).toBe(200);
     expect(r.json()).toMatchObject({ status: "submitting" });
     t.db.$client.exec("DROP TRIGGER r2_fail_pending");
+    t.dueNow();
     await t.video.tick();
-    expect(t.job(jobId)).toMatchObject({ status: "pending", remoteId: rid(1) });
-    expect(await t.drive(jobId)).toMatchObject({ status: "done" });
+    expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_unconfirmed", remoteId: null });
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "unconfirmed", e: VEO_8S_MICROS })]);
     expect(t.server.posts()).toHaveLength(1);
   });
 
@@ -1225,6 +1242,7 @@ describe("video jobs — review r2 regressions", () => {
     t.db.$client
       .prepare("UPDATE video_jobs SET status = 'submitting', remote_id = NULL WHERE id = ?")
       .run(jobId);
+    t.dueNow();
     await t.video.tick();
     expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_unconfirmed" });
     expect(t.usage()).toEqual([expect.objectContaining({ s: "unconfirmed" })]);
@@ -1285,7 +1303,8 @@ describe("video jobs — review r2 regressions", () => {
     try {
       await vi.waitFor(() => expect(store).toHaveBeenCalled());
       await new Promise((r) => setTimeout(r, Math.max(0, t.job(jobId).deadlineAt! - Date.now()) + 100));
-      // Ended in the database while the write still waits: its slot and file place are free.
+      // The next pass ends it in the database while the write still waits: its slot and file place are free.
+      await t.video.tick();
       expect(t.job(jobId)).toMatchObject({
         status: "failed",
         errorCode: "video_timeout",
@@ -1319,6 +1338,7 @@ describe("video jobs — review r2 regressions", () => {
     await t.drive(jobId);
     expect(transient).toBe(false);
     expect(t.job(jobId).notifiedAt).toBeNull();
+    t.dueNow();
     await t.video.tick();
     spy.mockRestore();
     expect(t.job(jobId).notifiedAt).not.toBeNull();
@@ -1352,6 +1372,7 @@ describe("video jobs — review r2 regressions", () => {
     expect(() => t.video.tick()).not.toThrow();
     select.mockRestore();
     t.db.$client.exec("DROP TRIGGER r2_notify");
+    t.dueNow();
     await t.video.tick();
     expect(t.job(jobId).notifiedAt).not.toBeNull();
     expect(t.db.$client.prepare("SELECT count(*) n FROM notifications").get()).toEqual({ n: 1 });
@@ -1363,5 +1384,196 @@ describe("video jobs — review r2 regressions", () => {
     expect(videoEndText("video_timeout", 0.8)).not.toContain("최대");
     expect(videoEndText("video_timeout", null)).toContain("최대 비용으로 기록");
     expect(videoEndText("video_payment", null)).toContain("비용은 나가지 않았어요");
+  });
+});
+
+// ---------------------------------------------------------------- review round 3 (#255): the engine on its rows
+
+describe("video jobs — review r3 regressions (the engine's state is the rows)", () => {
+  const other = `${KEY}-alternate`;
+  /** The fake job server for `KEY`; a second synthetic key OpenRouter takes too (its job requests: 404). */
+  const twoKeys = (base = fakeServer()) => {
+    const check = fixtureOpenRouterFetch();
+    const asOther: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (new Headers(init?.headers).get("authorization") === `Bearer ${other}`) {
+        asOther.push(String(input));
+        if (String(input).includes("/videos/")) return new Response(null, { status: 404 });
+        return check(input, init);
+      }
+      return base.fetchImpl(input, init);
+    }) as typeof fetch;
+    return { server: { ...base, fetchImpl }, asOther };
+  };
+
+  it("1: a job polls only with the key it was approved under — another key in between is never asked, the job waits", async () => {
+    const clock = { t: Date.UTC(2026, 10, 26, 3, 0, 0) };
+    const { server, asOther } = twoKeys();
+    const t = await start({ server, clock });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    const admin = t.app.media!.admin;
+    await admin.registerKey(other, admin.generation(), () => true);
+    t.dueNow();
+    await t.video.tick();
+    await t.video.idle();
+    expect(asOther.filter((u) => u.includes("/videos/"))).toEqual([]);
+    expect(t.job(jobId)).toMatchObject({ status: "pending" });
+    // Never `video_lost` for another key's answer; the deadline ends it, its bound kept.
+    clock.t += 3600_000;
+    await t.video.tick();
+    expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_timeout" });
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "unconfirmed", e: VEO_8S_MICROS })]);
+  });
+
+  it("2: a key saved and deleted between two passes expires the waiting cards — the mark never comes back", async () => {
+    const { server } = twoKeys();
+    const t = await start({ server });
+    const { jobId } = await t.card();
+    const before = t.app.media!.keys.mark();
+    const admin = t.app.media!.admin;
+    await admin.registerKey(other, admin.generation(), () => true);
+    await admin.deleteKey(admin.generation(), () => true);
+    expect(t.app.media!.keys.mark()).not.toBe(before);
+    expect(t.job(jobId)).toMatchObject({
+      status: "expired",
+      errorCode: "video_settings_changed",
+      version: 1,
+    });
+    expect((await t.approve(jobId, 0)).json()).toMatchObject({ error: "video_job_expired" });
+    expect(t.server.posts()).toHaveLength(0);
+  });
+
+  it("3: deadlines come first: an end write that failed is done by a later pass, even while the file lock is held", async () => {
+    const t = await start({
+      limits: { deadlineMs: 500, pollMs: 0 },
+      server: fakeServer({ poll: (id) => Response.json({ id, status: "completed", usage: { cost: 0.8 } }) }),
+    });
+    const { jobId, scope } = await t.card();
+    await t.approve(jobId, 0);
+    let unlock!: () => void;
+    const locked = t.app.fileWrites.exclusive(() => new Promise<void>((r) => (unlock = r)));
+    const writing = vi.spyOn(t.app.files!, "addGenerated");
+    t.dueNow();
+    const pass = t.video.tick();
+    try {
+      await vi.waitFor(() => expect(writing).toHaveBeenCalled());
+      t.db.$client.exec(
+        "CREATE TRIGGER r3_end BEFORE UPDATE OF status ON video_jobs WHEN NEW.error_code='video_timeout' BEGIN SELECT RAISE(ABORT,'transient end write'); END",
+      );
+      await new Promise((r) => setTimeout(r, Math.max(0, t.job(jobId).deadlineAt! - Date.now()) + 100));
+      await t.video.tick();
+      expect(t.job(jobId).status).toBe("downloading");
+      t.db.$client.exec("DROP TRIGGER r3_end");
+      await t.video.tick();
+      expect(t.job(jobId)).toMatchObject({
+        status: "failed",
+        errorCode: "video_timeout",
+        costMicros: 800_000,
+      });
+      expect(t.app.files!.placesTaken(scope.conversationId)).toBe(0);
+    } finally {
+      unlock();
+      await locked;
+      await pass;
+      await t.video.idle();
+    }
+    expect(t.job(jobId)).toMatchObject({ status: "failed", fileId: null });
+    expect(t.db.$client.prepare("SELECT count(*) n FROM files").get()).toEqual({ n: 0 });
+  });
+
+  it("4: failing notifications back off on their own rows — 50 of one conversation never starve another's", async () => {
+    const t = await start();
+    const a = await t.card();
+    const b = await t.card();
+    const ended = (id: string) =>
+      t.db.$client
+        .prepare(
+          "UPDATE video_jobs SET status='failed', error_code='video_timeout', approved_at=?, ended_at=? WHERE id=?",
+        )
+        .run(Date.now() - 1000, Date.now(), id);
+    ended(a.jobId);
+    const seed = t.job(a.jobId);
+    for (let i = 1; i < 50; i++) ended(t.video.createCard({ ...seed }));
+    const good = t.video.createCard({ ...t.job(b.jobId) });
+    ended(good);
+    const real = t.app.resources.load.bind(t.app.resources);
+    vi.spyOn(t.app.resources, "load").mockImplementation((k, id) => {
+      if (k === "conversation" && id === seed.conversationId) throw new Error("unreadable single ref");
+      return real(k, id);
+    });
+    for (let i = 0; i < 3; i++) await t.video.tick();
+    expect(t.job(good).notifiedAt).not.toBeNull();
+    expect(t.db.$client.prepare("SELECT count(*) n FROM notifications").get()).toEqual({ n: 1 });
+  });
+
+  it("5: the start never throws; until its recovery succeeded nothing is approved; start again is harmless", async () => {
+    const t = await start({ engine: false });
+    const { jobId } = await t.card();
+    const update = vi.spyOn(t.db, "update").mockImplementationOnce(() => {
+      throw new Error("one transient write");
+    });
+    expect(() => t.video.start()).not.toThrow();
+    update.mockRestore();
+    expect(t.video.started).toBe(true);
+    expect((await t.approve(jobId, 0)).json()).toMatchObject({ error: "video_recovering" });
+    t.video.start();
+    await t.video.tick();
+    expect((await t.approve(jobId, 0)).json()).toMatchObject({ status: "pending" });
+    // A first read that fails at the app's own start does not fail `ready()` either.
+    const db = createTestDb();
+    const app = await buildApp(
+      loadConfig({
+        NODE_ENV: "test",
+        DATA_DIR: path.join(tmp(), "data"),
+        MASTER_KEY_PATH: path.join(tmp(), "key"),
+        OPENROUTER_API_KEY: KEY,
+      }),
+      {
+        db,
+        media: {
+          fetchImpl: fakeServer().fetchImpl,
+          video: { start: true, probe: () => fixtureVideoProbe() },
+        },
+      },
+    );
+    closers.push(() => app.close());
+    const real = db.$client.prepare.bind(db.$client);
+    let injected = false;
+    vi.spyOn(db.$client, "prepare").mockImplementation((q, ...args) => {
+      if (!injected && /"video_jobs"/.test(String(q))) {
+        injected = true;
+        throw new Error("transient first video read");
+      }
+      return real(q as string, ...(args as []));
+    });
+    await expect(app.ready()).resolves.toBeDefined();
+    expect(injected).toBe(true);
+    expect(app.media!.video.started).toBe(true);
+  });
+
+  it("6: the end notification opens the conversation (a regenerated reply cannot leave it pointing nowhere)", async () => {
+    const t = await start();
+    const { jobId, scope } = await t.card();
+    await t.approve(jobId, 0);
+    await t.drive(jobId);
+    expect(t.db.$client.prepare("SELECT url FROM notifications WHERE kind = 'video_done'").get()).toEqual({
+      url: `/c/${scope.conversationId}`,
+    });
+  });
+
+  it("7: while video is on, every settings save judges its model again; turning it off is always allowed", async () => {
+    const t = await start({
+      server: fakeServer({ catalog: () => [{ ...VEO, pricing_skus: { video_tokens: "0.000007" } }] }),
+    });
+    const m = t.app.media!;
+    await expect(
+      m.admin.saveSettings(videoOn({ dailyCostLimitUsd: 23 }), m.settings.revision(), () => true),
+    ).rejects.toMatchObject({ code: "media_model_video_token_priced" });
+    const off = videoOn({ dailyCostLimitUsd: 23 });
+    off.kinds.video = { enabled: false, model: VEO.id };
+    await expect(m.admin.saveSettings(off, m.settings.revision(), () => true)).resolves.toMatchObject({
+      settings: { kinds: { video: { enabled: false } } },
+    });
   });
 });
