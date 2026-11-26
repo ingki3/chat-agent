@@ -34,8 +34,12 @@ import {
   planTimeline,
   toAss,
   toVtt,
+  ingestArgs,
+  presentTrack,
   type InputInfo,
   type Plan,
+  type TrackEdit,
+  type TrackPresentation,
 } from "../src/media/compose-plan.js";
 import {
   fixtureComposer,
@@ -1554,6 +1558,258 @@ describe("review r2: the plan (pure)", () => {
   });
 });
 
+describe("review r8: one presentation per track (pure)", () => {
+  // What a graph built from a presentation shows and plays (the intent `clipArgs` and `ingestArgs` encode): at time u
+  // of the input's timeline, the latest picture sample mapped at or before u and before the end — none (black) before
+  // the start; a sound sample at its mapped time when that is in [start, end).
+  const shown = (p: TrackPresentation, frames: number[], u: number) => {
+    if (u < p.start - 1e-9) return "black";
+    let k = -1;
+    frames.forEach((m, i) => {
+      const at = m + p.shift;
+      if (at <= u + 1e-9 && (p.end == null || at < p.end - 1e-9)) k = i;
+    });
+    return k < 0 ? "black" : `F${k}`;
+  };
+  const heard = (p: TrackPresentation, m: number) => {
+    const at = m + p.shift;
+    return at >= p.start - 1e-9 && (p.end == null || at < p.end - 1e-9) ? Math.round(at * 1e4) / 1e4 : null;
+  };
+  const none = { edited: false, lead: 0, mediaTime: 0, end: null };
+  // The kinds of track (re-plan 2's accepted edit lists), each with its origin as `judgeInput` sets it.
+  const cases: {
+    name: string;
+    track: TrackEdit;
+    origin: number;
+    frames: number[];
+    want: TrackPresentation;
+    // [u, picture shown at u] — before, across and after the edit's end
+    see: [number, string][];
+    // [media time, where it is heard (null: not)]
+    hear: [number, number | null][];
+  }[] = [
+    {
+      name: "no edit list, B-frame delay, picture only (origin = its first picture)",
+      track: none,
+      origin: 1 / 15,
+      frames: [1 / 15, 1 + 1 / 15, 2 + 1 / 15],
+      want: { shift: -1 / 15, start: 0, end: null },
+      see: [
+        [0, "F0"],
+        [1.5, "F1"],
+        [9, "F2"],
+      ],
+      hear: [
+        [1 / 15, 0],
+        [1, 0.9333],
+      ],
+    },
+    {
+      name: "no edit list, sound earlier than the picture (origin 0: the sound before it kept)",
+      track: { ...none, end: 2 },
+      origin: 0,
+      frames: [1 / 15, 1 + 1 / 15],
+      want: { shift: 0, start: 0, end: 2 },
+      see: [
+        [0, "black"],
+        [0.1, "F0"],
+        [1.9, "F1"],
+        [5, "F1"],
+      ],
+      hear: [
+        [0, 0],
+        [0.05, 0.05],
+        [1.99, 1.99],
+        [2, null],
+      ],
+    },
+    {
+      name: "a leading empty edit only (5.5 s file, 1.5 s lead)",
+      track: { edited: true, lead: 1.5, mediaTime: 0, end: 5.5 },
+      origin: 0,
+      frames: [0, 1, 2, 3, 4],
+      want: { shift: 1.5, start: 1.5, end: 5.5 },
+      see: [
+        [1, "black"],
+        [1.5, "F0"],
+        [2.6, "F1"],
+        [5.4, "F3"],
+        [5.6, "F3"],
+        [9, "F3"],
+      ],
+      hear: [
+        [0, 1.5],
+        [3.9, 5.4],
+        [4, null],
+      ],
+    },
+    {
+      name: "a media time > 0 (AVFoundation's 0.4–1.5 s)",
+      track: { edited: true, lead: 0, mediaTime: 0.4, end: 1.1 },
+      origin: 0,
+      frames: [0, 1, 2],
+      want: { shift: -0.4, start: 0, end: 1.1 },
+      see: [
+        [0, "F0"],
+        [0.59, "F0"],
+        [0.6, "F1"],
+        [1.2, "F1"],
+        [3, "F1"],
+      ],
+      hear: [
+        [0.3, null],
+        [0.4, 0],
+        [1.49, 1.09],
+        [1.5, null],
+      ],
+    },
+    {
+      name: "a lead equal to its media time (0.25 s: shift 0, the media before it still left out)",
+      track: { edited: true, lead: 0.25, mediaTime: 0.25, end: 1.75 },
+      origin: 0,
+      frames: [0, 1, 2],
+      want: { shift: 0, start: 0.25, end: 1.75 },
+      see: [
+        [0.1, "black"],
+        [0.25, "F0"],
+        [1, "F1"],
+        [1.8, "F1"],
+      ],
+      hear: [
+        [0.05, null],
+        [0.2, null],
+        [0.25, 0.25],
+        [1.74, 1.74],
+        [1.75, null],
+      ],
+    },
+    {
+      name: "a lead and a media time (1 s, 0.4 s)",
+      track: { edited: true, lead: 1, mediaTime: 0.4, end: 2.1 },
+      origin: 0,
+      frames: [0, 1, 2],
+      want: { shift: 0.6, start: 1, end: 2.1 },
+      see: [
+        [0.5, "black"],
+        [1, "F0"],
+        [1.6, "F1"],
+        [3, "F1"],
+      ],
+      hear: [
+        [0.3, null],
+        [0.4, 1],
+        [1.49, 2.09],
+        [1.5, null],
+      ],
+    },
+    {
+      name: "a fragmented file's zero-length media edit (its end not known up front)",
+      track: { edited: true, lead: 0, mediaTime: 1 / 15, end: null },
+      origin: 0,
+      frames: [1 / 15, 1 + 1 / 15, 2 + 1 / 15],
+      want: { shift: -1 / 15, start: 0, end: null },
+      see: [
+        [0, "F0"],
+        [1, "F1"],
+        [99, "F2"],
+      ],
+      hear: [
+        [0, null],
+        [1 / 15, 0],
+        [3, 2.9333],
+      ],
+    },
+  ];
+
+  it("presentTrack — every kind of track, picture and sound, before / across / after its edit's end", () => {
+    for (const c of cases) {
+      const p = presentTrack(c.track, c.origin);
+      expect([c.name, p.shift]).toEqual([c.name, expect.closeTo(c.want.shift, 9)]);
+      expect([c.name, p.start, p.end]).toEqual([c.name, c.want.start, c.want.end]);
+      for (const [u, f] of c.see) expect([c.name, u, shown(p, c.frames, u)]).toEqual([c.name, u, f]);
+      for (const [m, at] of c.hear) expect([c.name, m, heard(p, m)]).toEqual([c.name, m, at]);
+    }
+    // Not an MP4/MOV (read without `-copyts`): as decoded.
+    expect(presentTrack(null)).toEqual({ shift: 0, start: 0, end: null });
+  });
+
+  it("the clip's picture graph comes from it only: mapped, cut at its end on the input's timeline, then trimmed", () => {
+    for (const c of cases) {
+      const p = presentTrack(c.track, c.origin);
+      const end = p.end ?? 2;
+      // A trim before, across and after the edit's end.
+      for (const startSec of [0, Math.max(0, end - 0.1), end + 0.5]) {
+        const plan = planTimeline(
+          { clips: [{ fileId: "v", trim: { startSec, endSec: startSec + 0.4 } }] },
+          ins(info("v", { kind: "video", durationSec: 10, videoTrack: c.track, originSec: c.origin })),
+        ) as Plan;
+        expect([c.name, startSec, plan.clips[0]!.picture]).toEqual([c.name, startSec, p]);
+        const g = clipArgs(plan, 0, "/in");
+        const graph = g[g.indexOf("-filter_complex") + 1]!;
+        const head = graph.slice(0, graph.indexOf("[src]"));
+        const map = p.shift !== 0 ? `,setpts=PTS${p.shift < 0 ? "-" : "+"}` : "";
+        const cut = p.end != null ? `trim=end=${Math.round(p.end * 1e6) / 1e6},` : "";
+        const trim = startSec ? `setpts=PTS-${Math.round(startSec * 1e6) / 1e6}/TB,` : "";
+        // Its end does not move with the trim; the trim's shift comes after it.
+        expect([c.name, startSec, head.startsWith(`[0:v]settb=AVTB${map}`)]).toEqual([
+          c.name,
+          startSec,
+          true,
+        ]);
+        if (cut)
+          expect([c.name, startSec, head.indexOf(cut) < head.indexOf(trim || "scale")]).toEqual([
+            c.name,
+            startSec,
+            true,
+          ]);
+        expect([c.name, startSec, head.includes(trim)]).toEqual([c.name, startSec, true]);
+        const leadIn = p.start - startSec;
+        expect([c.name, startSec, graph.includes(":enable='gte(t,")]).toEqual([c.name, startSec, leadIn > 0]);
+        expect(graph).not.toContain("trim=end=0.000001");
+      }
+    }
+  });
+
+  it("the ingest's sound graph comes from it only: the lead cut whatever the shift, then its end", () => {
+    for (const c of cases) {
+      const p = presentTrack(c.track, c.origin);
+      const a = ingestArgs({
+        inDir: "/in",
+        input: "in-0.mp4",
+        fileKind: "mp4",
+        sound: true,
+        countPicture: true,
+        capSec: 5,
+        soundAt: p,
+        pictureAt: p,
+      });
+      const af = a[a.indexOf("-af") + 1]!;
+      const vf = a[a.indexOf("-vf") + 1]!;
+      expect([c.name, af.includes("asetpts=PTS")]).toEqual([c.name, p.shift !== 0]);
+      expect([c.name, af.includes(`atrim=start=${Math.round(p.start * 1e6) / 1e6},`)]).toEqual([
+        c.name,
+        p.start > 0,
+      ]);
+      expect([c.name, af.includes(`,atrim=end=`)]).toEqual([c.name, p.end != null]);
+      expect([c.name, vf.includes("setpts=PTS")]).toEqual([c.name, p.shift !== 0]);
+      // Gaps in its timestamps are silence (an `empty_moov` file's stretched first AAC sample).
+      expect(af).toContain("aresample=48000:async=1:min_hard_comp=0.001:first_pts=0");
+    }
+    // The 0.25 s case: no shift, yet nothing before 0.25 s.
+    const eq = presentTrack({ edited: true, lead: 0.25, mediaTime: 0.25, end: 1.75 });
+    const a = ingestArgs({
+      inDir: "/in",
+      input: "x",
+      fileKind: "mp4",
+      sound: true,
+      countPicture: false,
+      capSec: 2,
+      soundAt: eq,
+    });
+    expect(a[a.indexOf("-af") + 1]).toMatch(/^atrim=start=0\.25,aresample=/);
+  });
+});
+
 describe("review r5: the call's own judgements (pure)", () => {
   it("transitions that together outrun a stated clip are refused at the call — no file length needed", () => {
     const I = ins(info("a", { kind: "image" }));
@@ -1727,31 +1983,32 @@ function boxesOf(b: Buffer, from: number, to: number) {
   }
   return out;
 }
-/** Where the first picture track's `elst` entries start in `b` (version 0), and how many there are. */
-function videoElst(b: Buffer): { entries: number; count: number } {
+/** Where the first picture (or `soun`: sound) track's `elst` entries start in `b` (version 0), and how many there are. */
+function videoElst(b: Buffer, handler = "vide"): { entries: number; count: number } {
   const moov = boxesOf(b, 0, b.length).find((x) => x.type === "moov")!;
   for (const trak of boxesOf(b, moov.start, moov.end).filter((x) => x.type === "trak")) {
     const kids = boxesOf(b, trak.start, trak.end);
     const mdia = kids.find((x) => x.type === "mdia")!;
     const hdlr = boxesOf(b, mdia.start, mdia.end).find((x) => x.type === "hdlr")!;
-    if (b.toString("latin1", hdlr.start + 8, hdlr.start + 12) !== "vide") continue;
+    if (b.toString("latin1", hdlr.start + 8, hdlr.start + 12) !== handler) continue;
     const edts = kids.find((x) => x.type === "edts")!;
     const elst = boxesOf(b, edts.start, edts.end).find((x) => x.type === "elst")!;
     if (b[elst.start] !== 0) throw new Error("elst version 1");
     return { entries: elst.start + 8, count: b.readUInt32BE(elst.start + 4) };
   }
-  throw new Error("no picture track");
+  throw new Error(`no ${handler} track`);
 }
-/** A copy of `src` whose first picture track's edit list entries are rewritten by `edit` (same count). */
+/** A copy of `src` whose first picture (or `handler`) track's edit list entries are rewritten by `edit` (same count). */
 function rewriteElst(
   src: string,
   out: string,
   edit: (
     e: { duration: number; media: number; rate: number }[],
   ) => { duration: number; media: number; rate: number }[],
+  handler = "vide",
 ) {
   const b = Buffer.from(fs.readFileSync(src));
-  const { entries, count } = videoElst(b);
+  const { entries, count } = videoElst(b, handler);
   const now = Array.from({ length: count }, (_, k) => ({
     duration: b.readUInt32BE(entries + k * 12),
     media: b.readInt32BE(entries + k * 12 + 4),
@@ -2976,6 +3233,138 @@ describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", 
       expect(c.slice(30 * lead, 30 * lead + 18).every((x) => x === "red")).toBe(true);
       expect(c.slice(30 * lead + 18).every((x) => x === "blue")).toBe(true);
     }
+  });
+
+  // ---- review r8, with the real ffmpeg
+  it("review r8: a MOV without an edit list keeps its sound before the first picture (30 fps: 55 ms, 2 fps: 0.4 s)", async () => {
+    const dir = tmp();
+    const t = await start({ composer: real });
+    for (const [rate, until, d] of [
+      [30, 0.055, 2],
+      [2, 0.4, 4],
+    ] as const) {
+      const mov = path.join(dir, `slate-${rate}.mov`);
+      execFileSync(FFMPEG, [
+        ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i"],
+        `aevalsrc=if(lt(t\\,${until})\\,sin(2*PI*550*t)*0.5\\,0):s=48000:d=${d}`,
+        ...["-f", "lavfi", "-i", `color=c=red:s=64x64:r=${rate}:d=${d}`, "-map", "1:v", "-map", "0:a"],
+        ...["-c:v", "libx264", "-bf", "2", "-x264-params", "b-adapt=0", "-pix_fmt", "yuv420p"],
+        ...["-c:a", "pcm_s16le", "-use_editlist", "0", mov],
+      ]);
+      // A reorder delay without an edit list: the picture's first sample is late, the sound's is at 0.
+      expect(mp4Timeline(mov)).toMatchObject({
+        ok: true,
+        video: { edited: false },
+        audio: { edited: false },
+      });
+      const s = await t.scopeOf();
+      const f = await t.putFile(s, mov, "mp4");
+      const out = await composeOne(t, s, { clips: [{ fileId: f }] });
+      expect([rate, loudness(pcmOf(out), 0, until - 0.005) > 1000]).toEqual([rate, true]);
+      const c = colours(out);
+      expect([rate, c.at(-1)]).toEqual([rate, "red"]);
+    }
+  });
+
+  it("review r8: a leading empty edit as long as its media time (PCM 0.25 s, AAC 28 ms) leaves the media before it out", async () => {
+    const dir = tmp();
+    const t = await start({ composer: real });
+    for (const [codec, lead] of [
+      ["pcm_s16le", 0.25],
+      ["aac", 0.028],
+    ] as const) {
+      const src = path.join(dir, `lead-${codec}.mov`);
+      execFileSync(FFMPEG, [
+        ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "color=c=red:s=64x64:r=30:d=2"],
+        ...["-itsoffset", String(lead), "-f", "lavfi", "-i", "sine=f=440:r=48000:d=2"],
+        ...["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", codec, src],
+      ]);
+      // The export's sound edit: nothing until `lead`, then its media from `lead` (in the track's 48 kHz units).
+      const eq = path.join(dir, `equal-${codec}.mov`);
+      rewriteElst(
+        src,
+        eq,
+        (e) =>
+          [
+            { duration: Math.round(lead * 1000), media: -1, rate: 1 },
+            { duration: 2000 - Math.round(lead * 1000), media: Math.round(lead * 48_000), rate: 1 },
+          ].slice(-e.length),
+        "soun",
+      );
+      expect(mp4Timeline(eq)).toMatchObject({
+        ok: true,
+        audio: { edited: true, lead: expect.closeTo(lead, 6), mediaTime: expect.closeTo(lead, 6) },
+      });
+      const s = await t.scopeOf();
+      const f = await t.putFile(s, eq, "mp4");
+      const out = await composeOne(t, s, { clips: [{ fileId: f }] });
+      const pcm = pcmOf(out);
+      expect([codec, loudness(pcm, 0, lead - 0.002)]).toEqual([codec, expect.any(Number)]);
+      expect([codec, loudness(pcm, 0, lead - 0.002) < 50]).toEqual([codec, true]);
+      expect([codec, loudness(pcm, lead + 0.1, 1.5) > 1000]).toEqual([codec, true]);
+    }
+  });
+
+  it("review r8: a trim after the picture's edit end (0.5 s of 2 s with 2 s of sound) holds the last frame allowed", async () => {
+    const dir = tmp();
+    const src = path.join(dir, "shortv-src.mov");
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i"],
+      "nullsrc=s=64x64:r=30:d=2,format=rgb24,geq=r='if(gte(T\\,0.5)\\,255\\,0)':g='if(gte(T\\,0.5)\\,255\\,0)':b=255",
+      ...[
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=f=440:r=48000:d=2",
+        "-c:v",
+        "libx264",
+        "-bf",
+        "0",
+        "-pix_fmt",
+        "yuv420p",
+      ],
+      ...["-c:a", "pcm_s16le", src],
+    ]);
+    // Blue for 0.5 s, then white: the picture's edit presents the blue only.
+    const mov = path.join(dir, "shortv.mov");
+    rewriteElst(src, mov, (e) => e.map((x) => (x.media === -1 ? x : { ...x, duration: 500 })));
+    expect(mp4Timeline(mov)).toMatchObject({ ok: true, video: { end: 0.5 }, audio: { end: 2 } });
+    const t = await start({ composer: real });
+    for (const [trim, n] of [
+      [null, 60],
+      [{ startSec: 0, endSec: 0.4 }, 12],
+      [{ startSec: 0.3, endSec: 1 }, 21],
+      [{ startSec: 0.6, endSec: 1.4 }, 24],
+    ] as const) {
+      const s = await t.scopeOf();
+      const f = await t.putFile(s, mov, "mp4");
+      const out = await composeOne(t, s, { clips: [{ fileId: f, ...(trim ? { trim } : {}) }] });
+      expect([trim, colours(out)]).toEqual([trim, Array(n).fill("blue")]);
+    }
+  });
+
+  it("review r8: an empty_moov MP4 with sound plays its picture and its sound together (the sound's 2 frames first kept)", async () => {
+    const dir = tmp();
+    const file = path.join(dir, "frag-sound.mp4");
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i"],
+      "nullsrc=s=64x64:r=30:d=4,format=rgb24,geq=r='if(between(T\\,2\\,2.499)\\,255\\,0)':g='if(between(T\\,2\\,2.499)\\,255\\,0)':b='if(between(T\\,2\\,2.499)\\,255\\,0)'",
+      ...["-f", "lavfi", "-i", "aevalsrc=if(between(t\\,2\\,2.499)\\,sin(2*PI*550*t)*0.5\\,0):s=48000:d=4"],
+      ...["-c:v", "libx264", "-bf", "2", "-g", "30", "-pix_fmt", "yuv420p", "-c:a", "aac"],
+      ...["-movflags", "empty_moov+frag_keyframe", file],
+    ]);
+    const t = await start({ composer: real });
+    const s = await t.scopeOf();
+    const f = await t.putFile(s, file, "mp4");
+    const out = await composeOne(t, s, { clips: [{ fileId: f }] });
+    const c = colours(out).map((x) => (x.startsWith("other(25") ? "white" : x));
+    const pcm = pcmOf(out);
+    const sound = pcm.findIndex((v) => Math.abs(v) > 1000) / 48_000;
+    const picture = c.indexOf("white") / 30;
+    // The file's sound track starts at 0 (the muxer stretches its first AAC sample over the picture's reorder delay):
+    // that 0.0667 s is kept, and the flash and the beep stay together.
+    expect(c.length).toBe(122);
+    expect(Math.abs(sound - picture)).toBeLessThan(1 / 30);
   });
 
   it("readiness: a tiny composition checked in the same sandbox", async () => {

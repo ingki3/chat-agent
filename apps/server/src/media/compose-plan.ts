@@ -73,32 +73,56 @@ export type InputInfo = {
   /** Where its sound ends, from the file's start (estimated, then decoded); null without sound. */
   audioSec?: number | null;
   /**
-   * Review r4: an MP4/MOV's first sound track ends here on the presentation timeline (its edit list — exact, not an
-   * estimate): the decoded sound is cut there (an AAC's last frame is padding past it). Null for other kinds.
-   */
-  audioEndSec?: number | null;
-  /**
-   * Review r5: an MP4/MOV's presentation 0 on its `-copyts` timeline (seconds): the earliest first sample of its picture
-   * and sound tracks, not counting an explicit leading empty edit (that stays, as nothing) — so a codec's reorder delay
-   * without an edit list (a B-frame MP4 whose first picture is at 0.0667 s) is not taken for an empty edit. 0 when
-   * there is nothing to take away; never negative (a preroll before 0 is cut).
+   * Review r5 (restored in r8): an MP4/MOV's presentation 0 on its `-copyts` timeline (seconds) — the earliest first
+   * sample of its picture and sound tracks, a track with an edit list counting from the movie's 0 — so a codec's
+   * reorder delay without an edit list (a B-frame MP4 whose only track's first picture is at 0.0667 s) is not taken for
+   * a gap, and sound that starts before the first picture is kept. 0 when there is nothing to take away; never negative
+   * (a preroll before 0 is cut).
    */
   originSec?: number;
-  /** Re-plan 2: an MP4/MOV picture track with an edit list ends here on the `-copyts` timeline (its media edit's end). */
-  videoEndSec?: number | null;
   /**
-   * Review r7: an edit list's mapping (the files are read with `-ignore_editlist`): a track's media time m is shown at
-   * m + shift (shift = lead − the edit's media time), and nothing of it before its lead (an empty edit: black, silent).
+   * Review r8: an MP4/MOV's first picture and sound tracks as the file describes them (`mp4Timeline`; without an edit
+   * list, its samples' own end where ffprobe says one). Every graph reads them through `presentTrack` only.
    */
-  videoShiftSec?: number;
-  audioShiftSec?: number;
-  videoLeadSec?: number;
-  audioLeadSec?: number;
+  videoTrack?: TrackEdit | null;
+  audioTrack?: TrackEdit | null;
   hasVideo: boolean;
   hasAudio: boolean;
   width: number | null;
   height: number | null;
 };
+
+/**
+ * Review r8: one MP4/MOV track as its file describes it. With an edit list (re-plan 2: at most a leading empty edit,
+ * then one media edit at rate 1): nothing until `lead` (movie seconds), then its media from `mediaTime` (its own
+ * seconds) to `end` on the movie's timeline (null: a fragmented file's, not known up front). Without one: its samples
+ * at their own times, to `end` when known (ffprobe's start + duration of a sound track — review r4) — else to its last
+ * sample's end.
+ */
+export type TrackEdit = { edited: boolean; lead: number; mediaTime: number; end: number | null };
+
+/**
+ * Review r8: how one track is presented on its input's timeline (seconds from `InputInfo.originSec`) — the only source
+ * of every ingest and clip graph's mapping, for picture and sound alike:
+ *
+ * - `shift`: added to a sample's time as decoded (`-copyts -ignore_editlist`) to give its time on that timeline;
+ * - `start`: nothing of the track before it — silence, black (a leading empty edit's end) — cut whatever the shift (a
+ *   sample before its edit's media time lands before it; a picture's sample already on screen at that time comes in
+ *   at it);
+ * - `end`: nothing after it, cut on that timeline before any trim of the clip (null: its last sample's end).
+ */
+export type TrackPresentation = { shift: number; start: number; end: number | null };
+
+export function presentTrack(track: TrackEdit | null | undefined, originSec = 0): TrackPresentation {
+  const o = originSec;
+  if (!track) return { shift: 0 - o, start: 0, end: null };
+  if (!track.edited) return { shift: 0 - o, start: 0, end: track.end != null ? track.end - o : null };
+  return {
+    shift: track.lead - track.mediaTime - o,
+    start: Math.max(0, track.lead - o),
+    end: track.end != null ? track.end - o : null,
+  };
+}
 
 export type PlanClip = {
   input: string;
@@ -112,13 +136,8 @@ export type PlanClip = {
   kenBurns: "in" | "out" | "left" | "right" | null;
   volume: number;
   hasAudio: boolean;
-  /** Its input's presentation 0 on the `-copyts` timeline (`InputInfo.originSec`). */
-  origin?: number;
-  /** Re-plan 2: where its picture's presentation ends, from that 0 (an edit list's media edit end) — nothing after. */
-  pictureEnd?: number | null;
-  /** Review r7: its edit list's mapping (`InputInfo.videoShiftSec`, `videoLeadSec`). */
-  shift?: number;
-  lead?: number;
+  /** Review r8: its picture track's presentation (`presentTrack`), on its input's timeline. */
+  picture?: TrackPresentation;
   /**
    * Review r1: frames at its end that only hold its last picture (the last clip, held for the narration) — a Ken
    * Burns move ends at the clip's own length, then holds.
@@ -356,10 +375,7 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
       kenBurns: null,
       volume: c.volume ?? 1,
       hasAudio: info.hasAudio,
-      origin: info.originSec ?? 0,
-      pictureEnd: info.videoEndSec != null ? info.videoEndSec - (info.originSec ?? 0) : null,
-      shift: info.videoShiftSec ?? 0,
-      lead: info.videoLeadSec ?? 0,
+      picture: presentTrack(info.videoTrack, info.originSec ?? 0),
       head: 0,
       tail: 0,
       transition: null,
@@ -610,7 +626,7 @@ export const FF_COMMON = [
  */
 const input = (o: { demuxer: string; file: string }) => [
   // Review r7: its edit list is not applied by the demuxer (that drops the sample already showing at an edit's start);
-  // this server maps it itself (`InputInfo.videoShiftSec`…), the same way for the ingest and every clip.
+  // this server maps it itself (`presentTrack`), the same way for the ingest and every clip.
   ...(o.demuxer === "mov" ? ["-copyts", "-ignore_editlist", "1"] : []),
   "-protocol_whitelist",
   "file,pipe",
@@ -707,14 +723,17 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
     // The canvas starts at the trim's start (review r5): its first slot shows the source frame on screen at that very
     // moment (a frame that began before it), and every later slot samples the source at start + k/30.
     const own = Math.max(1, Math.round(c.useSec * FPS));
-    const leadIn = (c.lead ?? 0) - (c.origin ?? 0) - c.startSec;
+    const at = c.picture ?? presentTrack(null);
+    const leadIn = at.start - c.startSec;
     // The canvas is the output's size (no frame of the source is kept for its size — review r5: a reference branch
     // buffered every frame before the start); the picture is fitted to it first, its alpha kept for the overlay.
     picture =
-      // Fine timebase first (re-plan 2: a 1 s MOV timescale would round the shift), then the shift; a picture with an
-      // edit list stops at its presentation's end (its last frame then holds).
-      `[0:v]settb=AVTB,setpts=PTS${signed((c.shift ?? 0) - (c.origin ?? 0) - c.startSec)}/TB,` +
-      `${c.pictureEnd != null ? `trim=end=${num(Math.max(1e-6, c.pictureEnd - c.startSec))},` : ""}` +
+      // Fine timebase first (re-plan 2: a 1 s MOV timescale would round the shift), then the track's presentation
+      // (`presentTrack`): mapped to its input's timeline and cut at its end there — before the clip's trim (review r8:
+      // a trim after that end shows the last frame allowed, held, never one the edit leaves out) — then the trim.
+      `[0:v]settb=AVTB${at.shift !== 0 ? `,setpts=PTS${signed(at.shift)}/TB` : ""},` +
+      `${at.end != null ? `trim=end=${num(Math.max(1e-6, at.end))},` : ""}` +
+      `${c.startSec !== 0 ? `setpts=PTS${signed(-c.startSec)}/TB,` : ""}` +
       `${square},${fit(W, H)},setsar=1,format=yuva420p[src];` +
       `color=c=black:s=${W}x${H}:r=${FPS},format=yuv420p[canvas];` +
       // Before a leading empty edit ends nothing is shown (review r7: the frame showing at the edit's start comes in at
@@ -792,24 +811,22 @@ export function ingestArgs(o: {
   sound: boolean;
   countPicture: boolean;
   capSec: number;
-  /** An MP4/MOV sound track's presentation end (`InputInfo.audioEndSec`): nothing past it (its codec's padding). */
-  soundEndSec?: number | null;
-  /** Its presentation 0 on the `-copyts` timeline (`InputInfo.originSec`). */
-  originSec?: number;
-  /** Review r7: the edit lists' mappings (`InputInfo.audioShiftSec`, `audioLeadSec`, `videoShiftSec`). */
-  soundShiftSec?: number;
-  soundLeadSec?: number;
-  pictureShiftSec?: number;
+  /** Review r8: its sound and picture tracks' presentation (`presentTrack`) on its timeline. */
+  soundAt?: TrackPresentation;
+  pictureAt?: TrackPresentation;
 }): string[] {
-  const o0 = o.originSec ?? 0;
-  const sa = (o.soundShiftSec ?? 0) - o0;
-  const sv = (o.pictureShiftSec ?? 0) - o0;
-  const leadA = (o.soundLeadSec ?? 0) - o0;
-  // A sound before its lead (before its edit's media time — AAC priming) is not presented; from 0 to its lead, silence.
+  const sa = o.soundAt ?? presentTrack(null);
+  const pa = o.pictureAt ?? presentTrack(null);
+  // The sound mapped to its timeline; before its start nothing (review r8: cut whatever the shift — a lead equal to its
+  // edit's media time shifts by 0, yet the media before it is still left out), then silence from 0 to the first sample
+  // kept (`first_pts=0`), and nothing past its end (an AAC's padding, an edit's end).
   const shiftA =
-    (sa !== 0 ? `asettb=AVTB,asetpts=PTS${signed(sa)}/TB,` : "") +
-    (o.soundShiftSec ? `atrim=start=${num(Math.max(0, leadA))},` : "");
-  const shiftV = sv !== 0 ? `settb=AVTB,setpts=PTS${signed(sv)}/TB,` : "";
+    (sa.shift !== 0 ? `asettb=AVTB,asetpts=PTS${signed(sa.shift)}/TB,` : "") +
+    (sa.start > 0 ? `atrim=start=${num(sa.start)},` : "");
+  const endA = sa.end != null ? `,atrim=end=${num(Math.max(1e-6, sa.end))}` : "";
+  const shiftV = pa.shift !== 0 ? `settb=AVTB,setpts=PTS${signed(pa.shift)}/TB,` : "";
+  // Review r8: a gap in the sound's timestamps is silence from 1 ms on (`min_hard_comp`; ffmpeg's own 0.1 s would
+  // close a shorter one — an MP4 whose first AAC sample is stretched to fill 0.0667 s then plays 45 ms early).
   const cap = num(Math.max(1, o.capSec));
   return [
     ...FF_COMMON,
@@ -820,9 +837,7 @@ export function ingestArgs(o: {
           "-map",
           "0:a:0",
           "-af",
-          `${shiftA}aresample=${RATE}:async=1:first_pts=0${
-            o.soundEndSec ? `,atrim=end=${num(o.soundEndSec - o0)}` : ""
-          },aformat=sample_fmts=s16:channel_layouts=stereo`,
+          `${shiftA}aresample=${RATE}:async=1:min_hard_comp=0.001:first_pts=0${endA},aformat=sample_fmts=s16:channel_layouts=stereo`,
           "-t",
           cap,
           ...PCM,

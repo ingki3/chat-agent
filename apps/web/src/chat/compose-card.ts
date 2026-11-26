@@ -35,11 +35,17 @@ export const COMPOSE_STATUS_TEXT: Record<ComposeJobStatus, string> = {
   failed: "합성하지 못했어요",
 };
 
-/** "1분 20초" / "12.5초". */
+/**
+ * "1분 20초" / "12.5초" / "0.1초 미만" (review r8: a length that rounds to 0 is still not nothing — a one-frame video is
+ * 0.033 s; minutes from the whole length rounded first, so 119.6 s is "2분", never "1분 60초").
+ */
 export function secondsText(sec: number): string {
-  if (sec < 60) return `${Math.round(sec * 10) / 10}초`;
-  const m = Math.floor(sec / 60);
-  const s = Math.round(sec - m * 60);
+  const tenths = Math.round(sec * 10) / 10;
+  if (sec > 0 && tenths === 0) return "0.1초 미만";
+  if (tenths < 60) return `${tenths}초`;
+  const total = Math.round(sec);
+  const m = Math.floor(total / 60);
+  const s = total - m * 60;
   return s ? `${m}분 ${s}초` : `${m}분`;
 }
 

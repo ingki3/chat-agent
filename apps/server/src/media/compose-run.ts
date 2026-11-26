@@ -28,6 +28,7 @@ import {
   verifyArgs,
   workUnits,
   isPlanError,
+  presentTrack,
   type InputInfo,
   type Plan,
 } from "./compose-plan.js";
@@ -357,30 +358,26 @@ export function judgeInput(
   const mov = DEMUXER[fileKind] === "mov";
   const tv = timeline.video;
   const ta = timeline.audio;
-  // Re-plan 2: a track with an edit list is presented on [lead, end) of the movie's timeline — its picture and its sound
-  // are cut at that end (not at its last frame's duration or its codec's padding). Without one, review r4's track end.
-  const audioEndSec =
-    !mov || !a
-      ? null
-      : ta?.edited
-        ? ta.end
-        : Number.isFinite(a.duration) && a.duration! > 0
-          ? (Number.isFinite(a.start_time) ? a.start_time! : 0) + a.duration!
-          : null;
-  const videoEndSec = mov && v && tv?.edited ? tv.end : null;
-  // Review r7: the files are read with their edit lists ignored (`-ignore_editlist`, so that no sample is dropped) and
-  // mapped here: a track's media time m is shown at lead + (m − its edit's media time).
-  const videoShiftSec = mov && tv?.edited ? tv.lead - tv.mediaTime : 0;
-  const audioShiftSec = mov && ta?.edited ? ta.lead - ta.mediaTime : 0;
-  const videoLeadSec = mov && tv?.edited ? tv.lead : 0;
-  const audioLeadSec = mov && ta?.edited ? ta.lead : 0;
-  // An MP4/MOV's presentation 0 on its `-copyts` timeline (reviews r5, r7). With an edit list on any of its tracks: the
-  // movie's 0 (each track mapped by its own edit). Without any: its first picture's time when it has one (a reorder
-  // delay without an edit list is no gap — sound before that first picture, at most that delay, is not presented),
-  // else its sound's first sample.
-  const anyEdited = !!tv?.edited || !!ta?.edited;
-  const first = (x: typeof v) => (x && Number.isFinite(x.start_time) ? x.start_time! : 0);
-  const originSec = !mov || anyEdited ? 0 : Math.max(0, v ? first(v) : a ? first(a) : 0);
+  // Review r8: each track as the file describes it — its edit list (re-plan 2: presented on [lead, end) of the movie's
+  // timeline, its media from its edit's media time; the file is read with `-ignore_editlist` and mapped by
+  // `presentTrack`), or, without one, its samples at their own times — a sound track to its own end (review r4: an
+  // AAC's last frame decodes past it).
+  const streamEnd = (x: typeof v) =>
+    x && Number.isFinite(x.duration) && x.duration! > 0
+      ? (Number.isFinite(x.start_time) ? x.start_time! : 0) + x.duration!
+      : null;
+  const videoTrack =
+    mov && v ? (tv?.edited ? tv : { edited: false, lead: 0, mediaTime: 0, end: null }) : null;
+  const audioTrack =
+    mov && a ? (ta?.edited ? ta : { edited: false, lead: 0, mediaTime: 0, end: streamEnd(a) }) : null;
+  // An MP4/MOV's presentation 0 on its `-copyts` timeline (review r5, restored in r8): the earliest first sample of its
+  // tracks — a track with an edit list starts at the movie's 0 (its leading empty edit stays, as nothing), one without
+  // at its first sample (a B-frame picture's reorder delay without an edit list is no gap; sound before that first
+  // picture is kept).
+  const first = (x: typeof v, edited: boolean | undefined) =>
+    edited ? 0 : x && Number.isFinite(x.start_time) ? x.start_time! : 0;
+  const firsts = [...(v ? [first(v, tv?.edited)] : []), ...(a ? [first(a, ta?.edited)] : [])];
+  const originSec = mov && firsts.length ? Math.max(0, Math.min(...firsts)) : 0;
 
   if (kind === "image") {
     if (!v || !side(v.width) || !side(v.height)) return { ok: false, reason: "unreadable" };
@@ -411,12 +408,8 @@ export function judgeInput(
         hasVideo: !!v,
         hasAudio: audio.length > 0,
         audioSec,
-        audioEndSec,
-        videoEndSec,
-        videoShiftSec,
-        audioShiftSec,
-        videoLeadSec,
-        audioLeadSec,
+        videoTrack,
+        audioTrack,
         originSec,
         width: v?.width ?? null,
         height: v?.height ?? null,
@@ -431,9 +424,7 @@ export function judgeInput(
       kind,
       durationSec: duration,
       audioSec,
-      audioEndSec,
-      audioShiftSec,
-      audioLeadSec,
+      audioTrack,
       originSec,
       hasVideo: false,
       hasAudio: true,
@@ -730,11 +721,8 @@ export function sandboxedComposer(o: {
           sound: info.hasAudio,
           countPicture: u.count && info.hasVideo,
           capSec: u.cap,
-          soundEndSec: info.audioEndSec ?? null,
-          originSec: info.originSec ?? 0,
-          soundShiftSec: info.audioShiftSec ?? 0,
-          soundLeadSec: info.audioLeadSec ?? 0,
-          pictureShiftSec: info.videoShiftSec ?? 0,
+          soundAt: presentTrack(info.audioTrack, info.originSec ?? 0),
+          pictureAt: presentTrack(info.videoTrack, info.originSec ?? 0),
         }),
         0,
         0,
@@ -752,10 +740,11 @@ export function sandboxedComposer(o: {
         audioSec = size / 4 / RATE;
       }
       // Re-plan 2: a picture with an edit list lasts to its media edit's end — not to its last frame's own duration.
+      const pictureEnd = presentTrack(info.videoTrack, info.originSec ?? 0).end;
       const pictureSec = !(u.count && info.hasVideo)
         ? null
-        : info.videoEndSec != null
-          ? Math.max(0, info.videoEndSec - (info.originSec ?? 0))
+        : pictureEnd != null
+          ? Math.max(0, pictureEnd)
           : (pictureFrames ?? 0) / FPS;
       if (u.count && info.hasVideo && !pictureFrames) return { ok: false, code: "compose_failed" };
       truth.set(fileId, {

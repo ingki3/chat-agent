@@ -55,4 +55,18 @@ describe("compose card (#238 stage 4)", () => {
     expect(durationText({ durationSec: 0, status: "failed" })).toBe("확인할 수 없음");
     expect(durationText({ durationSec: 2, status: "failed" })).toBe("2초");
   });
+
+  it("review r8: a one-frame video is not '0초'; minutes come from the rounded whole length", () => {
+    expect(secondsText(0.033)).toBe("0.1초 미만");
+    expect(secondsText(0.049)).toBe("0.1초 미만");
+    expect(secondsText(0.05)).toBe("0.1초");
+    expect(secondsText(0)).toBe("0초");
+    expect(secondsText(12.46)).toBe("12.5초");
+    expect(secondsText(59.94)).toBe("59.9초");
+    expect(secondsText(59.96)).toBe("1분");
+    expect(secondsText(119.6)).toBe("2분");
+    expect(secondsText(119.4)).toBe("1분 59초");
+    expect(secondsText(89.5)).toBe("1분 30초");
+    expect(durationText({ durationSec: 1 / 30, status: "done" })).toBe("0.1초 미만");
+  });
 });
