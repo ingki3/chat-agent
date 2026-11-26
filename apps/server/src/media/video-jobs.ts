@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { SkillResult, ToolScope } from "@agentlee/mcp-tools";
@@ -179,6 +180,16 @@ const LEASE_MS = (l: { requestTimeoutMs: number; downloadTimeoutMs: number }) =>
 const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 /** A poll answer is small (ids, URLs, usage); anything bigger is not read. */
 const STATUS_MAX = 256 * 1024;
+/**
+ * An outcome the provider already gave that a job's work holds because recording it failed (a write): a refusal
+ * (never billed — its code and the reservation to release), an accepted submit (its remote id), or a reported cost.
+ * The work keeps it until it is recorded; every end of the job (`finish`) and the engine's stop record it with it.
+ */
+type Held =
+  | { kind: "refusal"; code: VideoJobCode; usageKey: string }
+  | { kind: "accepted"; remoteId: string }
+  | { kind: "cost"; usd: number };
+
 const isObj = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
 /** The provider's moderation, as OpenRouter's `error` strings say it — mapped to a fixed code, never stored. */
@@ -203,11 +214,8 @@ export class VideoJobs {
     {
       stop: AbortController;
       done: Promise<unknown>;
-      /**
-       * A refusal (never billed) this work holds and is still recording: its code and the reservation's usage key. Every
-       * end of the job (`finish`) and its conversation's delete honour it — it is let go only once recorded.
-       */
-      refusal?: { code: VideoJobCode; usageKey: string };
+      /** An outcome this work holds and is still recording (`Held`) — let go only once recorded. */
+      held?: Held;
     }
   >();
   private readonly streams = new Set<() => void>();
@@ -252,7 +260,8 @@ export class VideoJobs {
       for (const r of rows) {
         if (!r.usageKey) continue;
         // A refusal known here and still being recorded is never billed; anything else still held is kept for good.
-        if (this.inflight.get(r.id)?.refusal?.usageKey === r.usageKey)
+        const held = this.inflight.get(r.id)?.held;
+        if (held?.kind === "refusal" && held.usageKey === r.usageKey)
           this.o.usage?.releaseVideoMedia(r.usageKey);
         else this.o.usage?.unconfirmVideoMedia(r.usageKey);
       }
@@ -683,6 +692,8 @@ export class VideoJobs {
       return r;
     }
     // ---- one synchronous step (review item 2): from here to the transaction's end nothing else runs here.
+    // The engine may have stopped while the model was looked up (review r7): nothing is reserved or sent then.
+    if (!this.started) throw new VideoError("video_engine_unavailable", 503);
     const at = this.now();
     const fresh = this.owned(id, userId);
     if (fresh.status !== "awaiting_approval" || fresh.version !== version)
@@ -773,19 +784,14 @@ export class VideoJobs {
   }
 
   /** Work of a job under way here: its stop kept until it ends (the only in-memory state of a job). */
-  private track(
-    id: string,
-    stop: AbortController,
-    work: Promise<unknown>,
-    refusal?: { code: VideoJobCode; usageKey: string },
-  ): Promise<unknown> {
+  private track(id: string, stop: AbortController, work: Promise<unknown>, held?: Held): Promise<unknown> {
     // Never rejects (review r5): what failed is logged; the row says where the job stands.
     const done = work
       .catch((e: unknown) => logEvent(this.o.log, "warn", "error", { videoJobId: id, err: e }))
       .finally(() => {
         if (this.inflight.get(id)?.stop === stop) this.inflight.delete(id);
       });
-    this.inflight.set(id, { stop, done, ...(refusal ? { refusal } : {}) });
+    this.inflight.set(id, { stop, done, ...(held ? { held } : {}) });
     return done;
   }
 
@@ -828,8 +834,8 @@ export class VideoJobs {
         // Review r4: the refusal is known here — it is recorded (and its bound released) or, should the writes fail,
         // kept trying while this job's work is still under way (a pass leaves it alone), until it is or the deadline.
         return (
-          this.finish(id, code, { refusal: { code, usageKey } }) ??
-          this.retrying(id, () => this.finish(id, code, { refusal: { code, usageKey } }), { code, usageKey })
+          this.finish(id, code, { held: { kind: "refusal", code, usageKey } }) ??
+          this.retrying(id, { kind: "refusal", code, usageKey })
         );
       }
       // No answer, a timeout or a 5xx: it may have started and may bill — never sent again, its bound stays.
@@ -846,31 +852,73 @@ export class VideoJobs {
     if (!remote) return this.finish(id, "video_unconfirmed") ?? this.get(id);
     // The id is what lets the job be followed: written now or — the writes failing — kept trying while this job's
     // work is under way (review r4), until it is written or the deadline.
-    const accept = () => {
-      const r = this.write(id, ["submitting"], {
-        status: "pending",
-        remoteId: remote,
-        submittedAt: this.now(),
-        nextAt: this.now() + this.limits.pollMs,
-        failures: 0,
-        leaseBoot: null,
-        leaseUntil: null,
-      });
-      if (r)
-        logEvent(this.o.log, "info", "video.submitted", {
-          userId: r.ownerId,
-          conversationId: r.conversationId,
-          videoJobId: id,
-        });
-      return r;
-    };
     try {
-      const r = accept();
+      const r = this.accept(id, remote);
       if (r) return r;
     } catch {
       // kept trying below
     }
-    return this.retrying(id, accept);
+    return this.retrying(id, { kind: "accepted", remoteId: remote });
+  }
+
+  /** An accepted submit recorded: `pending` with its remote id, its lease cleared. Null: the row was not `submitting`. */
+  private accept(id: string, remote: string): VideoJobRow | null {
+    const r = this.write(id, ["submitting"], {
+      status: "pending",
+      remoteId: remote,
+      submittedAt: this.now(),
+      nextAt: this.now() + this.limits.pollMs,
+      failures: 0,
+      leaseBoot: null,
+      leaseUntil: null,
+    });
+    if (r)
+      logEvent(this.o.log, "info", "video.submitted", {
+        userId: r.ownerId,
+        conversationId: r.conversationId,
+        videoJobId: id,
+      });
+    return r;
+  }
+
+  /**
+   * A reported cost recorded on its running job (and the job due again at once, its lease cleared — the next pass
+   * goes on with it). Null: the job is no longer running (its end recorded the cost, `finish`).
+   */
+  private settleHeld(id: string, usd: number): VideoJobRow | null {
+    return this.o.db.$client.transaction(() => {
+      const r = this.get(id);
+      if (!r || !POLLED.includes(r.status)) return null;
+      if (r.costMicros === null && r.usageKey) this.o.usage?.settleMedia(r.usageKey, usd);
+      this.o.db
+        .update(videoJobs)
+        .set({
+          ...(r.costMicros === null ? { costMicros: Math.round(usd * 1_000_000) } : {}),
+          nextAt: this.now(),
+          leaseBoot: null,
+          leaseUntil: null,
+        })
+        .where(eq(videoJobs.id, id))
+        .run();
+      return this.get(id) ?? null;
+    })();
+  }
+
+  /** Records a held outcome now (true: recorded, or nothing left to record — the job ended or is gone). */
+  private recordHeld(id: string, held: Held): boolean {
+    if (held.kind === "refusal") return this.finish(id, held.code, { held }) !== null || !this.running(id);
+    if (held.kind === "accepted") return this.accept(id, held.remoteId) !== null || !this.running(id);
+    return this.settleHeld(id, held.usd) !== null || !this.running(id);
+  }
+
+  /** Whether the job still runs (a read that fails says yes: keep its outcome). */
+  private running(id: string): boolean {
+    try {
+      const r = this.get(id);
+      return !!r && VIDEO_ACTIVE.has(r.status);
+    } catch {
+      return true;
+    }
   }
 
   /**
@@ -879,41 +927,30 @@ export class VideoJobs {
    * is no longer `submitting` or is gone, its deadline passed (the pass's timeout ends it), or the engine stops. The
    * approval does not wait for it: it answers with the row as it is now.
    */
-  private retrying(
-    id: string,
-    attempt: () => VideoJobRow | null,
-    refusal?: { code: VideoJobCode; usageKey: string },
-  ): VideoJobRow | undefined {
+  private retrying(id: string, held: Held): VideoJobRow | undefined {
     const stop = new AbortController();
     const work = (async () => {
       for (let n = 0; ; n++) {
         // The wait ends early when the job's work is stopped (its end recorded elsewhere, the engine stopping).
-        await new Promise<void>((r) => {
-          const timer = setTimeout(r, Math.min(30_000, this.limits.retryMs * 2 ** n));
-          timer.unref();
-          stop.signal.addEventListener(
-            "abort",
-            () => {
-              clearTimeout(timer);
-              r();
-            },
-            { once: true },
-          );
-        });
-        if (stop.signal.aborted || this.stopping) return;
-        // One try, all of it inside: a read or a write that fails is the next try (review r5).
         try {
-          const row = this.get(id);
-          // Until it is recorded or the job ended (its deadline ends it through `finish`, which honours a held
-          // refusal): a refusal is let go only once its release is committed.
-          if (!row || row.status !== "submitting") return;
-          if (attempt()) return;
+          await sleep(Math.min(30_000, this.limits.retryMs * 2 ** n), undefined, {
+            signal: stop.signal,
+            ref: false,
+          });
+        } catch {
+          return;
+        }
+        if (this.stopping) return;
+        // One try, all of it inside: a read or a write that fails is the next try. Until it is recorded or the job
+        // ended (its deadline ends it through `finish`, which records a held outcome with it).
+        try {
+          if (this.recordHeld(id, held)) return;
         } catch {
           // tried again
         }
       }
     })();
-    void this.track(id, stop, work, refusal);
+    void this.track(id, stop, work, held);
     try {
       return this.get(id);
     } catch {
@@ -945,6 +982,14 @@ export class VideoJobs {
     this.stopping = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    // Outcomes already given and still held (review r7): one more try to record each before the database goes.
+    for (const [id, w] of [...this.inflight])
+      if (w.held)
+        try {
+          this.recordHeld(id, w.held);
+        } catch {
+          // the next start ends it by the rows' own rule (bound kept)
+        }
     for (const w of this.inflight.values()) w.stop.abort();
     for (const close of [...this.streams]) close();
     await Promise.race([
@@ -1255,23 +1300,37 @@ export class VideoJobs {
       typeof usage.cost === "number" && Number.isFinite(usage.cost) && usage.cost >= 0 ? usage.cost : null;
     // The cost and `downloading` together, before a byte is fetched (a restart then never loses the cost). The
     // failures in a row are kept (a download retried across completed polls counts on).
-    const settled = this.o.db.$client.transaction(() => {
-      const r = this.get(row.id);
-      if (!r || !POLLED.includes(r.status) || this.pastDeadline(row.id)) return null;
-      if (cost !== null && r.costMicros === null && r.usageKey) this.o.usage?.settleMedia(r.usageKey, cost);
-      this.o.db
-        .update(videoJobs)
-        .set({
-          status: "downloading",
-          ...(cost !== null && r.costMicros === null ? { costMicros: Math.round(cost * 1_000_000) } : {}),
-          version: sql`${videoJobs.version} + 1`,
-          updatedAt: this.now(),
-        })
-        .where(eq(videoJobs.id, row.id))
-        .run();
-      return this.get(row.id) ?? null;
-    })();
+    // Past the deadline the cost is still recorded (review r7) — then the deadline ends the job.
+    let settled: VideoJobRow | null;
+    try {
+      settled = this.o.db.$client.transaction(() => {
+        const r = this.get(row.id);
+        if (!r || !POLLED.includes(r.status)) return null;
+        if (cost !== null && r.costMicros === null && r.usageKey) this.o.usage?.settleMedia(r.usageKey, cost);
+        const late = r.deadlineAt !== null && this.now() >= r.deadlineAt;
+        this.o.db
+          .update(videoJobs)
+          .set({
+            ...(late ? {} : { status: "downloading" as const }),
+            ...(cost !== null && r.costMicros === null ? { costMicros: Math.round(cost * 1_000_000) } : {}),
+            version: sql`${videoJobs.version} + 1`,
+            updatedAt: this.now(),
+          })
+          .where(eq(videoJobs.id, row.id))
+          .run();
+        return this.get(row.id) ?? null;
+      })();
+    } catch (e) {
+      // The cost is known: held and recorded by a retry of its own (or by the job's end), not by asking again.
+      if (cost === null) throw e;
+      this.retrying(row.id, { kind: "cost", usd: cost });
+      return;
+    }
     if (!settled) return;
+    if (this.pastDeadline(row.id)) {
+      this.finish(row.id, "video_timeout");
+      return;
+    }
     this.changed(row.id);
     const url = settled.remoteId ? videoContentUrl(settled.remoteId) : null;
     if (!url) {
@@ -1485,35 +1544,37 @@ export class VideoJobs {
    * **Every end of a running job other than its video** (review r6: one judgement, in this order):
    * 1. a refusal known here (given, or held by the job's work under way) — its code, its bound released in the same
    *    transaction (never billed); should that write fail, nothing changes and the holder (or the next pass) tries
-   *    again — a held refusal is let go only once recorded;
+   *    again — a held outcome is let go only once recorded (a held cost is recorded with any other end);
    * 2. past its deadline — `video_timeout`;
    * 3. else the given reason.
    * For 2–3 the bound stays for good (`unconfirmed`) unless a cost was settled. Tried twice. Null when the job had
    * already ended, is gone, or the write failed.
    */
-  private finish(
-    id: string,
-    reason: VideoJobCode,
-    o: { refusal?: { code: VideoJobCode; usageKey: string } } = {},
-  ): VideoJobRow | null {
+  private finish(id: string, reason: VideoJobCode, o: { held?: Held } = {}): VideoJobRow | null {
     const end = () =>
       this.o.db.$client.transaction(() => {
         const row = this.get(id);
         if (!row || !VIDEO_ACTIVE.has(row.status)) return null;
-        const refusal = o.refusal ?? this.inflight.get(id)?.refusal;
+        const held = o.held ?? this.inflight.get(id)?.held;
         let code: VideoJobCode;
-        if (refusal) {
-          this.o.usage?.releaseVideoMedia(refusal.usageKey);
-          code = refusal.code;
+        let costMicros = row.costMicros;
+        if (held?.kind === "refusal") {
+          this.o.usage?.releaseVideoMedia(held.usageKey);
+          code = held.code;
         } else {
           code = row.deadlineAt !== null && this.now() >= row.deadlineAt ? "video_timeout" : reason;
-          if (row.usageKey && row.costMicros === null) this.o.usage?.unconfirmVideoMedia(row.usageKey);
+          // A reported cost still held (review r7): recorded with the end.
+          if (held?.kind === "cost" && costMicros === null && row.usageKey) {
+            this.o.usage?.settleMedia(row.usageKey, held.usd);
+            costMicros = Math.round(held.usd * 1_000_000);
+          } else if (row.usageKey && costMicros === null) this.o.usage?.unconfirmVideoMedia(row.usageKey);
         }
         this.o.db
           .update(videoJobs)
           .set({
             status: "failed",
             errorCode: code,
+            costMicros,
             nextAt: null,
             leaseBoot: null,
             leaseUntil: null,

@@ -353,14 +353,15 @@ export function registerFileRoutes(
       const p = viewOf(app, req, { fileIn: f.conversationId });
       if (p === null || (p && !p.files.has(f.id)))
         return reply.code(403).header("Cache-Control", "no-store").send({ error: "forbidden" });
+      // An MP4 only when it is a video job's checked result (#238 stage 3, review item 8): never an upload. Asked before
+      // the file is opened (review r7: a failed read here leaves no descriptor open).
+      const inline =
+        req.query.inline === "1" &&
+        (INLINE_KINDS.has(f.kind) || (f.kind === "mp4" && store.isVerifiedVideo(f.id)));
       // Checked folders only, never a link, a regular file of the size the row says (FileStore.open).
       const fd = store.open(f);
       if (fd === undefined)
         return reply.code(404).header("Cache-Control", "no-store").send({ error: "not_found" });
-      // An MP4 only when it is a video job's checked result (#238 stage 3, review item 8): never an upload.
-      const inline =
-        req.query.inline === "1" &&
-        (INLINE_KINDS.has(f.kind) || (f.kind === "mp4" && store.isVerifiedVideo(f.id)));
       const { base, ext } = nameParts(toUploadedFile(f).name);
       const disposition = attachment(base, ext || f.kind);
       reply

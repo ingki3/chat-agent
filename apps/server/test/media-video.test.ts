@@ -2196,3 +2196,184 @@ describe("video jobs — review r6 regressions (explicit leases, one end judgeme
     expect(fs.readdirSync(root)).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------- review round 7 (#255)
+
+describe("video jobs — review r7 regressions (held outcomes)", () => {
+  const completed = (id: string) => Response.json({ id, status: "completed", usage: { cost: 0.8 } });
+  const restart = (t: Awaited<ReturnType<typeof start>>, server: ReturnType<typeof fakeServer>) => {
+    const next = new VideoJobs({
+      db: t.db,
+      files: () => t.app.files,
+      conversations: t.app.conversations!,
+      keys: t.app.media!.keys,
+      settings: t.app.media!.settings,
+      budget: t.app.media!.budget,
+      usage: t.app.usageStore,
+      users: t.app.users!,
+      notifications: () => t.app.notifications,
+      probe: () => fixtureVideoProbe(),
+      dataDir: t.dataDir,
+      fetchImpl: server.fetchImpl,
+      limits: { tickMs: 3_600_000 },
+    });
+    next.start();
+    closers.push(() => next.stop());
+    return next;
+  };
+
+  it("1: a reported cost whose write fails once is recorded by its own retry — not lost to the deadline", async () => {
+    const clock = { t: Date.now() };
+    const server = fakeServer({ poll: (id) => completed(id) });
+    const t = await start({ server, clock, limits: { retryMs: 20 } });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    const deadline = t.job(jobId).deadlineAt!;
+    clock.t = deadline - 25_000;
+    const settle = vi.spyOn(t.app.usageStore!, "settleMedia").mockImplementationOnce(() => {
+      throw new Error("temporary write");
+    });
+    t.dueNow();
+    await t.video.tick();
+    settle.mockRestore();
+    await vi.waitFor(() => expect(t.job(jobId).costMicros).toBe(800_000), { timeout: 5000 });
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "settled", p: 800_000 })]);
+    // The status was asked once for it: the cost was not asked again.
+    expect(server.requests.filter((x) => x.url === videoStatusUrl(rid(1)))).toHaveLength(1);
+  });
+
+  it("1: a cost still held at the deadline is recorded with the timeout", async () => {
+    const clock = { t: Date.now() };
+    const server = fakeServer({ poll: (id) => completed(id) });
+    const t = await start({ server, clock, limits: { retryMs: 60_000 } });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    const settle = vi.spyOn(t.app.usageStore!, "settleMedia").mockImplementationOnce(() => {
+      throw new Error("temporary write");
+    });
+    t.dueNow();
+    await t.video.tick();
+    settle.mockRestore();
+    clock.t = t.job(jobId).deadlineAt!;
+    await t.video.tick();
+    expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_timeout", costMicros: 800_000 });
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "settled", p: 800_000 })]);
+  });
+
+  it("1: a completed answer handled exactly at the deadline records its cost", async () => {
+    const base = Date.now();
+    const clock = { t: base };
+    const server = fakeServer({
+      poll: (id) => {
+        clock.t = base + 3_600_000;
+        return completed(id);
+      },
+    });
+    const t = await start({ server, clock });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    clock.t = base + 3_600_000 - 1;
+    t.dueNow();
+    await t.video.tick();
+    await t.video.idle();
+    expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_timeout", costMicros: 800_000 });
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "settled", p: 800_000 })]);
+    expect(server.requests.filter((x) => x.url.includes("/content?"))).toHaveLength(0);
+  });
+
+  for (const kind of ["402", "202"] as const)
+    it(`2: a graceful stop records a held ${kind} before the database goes`, async () => {
+      const server = fakeServer({
+        submit: () =>
+          kind === "402"
+            ? new Response(null, { status: 402 })
+            : Response.json({ id: rid(1) }, { status: 202 }),
+      });
+      const t = await start({ server, limits: { retryMs: 30_000 } });
+      const { jobId } = await t.card();
+      const condition = kind === "402" ? "NEW.error_code='video_payment'" : "NEW.status='pending'";
+      t.db.$client.exec(
+        `CREATE TRIGGER r7_block BEFORE UPDATE OF status ON video_jobs WHEN ${condition} BEGIN SELECT RAISE(ABORT,'temporary'); END`,
+      );
+      expect((await t.approve(jobId, 0)).json().status).toBe("submitting");
+      t.db.$client.exec("DROP TRIGGER r7_block");
+      await t.video.stop();
+      if (kind === "402") {
+        expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_payment" });
+        expect(t.usage()).toEqual([]);
+      } else {
+        expect(t.job(jobId)).toMatchObject({ status: "pending", remoteId: rid(1) });
+        const next = restart(t, server);
+        for (let i = 0; i < 5 && next.get(jobId)!.status !== "done"; i++) {
+          t.dueNow();
+          await next.tick();
+          await next.idle();
+        }
+        expect(next.get(jobId)!.status).toBe("done");
+      }
+      expect(server.posts()).toHaveLength(1);
+    });
+
+  it("3: the engine stopping while the model is looked up: nothing reserved or sent", async () => {
+    const base = fakeServer();
+    let hold = false;
+    let resume!: () => void;
+    const fetchImpl: typeof fetch = async (url, opts) => {
+      if (hold && String(url) === MEDIA_CATALOG_URLS.video) await new Promise<void>((r) => (resume = r));
+      return base.fetchImpl(url, opts);
+    };
+    const t = await start({ server: { ...base, fetchImpl } });
+    const { jobId } = await t.card();
+    hold = true;
+    const request = t.approve(jobId, 0);
+    await vi.waitFor(() => expect(resume).toBeDefined());
+    await t.video.stop();
+    resume();
+    expect((await request).json()).toMatchObject({ error: "video_engine_unavailable" });
+    expect(base.posts()).toHaveLength(0);
+    expect(t.usage()).toEqual([]);
+    expect(t.job(jobId).status).toBe("awaiting_approval");
+  });
+
+  it("4: a long retry leaves no abort listeners behind its waits", async () => {
+    const { getEventListeners } = await import("node:events");
+    const t = await start({
+      limits: { retryMs: 10 },
+      server: fakeServer({ submit: () => new Response(null, { status: 402 }) }),
+    });
+    const { jobId } = await t.card();
+    t.db.$client.exec(
+      "CREATE TRIGGER r7_refuse BEFORE UPDATE OF status ON video_jobs WHEN NEW.error_code='video_payment' BEGIN SELECT RAISE(ABORT,'temporary'); END",
+    );
+    expect((await t.approve(jobId, 0)).json().status).toBe("submitting");
+    const { stop } = (
+      t.video as unknown as { inflight: Map<string, { stop: AbortController }> }
+    ).inflight.get(jobId)!;
+    await new Promise((r) => setTimeout(r, 400));
+    expect(getEventListeners(stop.signal, "abort").length).toBeLessThanOrEqual(1);
+    t.db.$client.exec("DROP TRIGGER r7_refuse");
+    await vi.waitFor(() => expect(t.job(jobId).errorCode).toBe("video_payment"), { timeout: 5000 });
+    expect(t.usage()).toEqual([]);
+  });
+
+  it("5: a provenance read that fails before the inline file is opened leaves no descriptor", async () => {
+    const t = await start();
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    const row = await t.drive(jobId);
+    const store = t.app.files!;
+    const open = vi.spyOn(store, "open");
+    const fail = vi.spyOn(store, "isVerifiedVideo").mockImplementationOnce(() => {
+      throw new Error("transient read failure");
+    });
+    try {
+      const url = `/api/files/${row.fileId}/content?inline=1`;
+      expect((await t.api(t.f.cookies.owner, "GET", url)).statusCode).toBe(500);
+      expect(open).not.toHaveBeenCalled();
+      expect((await t.api(t.f.cookies.owner, "GET", url)).statusCode).toBe(200);
+    } finally {
+      fail.mockRestore();
+      open.mockRestore();
+    }
+  });
+});
