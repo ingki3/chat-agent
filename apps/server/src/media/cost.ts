@@ -252,6 +252,21 @@ function videoSku(
 }
 
 /**
+ * The per-second prices of `pricing_skus`, in USD per second (the `cents_*` ones divided by 100), with the resolution
+ * tier each is for (null: every tier) — what the admin's model list shows (review r1: never raw cents as dollars).
+ * Prices this server cannot read or that bill inputs never sent are left out.
+ */
+export function videoRates(skus: unknown): { usdPerSec: number; tier: string | null }[] {
+  if (!isObj(skus)) return [];
+  const out: { usdPerSec: number; tier: string | null }[] = [];
+  for (const [key, value] of Object.entries(skus)) {
+    const s = videoSku(key, value);
+    if (typeof s === "object") out.push(s);
+  }
+  return out;
+}
+
+/**
  * A video job's upper bound (USD) from its model's `pricing_skus` (user decision 1: only models priced per second):
  * the dearest per-second SKU that can apply to the resolution asked for — its own tier's and the unsuffixed ones,
  * every sound and long-length variant (the server never says whether to make sound) — times the length, at least the

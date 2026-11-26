@@ -1,4 +1,4 @@
-import { MEDIA_LIMITS, VIDEO_LIMITS } from "@agentlee/shared";
+import { VIDEO_LIMITS } from "@agentlee/shared";
 import { boundMicros, videoCostBound, videoPricing, type VideoPricing } from "./cost.js";
 
 /**
@@ -39,7 +39,7 @@ export function videoRecordOf(answer: unknown, model: string): VideoRecord | und
         ...new Set(
           e.supported_durations.filter(
             (d): d is number =>
-              typeof d === "number" && Number.isInteger(d) && d > 0 && d <= MEDIA_LIMITS.videoMaxSec,
+              typeof d === "number" && Number.isInteger(d) && d > 0 && d <= VIDEO_LIMITS.requestMaxSec,
           ),
         ),
       ].sort((a, b) => a - b)

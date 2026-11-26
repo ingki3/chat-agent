@@ -20,6 +20,7 @@ import { FIXTURE_OPENROUTER_KEY_PREFIX, fixtureMp4, fixtureOpenRouterFetch } fro
 import {
   MEDIA_CATALOG_URLS,
   OPENROUTER_VIDEOS_URL,
+  videoPriceText,
   VIDEO_JOB_ID,
   videoContentUrl,
   videoGet,
@@ -35,6 +36,7 @@ import {
 } from "../src/media/video-plan.js";
 import {
   fixtureVideoProbe,
+  KNOWN_GOOD_MP4,
   judgeVideoProbe,
   sandboxedVideoProbe,
   videoProbeOptions,
@@ -941,5 +943,252 @@ describe("video_generate and its jobs (#238 stage 3)", () => {
     expect(compose({ kind: "video_failed", reason: "60분 안에 끝나지 않았어요", url: "/c/x" }).body).toBe(
       "영상을 만들지 못했어요 — 60분 안에 끝나지 않았어요",
     );
+  });
+});
+
+// ---------------------------------------------------------------- review round 1 (#255)
+
+describe("video jobs — review r1 regressions", () => {
+  const dueOf = (t: Awaited<ReturnType<typeof start>>, id: string) =>
+    (t.video as unknown as { due: Map<string, { at: number; failures: number }> }).due.get(id);
+
+  it("P1: a probe that cannot check a known-good MP4 here refuses the approval before anything is reserved or sent", async () => {
+    let readyCalls = 0;
+    let ready = false;
+    const probe: VideoProbe = {
+      check: async () => "ok",
+      ready: async () => {
+        readyCalls += 1;
+        return ready;
+      },
+    };
+    const t = await start({ probe: () => probe });
+    const { jobId } = await t.card();
+    expect((await t.approve(jobId, 0)).json()).toMatchObject({ error: "video_probe_unavailable" });
+    expect(t.server.posts()).toHaveLength(0);
+    expect(t.usage()).toHaveLength(0);
+    ready = true;
+    expect((await t.approve(jobId, 0)).json()).toMatchObject({ status: "pending" });
+    // An ok holds a while (not asked again for the next approval).
+    const other = await t.card();
+    await t.approve(other.jobId, 0);
+    expect(readyCalls).toBe(2);
+    // The fixture probe's readiness really writes and checks the known-good MP4 in video-scratch.
+    expect(await fixtureVideoProbe(t.dataDir).ready()).toBe(true);
+    expect(KNOWN_GOOD_MP4.subarray(4, 8).toString("latin1")).toBe("ftyp");
+    expect(fs.readdirSync(path.join(t.dataDir, "video-scratch"))).toEqual([]);
+  });
+
+  it("P2: a rescrub changing a waiting card's prompt ends it (video_blocked, version + 1) — the old approval sends nothing", async () => {
+    const t = await start();
+    const { jobId } = await t.card();
+    // The background rescrub's write: any change of a waiting card's prompt (the trigger of 0039).
+    t.db.$client
+      .prepare("UPDATE video_jobs SET prompt = ? WHERE id = ?")
+      .run("노을 진 [REDACTED] 위 작은 배", jobId);
+    expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_blocked", version: 1 });
+    expect((await t.approve(jobId, 0)).json()).toMatchObject({ error: "video_job_changed" });
+    expect(t.server.posts()).toHaveLength(0);
+    // A job already sent is left alone.
+    const sent = await t.card();
+    await t.approve(sent.jobId, 0);
+    t.db.$client.prepare("UPDATE video_jobs SET prompt = 'x' WHERE id = ?").run(sent.jobId);
+    expect(t.job(sent.jobId).status).toBe("pending");
+  });
+
+  it("P2: the model's default for sound changed: the card is refreshed and approved again", async () => {
+    let audio: boolean | null = true;
+    const t = await start({ server: fakeServer({ catalog: () => [{ ...VEO, generate_audio: audio }] }) });
+    const { jobId } = await t.card();
+    audio = false;
+    const r = await t.approve(jobId, 0);
+    expect(r.statusCode).toBe(409);
+    expect(r.json()).toMatchObject({ error: "video_card_refreshed", job: { audio: false, version: 1 } });
+    expect(t.server.posts()).toHaveLength(0);
+    expect((await t.approve(jobId, 1)).json()).toMatchObject({ status: "pending", audio: false });
+  });
+
+  it("P2: a status answer about another job changes nothing — neither status nor cost; asked again later", async () => {
+    const t = await start({
+      server: fakeServer({
+        poll: () => Response.json({ id: rid(99), status: "completed", usage: { cost: 0 } }),
+      }),
+    });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    await t.video.tick();
+    (t.video as unknown as { due: Map<string, { at: number }> }).due.get(jobId)!.at = 0;
+    await t.video.tick();
+    await t.video.idle();
+    expect(t.job(jobId)).toMatchObject({ status: "pending", costMicros: null });
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "video_job", p: null, e: VEO_8S_MICROS })]);
+    expect(dueOf(t, jobId)!.failures).toBeGreaterThanOrEqual(1);
+  });
+
+  it("P2: a refused submit whose release fails still ends; its bound is released on the next pass", async () => {
+    const t = await start({
+      server: fakeServer({ submit: () => Response.json({ error: { code: 402 } }, { status: 402 }) }),
+    });
+    const { jobId } = await t.card();
+    const release = vi.spyOn(t.app.usageStore!, "releaseMedia").mockImplementation(() => {
+      throw new Error("SQLITE_BUSY");
+    });
+    expect((await t.approve(jobId, 0)).json()).toMatchObject({
+      status: "failed",
+      errorCode: "video_payment",
+    });
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "video_job" })]);
+    release.mockRestore();
+    await t.video.tick();
+    expect(t.usage()).toEqual([]);
+  });
+
+  it("P2: a session ended during the model lookup: refused before the card is re-priced, and no card in the answer", async () => {
+    let price = "0.12";
+    let onLookup = () => {};
+    const t = await start({
+      server: fakeServer({
+        catalog: () => {
+          onLookup();
+          return [{ ...VEO, pricing_skus: { ...VEO.pricing_skus, duration_seconds_with_audio: price } }];
+        },
+      }),
+    });
+    const { jobId } = await t.card();
+    price = "0.50";
+    onLookup = () => t.app.users!.deactivate(t.f.users.owner.id);
+    const r = await t.approve(jobId, 0);
+    expect(r.statusCode).toBe(403);
+    expect(r.json()).toEqual({ error: "forbidden" });
+    expect(t.job(jobId)).toMatchObject({
+      status: "awaiting_approval",
+      version: 0,
+      estimateMicros: VEO_8S_MICROS,
+    });
+  });
+
+  it("P2: a rolled-back conversation delete never stops another conversation's job", async () => {
+    let gate: () => void = () => {};
+    let held = false;
+    const t = await start({
+      server: fakeServer({
+        poll: async (id) => {
+          if (held) await new Promise<void>((r) => (gate = r));
+          return Response.json({ id, status: "in_progress", progress: 10 });
+        },
+      }),
+    });
+    const a = await t.card();
+    await t.approve(a.jobId, 0);
+    const b = await t.card();
+    t.app.conversations!.onDelete((id) => {
+      if (id === a.scope.conversationId) throw new Error("hook refused");
+    });
+    held = true;
+    (t.video as unknown as { due: Map<string, { at: number }> }).due.get(a.jobId)!.at = 0;
+    const pass = t.video.tick();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(() => t.app.conversations!.delete(a.scope.conversationId)).toThrow("hook refused");
+    t.app.conversations!.delete(b.scope.conversationId);
+    gate();
+    await pass;
+    await t.video.idle();
+    expect(t.job(a.jobId)).toMatchObject({ status: "in_progress", progress: 10 });
+  });
+
+  it("P2: the deadline holds during the check and the file lock: past it, video_timeout — the settled cost stays", async () => {
+    const clock = { t: Date.UTC(2026, 10, 26, 3, 0, 0) };
+    const probe: VideoProbe = {
+      ready: async () => true,
+      check: async () => {
+        clock.t += 61 * 60_000;
+        return "ok";
+      },
+    };
+    const t = await start({ clock, probe: () => probe });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    expect(await t.drive(jobId)).toMatchObject({
+      status: "failed",
+      errorCode: "video_timeout",
+      costMicros: 800_000,
+    });
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "settled", p: 800_000 })]);
+    expect(t.db.$client.prepare("SELECT count(*) n FROM files").get()).toEqual({ n: 0 });
+  });
+
+  it("P2: notified_at only once published — a failed publish is tried again (same dedupe key, one row)", async () => {
+    const t = await start();
+    const publish = vi.spyOn(t.app.notifications!, "publish").mockImplementationOnce(() => {
+      throw new Error("notifications table busy");
+    });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    await t.drive(jobId);
+    expect(t.job(jobId)).toMatchObject({ status: "done", notifiedAt: null });
+    expect(t.db.$client.prepare("SELECT count(*) n FROM notifications").get()).toEqual({ n: 0 });
+    await t.video.tick();
+    await t.video.tick();
+    expect(t.job(jobId).notifiedAt).not.toBeNull();
+    expect(t.db.$client.prepare("SELECT kind FROM notifications").all()).toEqual([{ kind: "video_done" }]);
+    expect(publish).toHaveBeenCalledTimes(2);
+  });
+
+  it("P2: the content's 429 keeps its Retry-After, and the failures in a row count across completed polls", async () => {
+    const clock = { t: Date.UTC(2026, 10, 26, 3, 0, 0) };
+    const t = await start({
+      clock,
+      server: fakeServer({
+        poll: (id) => Response.json({ id, status: "completed", usage: { cost: 0.8 } }),
+        content: () =>
+          Response.json({ error: { code: 429 } }, { status: 429, headers: { "retry-after": "90" } }),
+      }),
+    });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    for (const n of [1, 2]) {
+      dueOf(t, jobId)!.at = 0;
+      await t.video.tick();
+      await t.video.idle();
+      expect(dueOf(t, jobId)).toEqual({ at: clock.t + 90_000, failures: n });
+    }
+    expect(t.job(jobId)).toMatchObject({ status: "downloading", costMicros: 800_000 });
+  });
+
+  it("P2: the admin's list shows per-second prices in dollars — cents divided by 100", () => {
+    expect(
+      videoPriceText({
+        cents_per_image_input: "1",
+        cents_per_video_output_second_480p: "8",
+        cents_per_video_output_second_720p: "14",
+        cents_per_video_output_second_1080p: "25",
+      }),
+    ).toBe("$0.08/초 (480p), $0.14/초 (720p), $0.25/초 (1080p)");
+    expect(videoPriceText(VEO.pricing_skus)).toBe("$0.12/초, $0.3/초 (4k), $0.1/초 (720p)");
+    expect(videoPriceText({ video_tokens: "0.000007" })).toBeNull();
+  });
+
+  it("P3: the engine expires a waiting card when the settings change, and its open stream hears it", async () => {
+    const t = await start();
+    const { jobId } = await t.card();
+    const heard: string[] = [];
+    const off = t.video.subscribe(jobId, () => heard.push(t.job(jobId).status));
+    t.app.media!.settings.set(videoOn({ dailyCostLimitUsd: 30 }));
+    await t.video.tick();
+    off();
+    expect(t.job(jobId)).toMatchObject({ status: "expired", errorCode: "video_settings_changed" });
+    expect(heard).toContain("expired");
+  });
+
+  it("P3: a length over 600 s is no input error — it becomes the model's longest; a list's long lengths are kept", async () => {
+    const t = await start({
+      server: fakeServer({ catalog: () => [{ ...VEO, supported_durations: [4, 8, 900] }] }),
+    });
+    // 900 s at $0.12 is over the default $50 a day.
+    t.app.media!.settings.set(videoOn({ dailyCostLimitUsd: 1000 }));
+    const r = await t.app.media!.tools.run("video", await t.scopeOf(), { prompt: "강", durationSec: 601 });
+    expect(r).toMatchObject({ ok: true, output: { durationSec: 900 } });
+    const s = await t.app.media!.tools.run("video", await t.scopeOf(), { prompt: "강", durationSec: 5000 });
+    expect(s).toMatchObject({ ok: true, output: { durationSec: 900 } });
   });
 });

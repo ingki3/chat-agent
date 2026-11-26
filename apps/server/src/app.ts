@@ -728,7 +728,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         ? () => undefined
         : config.fakeRuntime
           ? // The e2e server: a scripted probe beside its scripted OpenRouter (no program runs).
-            () => fixtureVideoProbe()
+            () => fixtureVideoProbe(config.dataDir)
           : () => sandboxedVideoProbe({ dataDir: config.dataDir, ffmpegPath: config.audioFfmpeg }));
     const video = new VideoJobs({
       db: opts.db!,

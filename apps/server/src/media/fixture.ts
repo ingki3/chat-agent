@@ -11,6 +11,7 @@ import {
   SPEECH_PRICING_URL,
 } from "./openrouter.js";
 import { makeSpeechWorkdir, type Measured, type SpeechAudio } from "./speech-audio.js";
+import { KNOWN_GOOD_MP4 } from "./video-probe.js";
 
 /**
  * A scripted OpenRouter for the e2e run and manual testing with FAKE_RUNTIME=1 (#238): the server never reaches
@@ -216,27 +217,8 @@ export const FIXTURE_VIDEO_COST = 0.3;
 /** In a video prompt: the scripted job fails (`failed`, its error naming moderation). */
 export const FIXTURE_VIDEO_FAIL_MARK = "FIXTURE-VIDEO-FAIL";
 
-/**
- * A tiny ISO BMFF file of the MP4 form (an `ftyp` of brand `isom`, an empty `moov` and `mdat`): what the scripted
- * probe takes. It holds no frames — a browser may not play it (the card then offers the download).
- */
-export function fixtureMp4(): Buffer {
-  const box = (type: string, body: Buffer) => {
-    const head = Buffer.alloc(8);
-    head.writeUInt32BE(8 + body.length, 0);
-    head.write(type, 4, "latin1");
-    return Buffer.concat([head, body]);
-  };
-  const ftyp = box(
-    "ftyp",
-    Buffer.concat([
-      Buffer.from("isom", "latin1"),
-      Buffer.from([0, 0, 2, 0]),
-      Buffer.from("isomiso2mp41", "latin1"),
-    ]),
-  );
-  return Buffer.concat([ftyp, box("moov", Buffer.alloc(0)), box("mdat", Buffer.alloc(16))]);
-}
+/** The scripted video jobs' result: a real, playable MP4 (`KNOWN_GOOD_MP4` — 1 s of VP9, about 1 KB). */
+export const fixtureMp4 = (): Buffer => Buffer.from(KNOWN_GOOD_MP4);
 
 /**
  * The scripted video jobs (#238 stage 3): `POST /videos` answers 202 with a `gen-vid-…` id; each poll moves the job on

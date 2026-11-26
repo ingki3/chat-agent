@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { MediaCatalog, MediaKind, MediaModel } from "@agentlee/shared";
 import { carriesSecret } from "../secrets/egress.js";
+import { videoRates } from "./cost.js";
 
 /**
  * The OpenRouter reads of 미디어 생성 stage 1 (#238): the key check and the per-kind model catalogs. Same rules as
@@ -288,7 +289,10 @@ function parseEntry(kind: MediaKind, e: Json): MediaModel | null {
     return {
       id,
       name,
-      price: priceText(e.pricing_skus, (k) => k.replace(/^per-/, "")) ?? priceText(e.pricing),
+      price:
+        videoPriceText(e.pricing_skus) ??
+        priceText(e.pricing_skus, (k) => k.replace(/^per-/, "")) ??
+        priceText(e.pricing),
       options: options.map((o) => clip(o)),
       maxDurationSec: durations.length ? Math.max(...durations) : null,
     };
@@ -320,6 +324,24 @@ function parseEntry(kind: MediaKind, e: Json): MediaModel | null {
     options: [...(vectorOnly ? [VECTOR_ONLY_NOTE] : []), ...optionTexts(e.supported_parameters)].slice(0, 12),
     ...(vectorOnly ? { vectorOnly: true } : {}),
   };
+}
+
+/**
+ * A video model's per-second prices as the list shows them (#238 stage 3, review r1): "$0.12/초, $0.3/초 (4k)" —
+ * USD per second whatever the SKU's own unit (cents are divided by 100), the highest per tier, at most 4.
+ */
+export function videoPriceText(skus: unknown): string | null {
+  const byTier = new Map<string, number>();
+  for (const r of videoRates(skus)) {
+    const k = r.tier ?? "";
+    byTier.set(k, Math.max(byTier.get(k) ?? 0, r.usdPerSec));
+  }
+  const texts = [...byTier]
+    .filter(([, v]) => v > 0)
+    .sort(([a], [b]) => (a === "" ? -1 : b === "" ? 1 : a.localeCompare(b, "en", { numeric: true })))
+    .slice(0, 4)
+    .map(([tier, v]) => `${usd(v)}/초${tier ? ` (${clip(tier, 10)})` : ""}`);
+  return texts.length ? texts.join(", ") : null;
 }
 
 /** Raster formats this server stores (`output_format` values as OpenRouter names them). */

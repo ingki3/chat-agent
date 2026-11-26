@@ -32,6 +32,12 @@ export const VIDEO_LIMITS = {
   maxResolutionP: 1080,
   /** The resolution asked for when it is supported (else the lowest supported one). */
   defaultResolution: "720p",
+  /**
+   * The longest length a request or a model's list may name (a sanity bound of the input only — review r1: the
+   * admin's default length has its own limit, `MEDIA_LIMITS.videoMaxSec`; what is asked for becomes the model's
+   * nearest listed length).
+   */
+  requestMaxSec: 86_400,
   /** The aspect ratio asked for when the user names none and the model lists it. */
   defaultAspectRatio: "16:9",
 } as const;
@@ -170,6 +176,8 @@ export const VIDEO_JOB_ERRORS: Record<string, string> = {
   video_job_changed: "그사이 카드가 바뀌었어요. 새 내용을 확인하고 다시 눌러 주세요.",
   video_estimate_changed:
     "그사이 모델 가격이 올라 예상 최대 비용을 새로 고쳤어요. 확인하고 다시 승인해 주세요(아직 보내지 않았어요).",
+  video_card_refreshed:
+    "그사이 모델의 소리 기본값이 바뀌어 카드를 새로 고쳤어요. 확인하고 다시 승인해 주세요(아직 보내지 않았어요).",
   video_job_expired: "이 카드는 만료됐어요. 다시 요청해 주세요.",
   video_probe_unavailable:
     "이 서버에 ffprobe가 없어 받은 영상을 확인할 수 없어서 보내지 않았어요. 관리자에게 ffmpeg(ffprobe 포함) 설치를 부탁하세요.",

@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { VIDEO_ENDED, VIDEO_JOB_CODE_TEXT, VideoJob, VideoJobRefusal } from "@agentlee/shared";
 import { ApiError, errorText, files, videoJobs } from "../api.js";
-import { audioText, canPlayMp4, newestJob, usdText, VIDEO_STATUS_TEXT } from "./video-card.js";
+import { audioText, canPlayMp4, newestJob, usdText, VIDEO_STATUS_TEXT, videoPollMs } from "./video-card.js";
 
 const key = (id: string) => ["video-job", id] as const;
 
@@ -30,8 +30,10 @@ function useVideoJob(id: string) {
     queryFn: () => videoJobs.get(id),
     structuralSharing: (old: unknown, next: unknown) =>
       newestJob(old as VideoJob | undefined, next as VideoJob),
+    // Review r1: a card waiting for approval is read again now and then (another tab, the admin's change, its
+    // expiry); a running job without a live stream (no EventSource, or it failed) is polled until it ends.
     refetchInterval: (query) =>
-      polling && query.state.data && !VIDEO_ENDED.has(query.state.data.status) ? 5000 : false,
+      videoPollMs(query.state.data?.status, polling, typeof EventSource !== "undefined"),
     retry: (n, e) => !(e instanceof ApiError && (e.status === 403 || e.status === 404)) && n < 2,
   });
   const status = q.data?.status;
@@ -68,7 +70,10 @@ export function VideoCard({ jobId }: { jobId: string }) {
     const body = e instanceof ApiError ? VideoJobRefusal.safeParse(e.body) : undefined;
     if (body?.success && body.data.job) qc.setQueryData<VideoJob>(key(jobId), body.data.job);
     const changed =
-      e instanceof ApiError && (e.code === "video_job_changed" || e.code === "video_estimate_changed");
+      e instanceof ApiError &&
+      (e.code === "video_job_changed" ||
+        e.code === "video_estimate_changed" ||
+        e.code === "video_card_refreshed");
     setNotice(changed ? { kind: "changed", error: e } : { kind: "error", error: e });
   };
   const approve = useMutation({

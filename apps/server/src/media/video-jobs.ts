@@ -120,7 +120,11 @@ export type VideoJobsOptions = {
   settings: Pick<MediaSettingsStore, "get" | "revision">;
   budget: Pick<MediaBudget, "allowsMicros">;
   usage:
-    Pick<UsageStore, "reserveMedia" | "settleMedia" | "releaseMedia" | "unconfirmVideoMedia"> | undefined;
+    | Pick<
+        UsageStore,
+        "reserveMedia" | "settleMedia" | "releaseMedia" | "releaseVideoMedia" | "unconfirmVideoMedia"
+      >
+    | undefined;
   users: Pick<UserStore, "byId">;
   notifications: () => VideoNotify | undefined;
   /** While the previous process's media reservations are not taken up, nothing is approved (`video_recovering`). */
@@ -151,6 +155,8 @@ const DEFAULTS: Limits = {
 };
 
 const ACTIVE = [...VIDEO_ACTIVE] as VideoJobStatus[];
+/** A submit OpenRouter refused before it was billed (4xx, or refused here): its bound is released. */
+const REFUSED: readonly VideoJobCode[] = ["video_rejected", "video_payment", "video_rate_limited"];
 const POLLED: VideoJobStatus[] = ["pending", "in_progress", "downloading"];
 const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 /** A poll answer is small (ids, URLs, usage); anything bigger is not read. */
@@ -176,8 +182,14 @@ export class VideoJobs {
   /** When each polled job is due next, and its backoff. */
   private readonly due = new Map<string, { at: number; failures: number }>();
   private readonly streams = new Set<() => void>();
-  /** Job ids of conversations being deleted (between the delete's transaction and its end). */
-  private deleting: string[] = [];
+  /**
+   * Job ids of a conversation being deleted, by conversation (review r1: only a delete that committed — its
+   * `onDeleted` — stops them; a rolled-back delete's entry is replaced by the next delete of that conversation and
+   * never reaches another conversation's).
+   */
+  private readonly deleting = new Map<string, string[]>();
+  /** Until when the probe's readiness (a known-good MP4 checked in the sandbox) holds (review r1, P1). */
+  private probeOkUntil = 0;
   private timer: NodeJS.Timeout | undefined;
   private running = false;
   private stopping = false;
@@ -196,13 +208,16 @@ export class VideoJobs {
         .from(videoJobs)
         .where(eq(videoJobs.conversationId, conversationId))
         .all();
-      for (const r of rows) {
+      for (const r of rows)
         if (VIDEO_ACTIVE.has(r.status) && r.usageKey) this.o.usage?.unconfirmVideoMedia(r.usageKey);
-        this.deleting.push(r.id);
-      }
+      this.deleting.set(
+        conversationId,
+        rows.map((r) => r.id),
+      );
     });
-    o.conversations.onDeleted(() => {
-      const ids = this.deleting.splice(0);
+    o.conversations.onDeleted((c) => {
+      const ids = this.deleting.get(c.id) ?? [];
+      this.deleting.delete(c.id);
       for (const id of ids) {
         this.stops.get(id)?.abort();
         this.due.delete(id);
@@ -556,8 +571,12 @@ export class VideoJobs {
     if (row.status !== "awaiting_approval" || row.version !== version)
       throw new VideoError("video_job_changed", 409, row);
     if (this.o.recovering?.()) throw new VideoError("video_recovering", 503);
-    // Review item 8: ffprobe must be here before anything is paid (else a paid video could never be checked).
-    if (!this.o.probe()) throw new VideoError("video_probe_unavailable", 503);
+    // Review item 8 and r1 (P1): ffprobe must really work here — a known-good MP4 checked in the same sandbox —
+    // before anything is paid (else a paid video could never be checked).
+    if (!(await this.probeReady())) throw new VideoError("video_probe_unavailable", 503);
+    const allowed = () =>
+      stillAllowed() && !!this.o.users.byId(userId)?.active && this.get(id)?.ownerId === userId;
+    if (!allowed()) throw new VideoError("forbidden", 403);
     const key = this.o.keys.resolve();
     if (!key) throw new VideoError("video_job_expired", 409, this.expire(row, "video_settings_changed"));
     let record: VideoRecord | undefined;
@@ -566,21 +585,25 @@ export class VideoJobs {
     } catch {
       throw new VideoError("video_lookup_failed", 502);
     }
+    // Review r1: the session, the account and the ownership again — before any branch below changes or shows the card.
+    if (!allowed()) throw new VideoError("forbidden", 403);
     row = this.owned(id, userId);
     if (row.status !== "awaiting_approval" || row.version !== version)
       throw new VideoError(row.status === "expired" ? "video_job_expired" : "video_job_changed", 409, row);
     const plan = record ? replanVideo(record, row) : null;
     if (!plan || isPlanError(plan))
       throw new VideoError("video_job_expired", 409, this.expire(row, "video_options_changed"));
-    if (plan.micros > row.estimateMicros) {
-      // Dearer now: the card shows the new bound (version + 1) and is approved again — nothing is sent.
+    if (plan.micros > row.estimateMicros || plan.audio !== (row.audio ?? null)) {
+      // Dearer now, or the model's default for sound changed (review r1): the card shows the new bound and sound
+      // (version + 1) and is approved again — nothing is sent.
       const r = this.write(
         id,
         ["awaiting_approval"],
-        { estimateMicros: plan.micros, audio: plan.audio },
+        { estimateMicros: Math.max(plan.micros, row.estimateMicros), audio: plan.audio },
         version,
       );
-      throw new VideoError(r ? "video_estimate_changed" : "video_job_changed", 409, r ?? this.get(id));
+      const code = plan.micros > row.estimateMicros ? "video_estimate_changed" : "video_card_refreshed";
+      throw new VideoError(r ? code : "video_job_changed", 409, r ?? this.get(id));
     }
     const body = withMediaPolicy({
       model: row.model,
@@ -605,7 +628,7 @@ export class VideoJobs {
     const fresh = this.owned(id, userId);
     if (fresh.status !== "awaiting_approval" || fresh.version !== version)
       throw new VideoError("video_job_changed", 409, fresh);
-    if (!stillAllowed() || !this.o.users.byId(userId)?.active) throw new VideoError("forbidden", 403);
+    if (!allowed()) throw new VideoError("forbidden", 403);
     const stale = this.stale(fresh, at);
     if (stale) throw new VideoError("video_job_expired", 409, this.expire(fresh, stale));
     if (this.o.recovering?.()) throw new VideoError("video_recovering", 503);
@@ -680,6 +703,21 @@ export class VideoJobs {
     }
   }
 
+  /** The probe is here and works (`VideoProbe.ready`); an `ok` holds for 10 minutes, a failure is asked again. */
+  private async probeReady(): Promise<boolean> {
+    const probe = this.o.probe();
+    if (!probe) return false;
+    if (this.now() < this.probeOkUntil) return true;
+    let ok: boolean;
+    try {
+      ok = await probe.ready();
+    } catch {
+      ok = false;
+    }
+    if (ok) this.probeOkUntil = this.now() + 10 * 60_000;
+    return ok;
+  }
+
   private async submit(
     id: string,
     usageKey: string,
@@ -699,10 +737,9 @@ export class VideoJobs {
       const status = e instanceof MediaHttpError ? e.status : 0;
       // Refused here before sending (-1), or by OpenRouter with a 4xx (not billed): the bound goes.
       if (status === -1 || (status >= 400 && status < 500)) {
-        this.usageWrite(id, () => this.o.usage?.releaseMedia(usageKey));
         const code: VideoJobCode =
           status === 402 ? "video_payment" : status === 429 ? "video_rate_limited" : "video_rejected";
-        return this.fail(id, code, { released: true }) ?? this.get(id);
+        return this.fail(id, code, { release: usageKey }) ?? this.get(id);
       }
       // No answer, a timeout or a 5xx: it may have started and may bill — never sent again, its bound stays.
       return this.fail(id, "video_unconfirmed") ?? this.get(id);
@@ -760,12 +797,8 @@ export class VideoJobs {
       .where(inArray(videoJobs.status, POLLED))
       .all())
       this.due.set(r.id, { at: this.now(), failures: 0 });
-    for (const r of this.o.db
-      .select()
-      .from(videoJobs)
-      .where(and(inArray(videoJobs.status, ["done", "failed"]), sql`${videoJobs.notifiedAt} IS NULL`))
-      .all())
-      if (r.approvedAt !== null) this.notify(r);
+    this.releaseRefused();
+    this.notifyMissing();
     this.timer = setInterval(() => void this.tick(), this.limits.tickMs);
     this.timer.unref();
     void this.tick();
@@ -793,9 +826,12 @@ export class VideoJobs {
       .from(videoJobs)
       .where(eq(videoJobs.status, "awaiting_approval"))
       .all()) {
+      // Review r1 (P3): a card whose settings, model or key changed expires now too (the open card hears it).
       const stale = this.stale(r, at);
-      if (stale === "video_card_expired") this.expire(r, stale);
+      if (stale) this.expire(r, stale);
     }
+    this.releaseRefused();
+    this.notifyMissing();
     const started: Promise<void>[] = [];
     for (const r of this.o.db.select().from(videoJobs).where(inArray(videoJobs.status, POLLED)).all()) {
       if (this.busy.has(r.id)) continue;
@@ -836,6 +872,20 @@ export class VideoJobs {
   private async advance(row: VideoJobRow): Promise<void> {
     const stop = new AbortController();
     this.stops.set(row.id, stop);
+    // Review r1: the deadline holds while a job is handled too — a download, the check or a wait for the file lock
+    // past it is stopped (`video_timeout`; a cost already settled stays).
+    let late = false;
+    const deadline =
+      row.deadlineAt === null
+        ? undefined
+        : setTimeout(
+            () => {
+              late = true;
+              stop.abort();
+            },
+            Math.max(0, row.deadlineAt - this.now()),
+          );
+    deadline?.unref();
     try {
       const url = row.remoteId ? videoStatusUrl(row.remoteId) : null;
       if (!url) {
@@ -865,8 +915,12 @@ export class VideoJobs {
       }
       if (stop.signal.aborted || !this.get(row.id)) return;
       const a = isObj(answer) ? answer : {};
+      // Review r1: an answer about another job is not this one's — neither its status nor its cost; asked again.
+      if (a.id !== row.remoteId) return this.backoff(row);
       const status = a.status;
-      this.due.set(row.id, { at: this.now() + this.limits.pollMs, failures: 0 });
+      // The failures in a row count on across a `completed` whose download is being retried (review r1).
+      const failures = status === "completed" ? (this.due.get(row.id)?.failures ?? 0) : 0;
+      this.due.set(row.id, { at: this.now() + this.limits.pollMs, failures });
       if (status === "pending" || status === "in_progress") {
         const progress =
           typeof a.progress === "number" && Number.isFinite(a.progress)
@@ -894,8 +948,16 @@ export class VideoJobs {
       logEvent(this.o.log, "warn", "error", { videoJobId: row.id, err: e });
       this.backoff(row);
     } finally {
+      if (deadline) clearTimeout(deadline);
       if (this.stops.get(row.id) === stop) this.stops.delete(row.id);
+      if (late || this.pastDeadline(row.id)) this.fail(row.id, "video_timeout");
     }
+  }
+
+  /** Whether the job is still running and its deadline has passed. */
+  private pastDeadline(id: string): boolean {
+    const r = this.get(id);
+    return !!r && POLLED.includes(r.status) && r.deadlineAt !== null && this.now() >= r.deadlineAt;
   }
 
   /**
@@ -946,14 +1008,15 @@ export class VideoJobs {
       const file = path.join(workdir, "video.mp4");
       const got = await this.download(settled, url, apiKey, file, signal);
       if (signal.aborted || !this.get(row.id)) return;
-      if (got === "retry") return this.backoff(settled);
+      if (typeof got === "object" && "retry" in got) return this.backoff(settled, got.retryAfter);
       if (typeof got === "string") {
         this.fail(row.id, got);
         return;
       }
+      if (!("bytes" in got)) return;
       const probe = this.o.probe();
       const verdict = probe ? await probe.check(file, signal) : "failed";
-      if (signal.aborted || !this.get(row.id)) return;
+      if (signal.aborted || !this.get(row.id) || this.pastDeadline(row.id)) return;
       if (verdict !== "ok") {
         this.fail(row.id, verdict === "not_mp4" ? "video_not_mp4" : "video_store_failed");
         return;
@@ -975,7 +1038,7 @@ export class VideoJobs {
     apiKey: string,
     file: string,
     signal: AbortSignal,
-  ): Promise<{ bytes: number; sha256: string } | "retry" | VideoJobCode> {
+  ): Promise<{ bytes: number; sha256: string } | { retry: true; retryAfter?: number } | VideoJobCode> {
     let res: Response;
     try {
       res = await videoGet(url, {
@@ -986,7 +1049,11 @@ export class VideoJobs {
       });
     } catch (e) {
       const status = e instanceof MediaHttpError ? e.status : 0;
-      if (status === 409 || status === 429 || status >= 500 || status === 0) return "retry";
+      // Review r1: a 429's (or 503's) `Retry-After` is kept for the next try.
+      if (status === 409 || status === 429 || status >= 500 || status === 0)
+        return e instanceof MediaHttpError && e.retryAfterMs !== undefined
+          ? { retry: true, retryAfter: e.retryAfterMs }
+          : { retry: true };
       return "video_download_failed";
     }
     const max = this.limits.maxBytes;
@@ -1044,13 +1111,14 @@ export class VideoJobs {
         // Inside the file-write lock: the job is still this one, downloading, without a file.
         guard: () => {
           const r = this.get(row.id);
-          return !!r && r.status === "downloading" && r.fileId === null;
+          return !!r && r.status === "downloading" && r.fileId === null && !this.pastDeadline(row.id);
         },
         video: {
           jobId: row.id,
           commit: (f) => {
             const r = this.get(row.id);
-            if (!r || r.status !== "downloading" || r.fileId !== null) return false;
+            if (!r || r.status !== "downloading" || r.fileId !== null || this.pastDeadline(row.id))
+              return false;
             // No cost was reported: the bound stays for good (a settled one is left as it is).
             if (r.costMicros === null && r.usageKey) this.o.usage?.unconfirmVideoMedia(r.usageKey);
             return (
@@ -1074,6 +1142,8 @@ export class VideoJobs {
       // The job went (its conversation deleted) or changed under it: nothing is stored, nothing more to do.
       if (e instanceof FileAddCancelledError && !this.get(row.id)) return;
       if (e instanceof FileAddCancelledError && this.get(row.id)?.status !== "downloading") return;
+      // Past its deadline while waiting for the lock: the timeout (the caller's `finally`).
+      if (e instanceof FileAddCancelledError && this.pastDeadline(row.id)) return;
       this.fail(row.id, "video_store_failed");
       return;
     }
@@ -1093,25 +1163,47 @@ export class VideoJobs {
    * The job's end other than its video: failed with a fixed code; its bound stays (`unconfirmed`) unless a cost was
    * settled or it was released (a refusal before it was billed). Null when the job had already ended or is gone.
    */
-  private fail(id: string, code: VideoJobCode, o: { released?: boolean } = {}): VideoJobRow | null {
-    const r = this.o.db.$client.transaction(() => {
-      const row = this.get(id);
-      if (!row || !VIDEO_ACTIVE.has(row.status)) return null;
-      if (!o.released && row.usageKey && row.costMicros === null)
-        this.o.usage?.unconfirmVideoMedia(row.usageKey);
-      this.o.db
-        .update(videoJobs)
-        .set({
-          status: "failed",
-          errorCode: code,
-          endedAt: this.now(),
-          version: sql`${videoJobs.version} + 1`,
-          updatedAt: this.now(),
-        })
-        .where(eq(videoJobs.id, id))
-        .run();
-      return this.get(id) ?? null;
-    })();
+  private fail(id: string, code: VideoJobCode, o: { release?: string } = {}): VideoJobRow | null {
+    const end = (release: boolean) =>
+      this.o.db.$client.transaction(() => {
+        const row = this.get(id);
+        if (!row || !VIDEO_ACTIVE.has(row.status)) return null;
+        // Review r1: a refusal's bound goes in the same transaction as the job's end. Should that fail, the job ends
+        // anyway with its refusal code and its `video_job` row is released later (`releaseRefused`: every pass and
+        // at start); anything else keeps its bound for good unless a cost was settled.
+        if (o.release && release) this.o.usage?.releaseMedia(o.release);
+        else if (!o.release && row.usageKey && row.costMicros === null)
+          this.o.usage?.unconfirmVideoMedia(row.usageKey);
+        this.o.db
+          .update(videoJobs)
+          .set({
+            status: "failed",
+            errorCode: code,
+            endedAt: this.now(),
+            version: sql`${videoJobs.version} + 1`,
+            updatedAt: this.now(),
+          })
+          .where(eq(videoJobs.id, id))
+          .run();
+        return this.get(id) ?? null;
+      })();
+    let r: VideoJobRow | null = null;
+    let wrote = false;
+    for (const release of o.release ? [true, true, false] : [true, true]) {
+      try {
+        r = end(release);
+        wrote = true;
+        break;
+      } catch {
+        // tried again (a refusal's last try: the end alone)
+      }
+    }
+    if (!wrote)
+      logEvent(this.o.log, "error", "media.usage_failed", {
+        videoJobId: id,
+        mediaCode: "media_usage_failed",
+        mediaStep: o.release ? "release" : "settle",
+      });
     if (!r) return null;
     this.due.delete(id);
     this.changed(id);
@@ -1125,54 +1217,87 @@ export class VideoJobs {
     return r;
   }
 
-  /** A usage write of a job (the bound's release): tried twice, then logged for the operator. */
-  private usageWrite(id: string, fn: () => void): void {
-    for (let i = 0; i < 2; i++) {
+  /**
+   * The bounds of refused submits (402/429/4xx — never billed) still held because their release failed (review r1):
+   * released now. Every pass and at start.
+   */
+  private releaseRefused(): void {
+    const rows = this.o.db
+      .select({ usageKey: videoJobs.usageKey })
+      .from(videoJobs)
+      .where(
+        and(
+          eq(videoJobs.status, "failed"),
+          inArray(videoJobs.errorCode, [...REFUSED]),
+          sql`${videoJobs.usageKey} IS NOT NULL`,
+          sql`EXISTS (SELECT 1 FROM usage_records u WHERE u.run_id = ${videoJobs.usageKey}
+            AND u.purpose = 'media' AND u.media_settlement = 'video_job')`,
+        ),
+      )
+      .all();
+    for (const r of rows) {
       try {
-        fn();
-        return;
+        this.o.usage?.releaseVideoMedia(r.usageKey!);
       } catch {
-        // tried again
+        // tried again on the next pass
       }
     }
-    logEvent(this.o.log, "error", "media.usage_failed", {
-      videoJobId: id,
-      mediaCode: "media_usage_failed",
-      mediaStep: "release",
-    });
   }
 
-  /** The owner's notification of a job's end (once: `notified_at`, dedupe `video:<id>:end`). */
+  /**
+   * The owner's notification of a job's end — `notified_at` is written only once it is published (review r1: a publish
+   * that failed is tried again on the next pass and after a restart, with the same `dedupeKey video:<id>:end`, so it
+   * is never stored twice). A kind the owner turned off, or a publish the service refused for good (the account, the
+   * conversation gone), counts as done.
+   */
   private notify(row: VideoJobRow): void {
     if (row.status !== "done" && row.status !== "failed") return;
-    const claimed =
-      this.o.db
-        .update(videoJobs)
-        .set({ notifiedAt: this.now() })
-        .where(and(eq(videoJobs.id, row.id), sql`${videoJobs.notifiedAt} IS NULL`))
-        .run().changes === 1;
-    if (!claimed) return;
     const n = this.o.notifications();
+    if (!n) return;
     const kind = row.status === "done" ? "video_done" : "video_failed";
-    if (!n || !(n.wants?.(row.ownerId, kind) ?? true)) return;
-    const url = `/c/${row.conversationId}#m-${row.messageId}`;
-    const ref = { kind: "conversation", id: row.conversationId };
-    try {
-      n.publish(
-        row.ownerId,
-        kind === "video_done"
-          ? { kind, url, ref }
-          : {
-              kind,
-              reason: VIDEO_FAILURE_SHORT[(row.errorCode as VideoJobCode | null) ?? "video_failed"] ?? "실패",
-              url,
-              ref,
-            },
-        { dedupeKey: `video:${row.id}:end` },
-      );
-    } catch {
-      // the notification is best effort; the card says the same
+    if (n.wants?.(row.ownerId, kind) ?? true) {
+      const url = `/c/${row.conversationId}#m-${row.messageId}`;
+      const ref = { kind: "conversation", id: row.conversationId };
+      try {
+        n.publish(
+          row.ownerId,
+          kind === "video_done"
+            ? { kind, url, ref }
+            : {
+                kind,
+                reason:
+                  VIDEO_FAILURE_SHORT[(row.errorCode as VideoJobCode | null) ?? "video_failed"] ?? "실패",
+                url,
+                ref,
+              },
+          { dedupeKey: `video:${row.id}:end` },
+        );
+      } catch {
+        return;
+      }
     }
+    this.o.db
+      .update(videoJobs)
+      .set({ notifiedAt: this.now() })
+      .where(and(eq(videoJobs.id, row.id), sql`${videoJobs.notifiedAt} IS NULL`))
+      .run();
+  }
+
+  /** The ends of approved jobs whose notification is not published yet (start, every pass). */
+  private notifyMissing(): void {
+    for (const r of this.o.db
+      .select()
+      .from(videoJobs)
+      .where(
+        and(
+          inArray(videoJobs.status, ["done", "failed"]),
+          sql`${videoJobs.notifiedAt} IS NULL`,
+          sql`${videoJobs.approvedAt} IS NOT NULL`,
+        ),
+      )
+      .limit(50)
+      .all())
+      this.notify(r);
   }
 }
 

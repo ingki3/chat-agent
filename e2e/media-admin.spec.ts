@@ -461,14 +461,15 @@ test("stage 3: a video card is approved, follows its job and plays the video in 
   await expect(card.getByTestId("video-card-cost")).toHaveText("$0.30");
   const download = card.getByTestId("video-card-download");
   await expect(download).toContainText(/video-.*\.mp4/);
-  // The player — or, where the browser cannot play it (no MP4 support, or a file it cannot decode: the fixture's MP4
-  // holds no frames), the download only.
+  // The player: the fixture's result is a real MP4 (1 s of VP9) — the browser reads its header from the inline route.
   const player = card.getByTestId("video-card-video");
-  await expect(player.or(card.getByTestId("video-card-no-player"))).toBeVisible();
-  if (await player.count()) {
-    await expect(player).toHaveAttribute("controls", "");
-    expect(await player.getAttribute("src")).toMatch(/^\/api\/files\/[^/]+\/content\?inline=1$/);
-  }
+  await expect(player).toHaveAttribute("controls", "");
+  expect(await player.getAttribute("src")).toMatch(/^\/api\/files\/[^/]+\/content\?inline=1$/);
+  await expect
+    .poll(() => player.evaluate((el: HTMLVideoElement) => (el.error ? -1 : el.readyState)), {
+      timeout: 10_000,
+    })
+    .toBeGreaterThanOrEqual(1);
   // Served inline: only because a video job checked and stored it.
   const href = (await download.getAttribute("href"))!;
   const inline = await page.request.get(`${href}?inline=1`);

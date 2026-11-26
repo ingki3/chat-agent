@@ -1,4 +1,4 @@
-import type { PublicPart, VideoJob, VideoJobStatus } from "@agentlee/shared";
+import { VIDEO_ENDED, type PublicPart, type VideoJob, type VideoJobStatus } from "@agentlee/shared";
 
 /**
  * The video card's pure parts (#238 stage 3): where a `video_generate` card is in a reply, which of two job states is
@@ -63,4 +63,19 @@ export function canPlayMp4(): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * How often the card reads its job again (review r1): never once it has ended; a card waiting for approval every 30 s
+ * (another tab's action, the admin's change, its expiry); a running job every 5 s when it has no live stream — the
+ * browser has no `EventSource`, or the stream failed — else not at all (the stream brings every change).
+ */
+export function videoPollMs(
+  status: VideoJobStatus | undefined,
+  streamFailed: boolean,
+  hasEventSource: boolean,
+): number | false {
+  if (!status || VIDEO_ENDED.has(status)) return false;
+  if (status === "awaiting_approval") return 30_000;
+  return streamFailed || !hasEventSource ? 5000 : false;
 }

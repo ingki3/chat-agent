@@ -22,7 +22,39 @@ import { decodeVerdict, makeScratchDir, speechTools, sweepScratch } from "./spee
  * the engine's start).
  */
 export type VideoProbeVerdict = "ok" | "not_mp4" | "failed";
-export type VideoProbe = { check(file: string, signal?: AbortSignal): Promise<VideoProbeVerdict> };
+export type VideoProbe = {
+  check(file: string, signal?: AbortSignal): Promise<VideoProbeVerdict>;
+  /**
+   * Review r1 (P1): whether the check really works here — `check` run, in the same sandbox, on a known-good MP4
+   * (`KNOWN_GOOD_MP4`) in a fresh working folder, and it says `ok`. A sandbox that cannot start, an ffprobe that cannot
+   * read MP4: false (then nothing is approved).
+   */
+  ready(signal?: AbortSignal): Promise<boolean>;
+};
+
+/**
+ * A known-good MP4 (1 s, 64×36, VP9 in ISO BMFF, brand `isom`, made once with ffmpeg 8 and no metadata): what the
+ * readiness check probes — and what the e2e fixture serves (a browser plays VP9 in MP4).
+ */
+export const KNOWN_GOOD_MP4 = Buffer.from(
+  [
+    "AAAAHGZ0eXBpc29tAAACAGlzb21pc28ybXA0MQAAAzptb292AAAAbG12aGQAAAAAAAAAAAAAAAAAAAPoAAAD6AABAAABAAAAAAAA",
+    "AAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAACZXRy",
+    "YWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAEAAAAAAAAD6AAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAA",
+    "AAAAAAAAAEAAAAAAQAAAACQAAAAAACRlZHRzAAAAHGVsc3QAAAAAAAAAAQAAA+gAAAAAAAEAAAAAAd1tZGlhAAAAIG1kaGQAAAAA",
+    "AAAAAAAAAAAAACgAAAAoAFXEAAAAAAAtaGRscgAAAAAAAAAAdmlkZQAAAAAAAAAAAAAAAFZpZGVvSGFuZGxlcgAAAAGIbWluZgAA",
+    "ABR2bWhkAAAAAQAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAABAAAADHVybCAAAAABAAABSHN0YmwAAACoc3RzZAAAAAAA",
+    "AAABAAAAmHZwMDkAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAQAAkAEgAAABIAAAAAAAAAAEYTGF2YzYyLjExLjEwMCBsaWJ2cHgt",
+    "dnA5AAAAAAAAAAAY//8AAAAUdnBjQwEAAAAACoICAgIAAAAAAApmaWVsAQAAAAAQcGFzcAAAAAEAAAABAAAAFGJ0cnQAAAAAAABO",
+    "IAAAAAAAAAAYc3R0cwAAAAAAAAABAAAACgAABAAAAAAUc3RzcwAAAAAAAAABAAAAAQAAABxzdHNjAAAAAAAAAAEAAAABAAAACgAA",
+    "AAEAAAA8c3RzegAAAAAAAAAAAAAACgAAACoAAAAPAAAADwAAAA8AAAAPAAAADwAAAA8AAAAPAAAADwAAAA8AAAAUc3RjbwAAAAAA",
+    "AAABAAADZgAAAGF1ZHRhAAAAWW1ldGEAAAAAAAAAIWhkbHIAAAAAAAAAAG1kaXJhcHBsAAAAAAAAAAAAAAAALGlsc3QAAAAkqXRv",
+    "bwAAABxkYXRhAAAAAQAAAABMYXZmNjIuMy4xMDAAAAAIZnJlZQAAALltZGF0gkmDQgAD8AI2ADgkHBhCAAAwYAAAE7//9AMAAEf/",
+    "///U4h/////VDgAAhgBAkpwASUAAAyAAAFRwhgBAkpwASsAAAyAAAFRwhgBAkpwAScAAAyAAAFRwhgBAkpwASKAAAyAAAFRwhgBA",
+    "kpwAR4AAAyAAAFRwhgBAkpwARuAAAyAAAFRwhgBAkpwARkAAAyAAAFRwhgBAkpwARcAAAyAAAFRwhgBAkpwARUAAAyAAAFRw",
+  ].join(""),
+  "base64",
+);
 
 export const MP4_BRANDS: ReadonlySet<string> = new Set([
   "isom",
@@ -130,7 +162,8 @@ export function sandboxedVideoProbe(o: {
   const tools = speechTools(o.ffmpegPath, o.dataDir, o.platform);
   if (!tools) return undefined;
   const run = o.run ?? runIsolated;
-  return {
+  const probe: VideoProbe = {
+    ready: (signal) => readyOf(probe, o.dataDir, signal),
     async check(file, signal) {
       const st = fs.lstatSync(file, { throwIfNoEntry: false });
       if (!st?.isFile() || st.nlink !== 1) return "failed";
@@ -149,14 +182,31 @@ export function sandboxedVideoProbe(o: {
       return v === "ok" ? judgeVideoProbe(r.stdout) : "not_mp4";
     },
   };
+  return probe;
+}
+
+/** `ready` of a probe: `KNOWN_GOOD_MP4` checked in a fresh working folder of `video-scratch` (removed after). */
+async function readyOf(probe: VideoProbe, dataDir: string, signal?: AbortSignal): Promise<boolean> {
+  let dir: string | undefined;
+  try {
+    dir = makeVideoWorkdir(dataDir);
+    const file = path.join(dir, "ready.mp4");
+    fs.writeFileSync(file, KNOWN_GOOD_MP4, { flag: "wx", mode: 0o600 });
+    return (await probe.check(file, signal)) === "ok";
+  } catch {
+    return false;
+  } finally {
+    if (dir) removeVideoWorkdir(dir);
+  }
 }
 
 /**
  * The FAKE_RUNTIME (e2e) and test probe — no program runs: the file's first box must be `ftyp` with an MP4 brand, and
  * a `moov` box must follow somewhere (the fixture's tiny MP4 has one; a real decoder is not modelled).
  */
-export function fixtureVideoProbe(): VideoProbe {
-  return {
+export function fixtureVideoProbe(dataDir?: string): VideoProbe {
+  const probe: VideoProbe = {
+    ready: (signal) => (dataDir ? readyOf(probe, dataDir, signal) : Promise.resolve(true)),
     async check(file) {
       let b: Buffer;
       try {
@@ -169,4 +219,5 @@ export function fixtureVideoProbe(): VideoProbe {
       return MP4_BRANDS.has(brand) && b.includes("moov", 0, "latin1") ? "ok" : "not_mp4";
     },
   };
+  return probe;
 }

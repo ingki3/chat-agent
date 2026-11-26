@@ -348,6 +348,20 @@ export class UsageStore {
       .run();
   }
 
+  /** #238 stage 3: a refused video submit's bound (never billed) — only while it is still the job's (`video_job`). */
+  releaseVideoMedia(runKey: string): void {
+    this.db
+      .delete(usageRecords)
+      .where(
+        and(
+          eq(usageRecords.runId, runKey),
+          eq(usageRecords.purpose, "media"),
+          eq(usageRecords.mediaSettlement, "video_job"),
+        ),
+      )
+      .run();
+  }
+
   /** One more cost lookup that found nothing (the settler's backoff counts these). */
   triedMedia(runKey: string, tries: number): void {
     this.db
