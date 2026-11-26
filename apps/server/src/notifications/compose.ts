@@ -83,7 +83,11 @@ export type PublishInput =
    */
   | { kind: "video_done"; url: string; ref?: ResourceRefInput }
   /** 영상 생성 failed, timed out or was not confirmed: a fixed reason only. */
-  | { kind: "video_failed"; reason: string; url: string; ref?: ResourceRefInput };
+  | { kind: "video_failed"; reason: string; url: string; ref?: ResourceRefInput }
+  /** 멀티미디어 합성 (#238 stage 4): the composed video is in its card. Fixed words only — never the timeline's texts. */
+  | { kind: "compose_done"; url: string; ref?: ResourceRefInput }
+  /** 멀티미디어 합성 failed, timed out or was interrupted: a fixed reason only. */
+  | { kind: "compose_failed"; reason: string; url: string; ref?: ResourceRefInput };
 
 export type ResourceRefInput = { kind: string; id: string };
 
@@ -297,6 +301,20 @@ export function compose(input: PublishInput): Composed {
         kind: input.kind,
         title: "영상 생성",
         body: oneLine(`영상을 만들지 못했어요 — ${oneLine(input.reason, 40)}`, LINE_MAX),
+        url: safePath(input.url),
+      };
+    case "compose_done":
+      return {
+        kind: input.kind,
+        title: "영상 합성",
+        body: "합성한 영상이 완성됐어요. 눌러서 대화에서 보세요.",
+        url: safePath(input.url),
+      };
+    case "compose_failed":
+      return {
+        kind: input.kind,
+        title: "영상 합성",
+        body: oneLine(`영상을 합성하지 못했어요 — ${oneLine(input.reason, 40)}`, LINE_MAX),
         url: safePath(input.url),
       };
     case "dreaming_failed":

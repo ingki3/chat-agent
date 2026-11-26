@@ -36,6 +36,10 @@ export const NotificationKind = z.enum([
   "video_done",
   /** 영상 생성 failed, timed out or was not confirmed — a fixed reason, never the prompt. */
   "video_failed",
+  /** 멀티미디어 합성 (#238 stage 4): the composed video is ready — a fixed line, never the timeline's texts. */
+  "compose_done",
+  /** 멀티미디어 합성 failed, timed out or was interrupted — a fixed reason only. */
+  "compose_failed",
 ]);
 export type NotificationKind = z.infer<typeof NotificationKind>;
 
@@ -75,6 +79,9 @@ export const NotificationPrefs = z
     /** 영상 생성 notifications (#238 stage 3): "완성" and "실패" — on unless off. */
     videoDone: z.boolean().optional(),
     videoFailed: z.boolean().optional(),
+    /** 멀티미디어 합성 notifications (#238 stage 4): "완성" and "실패" — on unless off. */
+    composeDone: z.boolean().optional(),
+    composeFailed: z.boolean().optional(),
     /** The settings' revision (+1 on every write, #188 review 9) — in responses; ignored when saving. */
     rev: z.number().int().nonnegative().optional(),
   })
@@ -98,6 +105,8 @@ export const SaveNotificationPrefsRequest = z
     researchFailed: z.boolean(),
     videoDone: z.boolean(),
     videoFailed: z.boolean(),
+    composeDone: z.boolean(),
+    composeFailed: z.boolean(),
     /** A page may send back the revision it read; it is ignored (the server counts). */
     rev: z.number().int().nonnegative(),
   })

@@ -146,6 +146,8 @@ export const PREFS_FIELDS = {
   researchFailed: "stored",
   videoDone: "stored",
   videoFailed: "stored",
+  composeDone: "stored",
+  composeFailed: "stored",
   rev: "stored",
 } as const satisfies Record<keyof Prefs, "stored">;
 export const prefsFromGet = newer<Prefs>;

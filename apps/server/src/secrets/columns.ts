@@ -509,4 +509,23 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "video_jobs.file_id": ID,
   "video_jobs.error_code": ENUM,
   "video_jobs.lease_boot": { exempt: "a random process id the server made (the engine's lease)" },
+  // 멀티미디어 합성 (#238 stage 4, review R12): the timeline's subtitle texts are the user's — checked by the egress
+  // predicate at the call (a timeline carrying a known secret makes no job), scrubbed on write and again by the rescrub.
+  // The SRT and the WebVTT are made from this one column; `plan_json` holds no user text.
+  "compose_jobs.id": ID,
+  "compose_jobs.conversation_id": ID,
+  "compose_jobs.owner_id": ID,
+  "compose_jobs.message_id": ID,
+  "compose_jobs.run_id": ID,
+  "compose_jobs.status": ENUM,
+  "compose_jobs.timeline_json": {
+    write: "ComposeJobs.prepare (carriesSecret, scrubKnownDeep)",
+    rescrub: "deep",
+  },
+  "compose_jobs.plan_json": {
+    exempt: "numbers, fixed options and server-made file names worked out by the server (no user text)",
+  },
+  "compose_jobs.file_id": ID,
+  "compose_jobs.error_code": ENUM,
+  "compose_jobs.boot": { exempt: "a random process id the server made" },
 };

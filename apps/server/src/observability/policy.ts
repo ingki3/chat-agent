@@ -11,6 +11,7 @@ import {
   YOUTUBE_CODES,
   MEDIA_TOOL_CODES,
   VIDEO_JOB_CODES,
+  COMPOSE_JOB_CODES,
   NotificationKind,
   RuntimeId,
   SCHEDULE_PROPOSAL_CODES,
@@ -337,6 +338,8 @@ export const isDreamingCode = member(set(Object.keys(DREAMING_CODE_LABEL)));
 export const isResearchCode = member(set([...ResearchErrorCode.options, "stopped"]));
 /** Why a video job ended other than with its video (#238 stage 3, shared `VIDEO_JOB_CODES`). */
 export const isVideoCode = member(set(VIDEO_JOB_CODES));
+/** Why a composition ended without its video (#238 stage 4, shared `COMPOSE_JOB_CODES`). */
+export const isComposeCode = member(set(COMPOSE_JOB_CODES));
 /** Public artifact links (#204): what happened, from a fixed set — never the token, an IP or a title. */
 export const PUBLIC_LINK_CODES = set([
   "public_link_created",

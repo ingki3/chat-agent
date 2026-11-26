@@ -74,7 +74,18 @@ export type RunIsolatedOptions = SandboxPolicy & {
   signal?: AbortSignal;
   /** Tests only: replaces the `ps` measurement used by the monitor (given the job's pid). */
   probe?: (pid: number) => Promise<{ pid: number; rss: number }[]>;
+  /**
+   * Progress (#238 stage 4, review R6 — ffmpeg's `-progress pipe:1`): every complete stdout line is handed here as it
+   * comes, instead of being kept for the result (`stdout` is then empty). A line longer than `STDOUT_LINE_MAX` stops the
+   * child (`killed: "output"`); stderr still counts against `maxOutputBytes`. Every other limit is unchanged.
+   */
+  onStdoutLine?: (line: string) => void;
+  /** Tests: reports the peak resident memory measured (bytes) when the run ends. */
+  onPeakRss?: (bytes: number) => void;
 };
+
+/** One stdout line at most this long with `onStdoutLine`. */
+export const STDOUT_LINE_MAX = 64 * 1024;
 
 export type RunResult = {
   code: number | null;
@@ -238,7 +249,18 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
       if (settled) return;
       settled = true;
       done();
-      resolve({ code, signal, stdout: out + outDec.end(), stderr: err + errDec.end(), killed });
+      try {
+        o.onPeakRss?.(peak);
+      } catch {
+        // tests only
+      }
+      resolve({
+        code,
+        signal,
+        stdout: o.onStdoutLine ? "" : out + outDec.end(),
+        stderr: err + errDec.end(),
+        killed,
+      });
     };
     // `fork` only: the command is gone but its pipes are not closed — cut them and answer now (the time limit, a stop
     // and the drain deadline all end the call, whatever still holds the other end).
@@ -269,7 +291,23 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
       if (target === "out") out += outDec.write(chunk);
       else err += errDec.write(chunk);
     };
-    child.stdout.on("data", take("out"));
+    // With `onStdoutLine`: stdout goes out line by line and is not kept (nor counted against the output limit).
+    let line = "";
+    const lines = (chunk: Buffer) => {
+      if (killed || settled) return;
+      line += outDec.write(chunk);
+      for (let nl = line.indexOf("\n"); nl >= 0; nl = line.indexOf("\n")) {
+        const l = line.slice(0, nl);
+        line = line.slice(nl + 1);
+        try {
+          o.onStdoutLine!(l);
+        } catch {
+          // the caller's own problem
+        }
+      }
+      if (line.length > STDOUT_LINE_MAX) kill("output");
+    };
+    child.stdout.on("data", o.onStdoutLine ? lines : take("out"));
     child.stderr.on("data", take("err"));
     // The child may exit before reading its input (EPIPE): that is its failure, not the server's.
     child.stdin.on("error", () => {});
@@ -279,6 +317,7 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
     else o.signal?.addEventListener("abort", onAbort, { once: true });
 
     let sampling = false;
+    let peak = 0;
     const sample = async () => {
       if (sampling || killed || exited) return;
       sampling = true;
@@ -287,6 +326,7 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
         const me = procs.find((p) => p.pid === pid);
         // With children (`fork`): the whole group counts — yt-dlp and the deno it started together.
         const rss = o.fork ? procs.reduce((a, p) => a + p.rss, 0) : (me?.rss ?? 0);
+        if (me && rss * 1024 > peak) peak = rss * 1024;
         if (!me) {
           if (!exited) kill("monitor"); // running but not measurable → cannot enforce → stop
         } else if (rss * 1024 > o.maxRssBytes!) kill("memory");

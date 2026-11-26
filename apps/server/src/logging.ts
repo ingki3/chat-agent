@@ -54,6 +54,7 @@ import {
   isPublicLinkCode,
   isResearchCode,
   isVideoCode,
+  isComposeCode,
   isScheduleStatus,
   isScheduleStep,
   isScheduleTrigger,
@@ -127,6 +128,14 @@ export const LOG_EVENTS = [
   // A received outcome (refusal, accepted id, cost) the shutdown could not record within its time budget (#238
   // stage 3): the next start ends the job by the rows' own rule. The job's id only.
   "video.held_lost",
+  // compose_video (#238 stage 4): a job queued, started, done, failed — the job's id, IDs and a fixed code only (never
+  // the timeline's texts or a file name).
+  "compose.queued",
+  "compose.started",
+  "compose.done",
+  "compose.failed",
+  // The compose engine's readiness check (ffmpeg, ffprobe, the sandbox) failed — the outcome only.
+  "compose.unready",
   // python_run working folders left from the last process could not all be removed at start (#47; nothing else).
   "python.sweep_failed",
   // python_run account self-check (#47 round 2): the outcome only, no detail.
@@ -395,6 +404,9 @@ const FIELDS = new Map<string, Check>([
   /** 영상 생성 (#238 stage 3): the job's id and its fixed end code. */
   ["videoJobId", isId],
   ["videoCode", isVideoCode],
+  /** 멀티미디어 합성 (#238 stage 4): the job's id and its fixed end code. */
+  ["composeJobId", isId],
+  ["composeCode", isComposeCode],
 ]);
 
 /** Every key that may ever appear in a written record (tests and docs refer to it). */
@@ -686,6 +698,8 @@ export type LogFields = {
   researchCode?: string;
   videoJobId?: string;
   videoCode?: string;
+  composeJobId?: string;
+  composeCode?: string;
   /** A sandboxed worker kind (#122: extract, docgen, render), a failed self-check step, kinds not account-isolated. */
   workerKind?: string;
   workerStep?: string;

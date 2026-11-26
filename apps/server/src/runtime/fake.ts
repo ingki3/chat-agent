@@ -73,6 +73,8 @@ import {
  *   /image <prompt>   a real call of our `image_generate` (#238) with that prompt, and a short answer
  *   /speech <text>    a real call of our `speech_generate` (#238) with that text, and a short answer
  *   /video <prompt>   a real call of our `video_generate` (#238 stage 3) — its confirmation card — and a short answer
+ *   /compose <fileId> a real call of our `compose_video` (#238 stage 4): that image for 2 s with one subtitle, and a
+ *                     short answer pointing at the card
  *   /file-<scenario>   real calls of our file tools on the conversation's first upload (`fake-files.ts`: page12,
  *                     missing) and the scenario's answer with `[n]` markers (#48)
  *   /file-cite <fileId> <snippet>   one real `file_cite` of that id (e.g. another user's file) and a cited sentence
@@ -505,6 +507,21 @@ export const defaultScript: FakeScript = (input, memory) => {
       { text: "영상 확인 카드를 만들게요. " },
       { call: "video_generate", input: { prompt: video[1]!.trim() } },
       { text: "카드에서 길이와 예상 비용을 확인하고 승인해 주세요." },
+    ];
+  const compose = /^\/compose\s+(\S+)$/.exec(t);
+  if (compose)
+    return [
+      { text: "영상을 합성할게요. " },
+      {
+        call: "compose_video",
+        input: {
+          timeline: {
+            clips: [{ fileId: compose[1]!, durationSec: 2 }],
+            subtitles: [{ startSec: 0, endSec: 1.5, text: "첫 장면이에요" }],
+          },
+        },
+      },
+      { text: "카드에서 진행 상황을 확인해 주세요." },
     ];
   const chart = financeChartSteps(t);
   if (chart) return chart;

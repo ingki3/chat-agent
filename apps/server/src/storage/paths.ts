@@ -61,6 +61,8 @@ export function storagePaths(dataDir: string) {
     speechScratch: path.join(root, "speech-scratch"),
     /** `video_generate` downloads (#238 stage 3): `video-scratch/<uuid>`, removed when the job ends and at start. */
     videoScratch: path.join(root, "video-scratch"),
+    /** `compose_video` jobs (#238 stage 4): `compose-scratch/<job id>/{in,work,out}`, removed when the job ends and at start. */
+    composeScratch: path.join(root, "compose-scratch"),
     conversationFiles: (userId: string, conversationId: string) =>
       path.join(root, "files", assertSafeId("user", userId), assertSafeId("conversation", conversationId)),
     runtimeHome: (connectionId: string) =>

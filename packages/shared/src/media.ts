@@ -25,6 +25,8 @@ export const MEDIA_LIMITS = {
   dailyCostMaxUsd: 10_000,
   /** Calls one run may make per kind: the defaults (issue #238) and the largest the admin may set. */
   perRunDefaults: { image: 4, speech: 3, music: 1, video: 1 } as Record<MediaKind, number>,
+  /** Stage 4: `compose_video` calls per run (default). */
+  composePerRunDefault: 1,
   perRunMax: 50,
   /** Video length when the user names none (user decision 2026-11-24); longer only on request, up to the model. */
   videoDefaultSec: 8,
@@ -65,9 +67,21 @@ export const MediaSettings = z
       .positive()
       .max(MEDIA_LIMITS.dailyCostMaxUsd)
       .refine((n) => /^\d+(\.\d{1,2})?$/.test(String(n)), { message: "at most 2 decimals" }),
-    perRunLimits: z.object({ image: PerRun, speech: PerRun, music: PerRun, video: PerRun }),
+    perRunLimits: z.object({
+      image: PerRun,
+      speech: PerRun,
+      music: PerRun,
+      video: PerRun,
+      /** Stage 4 (#238): `compose_video` calls per run — defaulted when a stored row has none (review R9). */
+      compose: PerRun.default(MEDIA_LIMITS.composePerRunDefault),
+    }),
     /** Video length when the user asks for none (stage 3 enforces it). */
     videoDefaultSec: z.number().int().min(1).max(MEDIA_LIMITS.videoMaxSec),
+    /**
+     * Stage 4 (#238): 멀티미디어 합성 (`compose_video`) on this server — off by default (and when a stored row has no
+     * value: review R9). It needs no model or key (nothing leaves the server), only ffmpeg/ffprobe and the sandbox.
+     */
+    composeEnabled: z.boolean().default(false),
   })
   .strict();
 export type MediaSettings = z.infer<typeof MediaSettings>;
@@ -81,8 +95,9 @@ export const DEFAULT_MEDIA_SETTINGS: MediaSettings = {
     video: { enabled: false, model: null },
   },
   dailyCostLimitUsd: MEDIA_LIMITS.dailyCostDefaultUsd,
-  perRunLimits: { ...MEDIA_LIMITS.perRunDefaults },
+  perRunLimits: { ...MEDIA_LIMITS.perRunDefaults, compose: MEDIA_LIMITS.composePerRunDefault },
   videoDefaultSec: MEDIA_LIMITS.videoDefaultSec,
+  composeEnabled: false,
 };
 
 /** Where the OpenRouter key in use comes from: the admin's (saved here), `.env`, or none. */
@@ -121,6 +136,11 @@ export const MediaAdmin = z.object({
    * strictest moderation where it has one. Fixed policy, shown so the admin knows.
    */
   youthStrictModeration: z.literal(true),
+  /**
+   * Stage 4 (#238): whether 멀티미디어 합성 can run here — ffmpeg, ffprobe and the sandbox checked by a tiny composition
+   * (null: not checked yet). Shown next to its switch.
+   */
+  compose: z.object({ ready: z.boolean().nullable(), checkedAt: z.number().int().nullable() }).optional(),
 });
 export type MediaAdmin = z.infer<typeof MediaAdmin>;
 
@@ -275,6 +295,20 @@ export const MEDIA_TOOL_CODES = [
   "media_measure_failed",
   /** Stage 3: the model lists no length, or no resolution at most 1080p, this server can ask for. */
   "media_video_unsupported",
+  /** Stage 4 (`compose_video`): the admin's switch is off, or ffmpeg/ffprobe/the sandbox is not ready here. */
+  "compose_disabled",
+  /** Stage 4: a job of this user is waiting or running, or the queue is full (1 running, 3 waiting). */
+  "compose_busy",
+  /** Stage 4: the timeline does not hold (shape, limits, order, a transition on the last clip…) — `hint` says where. */
+  "compose_invalid_timeline",
+  /** Stage 4: a fileId that is not a file of this conversation (sent with an active message). */
+  "compose_input_missing",
+  /** Stage 4: a file of the wrong kind for its place (an image as narration, a webm, a video without sound…). */
+  "compose_input_kind",
+  /** Stage 4: a file this server could not copy or read (ffprobe). */
+  "compose_input_unreadable",
+  /** Stage 4: the result would be longer than 5 minutes (or the inputs over 2GB together). */
+  "compose_too_long",
 ] as const;
 export type MediaToolCode = (typeof MEDIA_TOOL_CODES)[number];
 
@@ -316,6 +350,19 @@ export const MEDIA_TOOL_HINTS: Partial<Record<MediaToolCode, string>> = {
     "만든 음성의 길이를 이 서버에서 확인하지 못해 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 잠시 뒤 다시 해 보거나 관리자에게 알려 주세요.",
   media_video_unsupported:
     "관리자가 고른 영상 모델이 이 서버가 쓰는 길이·해상도(1080p 이하)를 알려 주지 않아 만들 수 없어요. 관리자에게 다른 모델을 부탁하세요.",
+  compose_disabled:
+    "관리자가 멀티미디어 합성을 꺼 두었거나 이 서버에 ffmpeg·ffprobe가 준비되지 않았어요. 관리자에게 알려 주세요.",
+  compose_busy:
+    "이미 합성 중이거나 기다리는 영상이 있어요(한 사람 1개, 대기 3개까지). 카드에서 끝난 것을 확인한 뒤 다시 요청해 주세요.",
+  compose_invalid_timeline: "타임라인이 맞지 않아요. hint에 적힌 곳을 고쳐 다시 호출하세요.",
+  compose_input_missing:
+    "이 대화에 없는 파일이에요. file_list의 fileId(이 대화에서 보낸 파일·만든 파일)만 쓸 수 있어요.",
+  compose_input_kind:
+    "그 자리에 쓸 수 없는 파일 종류예요. 클립은 png·jpg·webp 이미지나 mp4·mov 영상, 나레이션·음악은 mp3·m4a·wav(또는 소리 있는 영상)만 돼요.",
+  compose_input_unreadable:
+    "입력 파일을 읽지 못했어요(손상됐거나 지원하지 않는 형식). 다른 파일로 해 보세요.",
+  compose_too_long:
+    "결과가 너무 길어요(최대 5분, 입력 합계 2GB). 클립이나 나레이션을 줄여 다시 요청해 주세요.",
   media_truncated:
     "음성이 제공자 쪽에서 중간에 끊겨 와서(더 잘게 나눠 다시 해도 끊김) 파일을 저장하지 않았어요. 이미 나간 비용은 기록됐어요. 글을 더 짧게 나눠 요청해 주세요.",
 };

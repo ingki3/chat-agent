@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { MEDIA_TOOL_LIMITS } from "@agentlee/shared";
+import { COMPOSE_LIMITS, ComposeTimeline, MEDIA_TOOL_LIMITS } from "@agentlee/shared";
 import type { ServerToolInfo } from "./index.js";
 
 /**
@@ -8,11 +8,12 @@ import type { ServerToolInfo } from "./index.js";
  * business (apps/server/src/media/generate.ts). Offered only while the kind is on (관리자 → 미디어 생성), to every
  * active account — youth accounts too, with the provider's strictest moderation where the model has one.
  */
-export type MediaToolInfo = ServerToolInfo & { kind: "image" | "speech" | "video" };
+export type MediaToolInfo = ServerToolInfo & { kind: "image" | "speech" | "video" | "compose" };
 
 /** The forbidden uses, the same for every account (#238 plan, user decision 2026-11-24). */
-const RULES =
-  "Call it ONLY when the user explicitly asked for this in the current request — never on your own initiative, never to illustrate an answer. Never: imitate or depict a real, identifiable person (a celebrity, a politician, a private person, a family member) or their voice; sexual or sexualized content of anyone; content that harasses, deceives (fake evidence, fake news, impersonation) or harms. Refuse such a request in your own words instead of calling. Each call costs money (the user's daily media budget): make one call per thing asked, never variations nobody asked for.";
+const FORBIDDEN =
+  "Call it ONLY when the user explicitly asked for this in the current request — never on your own initiative, never to illustrate an answer. Never: imitate or depict a real, identifiable person (a celebrity, a politician, a private person, a family member) or their voice; sexual or sexualized content of anyone; content that harasses, deceives (fake evidence, fake news, impersonation) or harms. Refuse such a request in your own words instead of calling.";
+const RULES = `${FORBIDDEN} Each call costs money (the user's daily media budget): make one call per thing asked, never variations nobody asked for.`;
 
 export const IMAGE_GENERATE_TOOL: MediaToolInfo = {
   name: "image_generate",
@@ -109,8 +110,22 @@ export const VIDEO_GENERATE_TOOL: MediaToolInfo = {
   },
 };
 
+/**
+ * Stage 4-1 (#238): one MP4 put together on this server from the conversation's own files (apps/server/src/media/
+ * compose-jobs.ts). Nothing leaves the server and nothing is paid: no confirmation card — the call queues a job.
+ */
+export const COMPOSE_VIDEO_TOOL: MediaToolInfo = {
+  name: "compose_video",
+  kind: "compose",
+  description: `Puts this conversation's own files together into ONE MP4 video on this server (no cost, nothing is sent anywhere): image and video clips in order — cuts, or a transition into the next clip —, narration audio placed at given times, background music (looped, faded, lowered under narration) and subtitles as a track the viewer can switch on and off (never burned in). Use only fileIds from file_list of this conversation: images png/jpg/webp, videos mp4/mov, audio mp3/m4a/wav (a video's own sound can be narration too). Limits: at most ${COMPOSE_LIMITS.maxClips} clips and ${COMPOSE_LIMITS.maxSeconds / 60} minutes in all, 720p or 1080p, 30 fps. An image clip needs durationSec; a transition's length must be shorter than both clips it joins; subtitles in order without overlap, within the video. If narration runs past the clips, the last frame is held. ${FORBIDDEN} (Putting the user's own files together does not make them yours to misuse: never assemble a video that passes off a real person's words or deeds, or fake evidence.) Call it once per video the user asked for. It returns at once with jobId and status (queued/running): the user follows the progress and watches the result in a card under your reply — tell them to check the card; never say the video is finished. A refusal's hint says what to fix.`,
+  input: {
+    timeline: ComposeTimeline.describe("The whole video: output, clips, narration, music, subtitles."),
+  },
+};
+
 export const MEDIA_TOOLS: readonly MediaToolInfo[] = [
   IMAGE_GENERATE_TOOL,
   SPEECH_GENERATE_TOOL,
   VIDEO_GENERATE_TOOL,
+  COMPOSE_VIDEO_TOOL,
 ];
