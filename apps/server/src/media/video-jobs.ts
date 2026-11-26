@@ -1072,7 +1072,8 @@ export class VideoJobs {
     // One loop from the start (review r11): every round (~200 ms) collects again every outcome held — handed over by
     // ended work, or still held by work under way (a submit's answer that came meanwhile included) — and writes it at
     // once, the lock wait cut to the time left for that one write; an outcome is let go only once its row reflects it.
-    // Until nothing is unrecorded and no submit is under way, or the budget ends.
+    // Until no work of any kind is under way any more — an aborted poll may still hand over a cost it had read
+    // (review r12) — and, after a round made once the last of it settled, nothing is unrecorded; or the budget ends.
     const unrecorded = new Set<string>();
     const round = () => {
       const held = new Map(this.handedOver);
@@ -1093,10 +1094,11 @@ export class VideoJobs {
         else unrecorded.add(id);
       }
     };
-    const submitting = () => [...this.inflight.values()].some((w) => w.kind === "submit");
     for (;;) {
+      // Whether every work had settled before this round: its outcomes are then all in it.
+      const settled = this.inflight.size === 0;
       round();
-      if (left() <= 0 || (!unrecorded.size && !submitting())) break;
+      if (left() <= 0 || (settled && !unrecorded.size)) break;
       await new Promise<void>((r) => setTimeout(r, Math.min(200, left())).unref());
     }
     // Still not recorded (the database not writable through the shutdown): the next start ends these jobs by the

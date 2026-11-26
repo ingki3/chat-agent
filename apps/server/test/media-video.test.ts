@@ -2938,3 +2938,70 @@ describe("video jobs — review r11 regressions (the stop records from its first
     expect(server.posts()).toHaveLength(2);
   }, 30_000);
 });
+
+// ---------------------------------------------------------------- review round 12 (#255)
+
+describe("video jobs — review r12 regressions (the stop ends only once every work settled)", () => {
+  for (const minutes of [0, 61])
+    it(`a cost an aborted poll had already read is recorded by the stop (restart after ${minutes} min keeps it)`, async () => {
+      let ctrl!: ReadableStreamDefaultController<Uint8Array>;
+      const body = new ReadableStream<Uint8Array>({
+        start(c) {
+          ctrl = c;
+        },
+      });
+      const clock = { t: Date.now() };
+      const res = new Response(body, { headers: { "content-type": "application/json" } });
+      const server = fakeServer({
+        poll: (id, n) => (n === 1 ? res : Response.json({ id, status: "completed", usage: { cost: 0.8 } })),
+      });
+      const inner = server.fetchImpl;
+      server.fetchImpl = (async (u: string | URL | Request, init?: RequestInit) => {
+        if (String(u) === videoStatusUrl(rid(1)))
+          init?.signal?.addEventListener(
+            "abort",
+            () => ctrl.error(new DOMException("aborted", "AbortError")),
+            { once: true },
+          );
+        return inner(u, init);
+      }) as typeof fetch;
+      const t = await start({ server, clock, dbFile: true });
+      const { jobId } = await t.card();
+      await t.approve(jobId, 0);
+      t.dueNow();
+      const work = t.video.tick();
+      await vi.waitFor(() => expect(body.locked).toBe(true));
+      ctrl.enqueue(
+        new TextEncoder().encode(JSON.stringify({ id: rid(1), status: "completed", usage: { cost: 0.8 } })),
+      );
+      ctrl.close();
+      await t.video.stop();
+      await work;
+      expect(t.job(jobId).costMicros).toBe(800_000);
+      clock.t += minutes * 60_000;
+      const next = new VideoJobs({
+        db: t.db,
+        files: () => t.app.files,
+        conversations: t.app.conversations!,
+        keys: t.app.media!.keys,
+        settings: t.app.media!.settings,
+        budget: t.app.media!.budget,
+        usage: t.app.usageStore,
+        users: t.app.users!,
+        notifications: () => t.app.notifications,
+        probe: () => fixtureVideoProbe(),
+        dataDir: t.dataDir,
+        fetchImpl: server.fetchImpl,
+        now: () => clock.t,
+        limits: { tickMs: 3_600_000 },
+      });
+      next.start();
+      closers.push(() => next.stop());
+      for (let i = 0; i < 5; i++) {
+        await next.tick();
+        await next.idle();
+      }
+      expect(t.job(jobId).costMicros).toBe(800_000);
+      expect(t.usage()[0]).toMatchObject({ s: "settled", p: 800_000 });
+    }, 30_000);
+});
