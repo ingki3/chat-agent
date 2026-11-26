@@ -32,12 +32,6 @@ export const VIDEO_LIMITS = {
   maxResolutionP: 1080,
   /** The resolution asked for when it is supported (else the lowest supported one). */
   defaultResolution: "720p",
-  /**
-   * The longest length a request or a model's list may name (a sanity bound of the input only — review r1: the
-   * admin's default length has its own limit, `MEDIA_LIMITS.videoMaxSec`; what is asked for becomes the model's
-   * nearest listed length).
-   */
-  requestMaxSec: 86_400,
   /** The aspect ratio asked for when the user names none and the model lists it. */
   defaultAspectRatio: "16:9",
 } as const;
@@ -153,23 +147,45 @@ export const VIDEO_JOB_CODE_TEXT: Record<VideoJobCode, string> = {
   video_settings_changed: "그사이 관리자가 영상 설정·모델·키를 바꿔 카드가 만료됐어요. 다시 요청해 주세요.",
   video_options_changed:
     "모델이 이 길이·해상도·화면비를 더 지원하지 않거나 비용 상한을 정할 수 없게 돼 카드가 만료됐어요.",
-  video_blocked: "보낼 수 없는 내용(비밀값)이 들어 있어 보내지 않았어요. 비용은 나가지 않았어요.",
-  video_rejected: "OpenRouter가 이 요청을 받지 않았어요. 비용은 나가지 않았어요.",
-  video_payment: "OpenRouter 잔액이나 키 한도가 부족해요. 비용은 나가지 않았어요. 관리자에게 알려 주세요.",
-  video_rate_limited:
-    "OpenRouter가 잠시 요청을 막았어요. 비용은 나가지 않았어요. 조금 뒤 다시 요청해 주세요.",
-  video_unconfirmed:
-    "제출 결과를 확인하지 못했어요. 이중 과금을 막으려고 다시 보내지 않았고, 비용은 최대치로 기록돼 있어요.",
-  video_failed: "제공자가 영상을 만들지 못했어요. 비용은 최대치로 기록돼 있어요(확인되면 바뀌지 않아요).",
-  video_moderated: "내용 검사에서 거부됐어요. 비용은 최대치로 기록돼 있어요.",
-  video_remote_expired: "제공자 쪽에서 작업 시간이 다 돼 끝났어요. 비용은 최대치로 기록돼 있어요.",
-  video_timeout: "제출 뒤 60분 안에 끝나지 않아 멈췄어요. 비용은 최대치로 기록돼 있어요.",
-  video_lost: "OpenRouter에서 이 작업을 찾지 못했어요. 비용은 최대치로 기록돼 있어요.",
-  video_download_failed: "완성된 영상을 받아 오지 못했어요. 비용은 기록돼 있어요.",
-  video_too_large: "완성된 영상이 너무 커서(1GB 초과) 저장하지 않았어요. 비용은 기록돼 있어요.",
-  video_not_mp4: "받은 파일이 MP4 영상이 아니어서 저장하지 않았어요. 비용은 기록돼 있어요.",
-  video_store_failed: "완성된 영상을 이 대화에 저장하지 못했어요. 비용은 기록돼 있어요.",
+  video_blocked: "보낼 수 없는 내용(비밀값)이 들어 있어 보내지 않았어요.",
+  video_rejected: "OpenRouter가 이 요청을 받지 않았어요.",
+  video_payment: "OpenRouter 잔액이나 키 한도가 부족해요. 관리자에게 알려 주세요.",
+  video_rate_limited: "OpenRouter가 잠시 요청을 막았어요. 조금 뒤 다시 요청해 주세요.",
+  video_unconfirmed: "제출 결과를 확인하지 못했어요. 이중 과금을 막으려고 다시 보내지 않았어요.",
+  video_failed: "제공자가 영상을 만들지 못했어요.",
+  video_moderated: "내용 검사에서 거부됐어요.",
+  video_remote_expired: "제공자 쪽에서 작업 시간이 다 돼 끝났어요.",
+  video_timeout: "제출 뒤 60분 안에 끝나지 않아 멈췄어요.",
+  video_lost: "OpenRouter에서 이 작업을 찾지 못했어요.",
+  video_download_failed: "완성된 영상을 받아 오지 못했어요.",
+  video_too_large: "완성된 영상이 너무 커서(1GB 초과) 저장하지 않았어요.",
+  video_not_mp4: "받은 파일이 MP4 영상이 아니어서 저장하지 않았어요.",
+  video_store_failed: "완성된 영상을 이 대화에 저장하지 못했어요.",
 };
+
+/** Ends where nothing was paid (never approved, or refused before it was billed). */
+const UNPAID: ReadonlySet<VideoJobCode> = new Set([
+  "video_card_expired",
+  "video_settings_changed",
+  "video_options_changed",
+  "video_blocked",
+  "video_rejected",
+  "video_payment",
+  "video_rate_limited",
+]);
+
+/**
+ * How a job ended, for its card (review r2): the reason, then what happened to the cost — none when nothing was paid;
+ * OpenRouter's confirmed cost when it reported one (`costUsd`); else the most it may have cost, kept for good.
+ */
+export function videoEndText(code: VideoJobCode, costUsd: number | null): string {
+  const cost = UNPAID.has(code)
+    ? "비용은 나가지 않았어요."
+    : costUsd !== null
+      ? "OpenRouter가 알려 준 실제 비용이 기록돼 있어요."
+      : "실제 비용을 확인할 수 없어 최대 비용으로 기록돼 있어요.";
+  return `${VIDEO_JOB_CODE_TEXT[code]} ${cost}`;
+}
 
 /** The card's refused actions (`error` of a 4xx/5xx answer). */
 export const VIDEO_JOB_ERRORS: Record<string, string> = {

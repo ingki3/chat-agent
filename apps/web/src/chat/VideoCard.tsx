@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { VIDEO_ENDED, VIDEO_JOB_CODE_TEXT, VideoJob, VideoJobRefusal } from "@agentlee/shared";
+import { VIDEO_ENDED, videoEndText, VideoJob, VideoJobRefusal } from "@agentlee/shared";
 import { ApiError, errorText, files, videoJobs } from "../api.js";
 import { audioText, canPlayMp4, newestJob, usdText, VIDEO_STATUS_TEXT, videoPollMs } from "./video-card.js";
 
@@ -192,7 +192,7 @@ export function VideoCard({ jobId }: { jobId: string }) {
           className={job.status === "failed" ? "error small" : "muted small"}
           data-testid="video-card-reason"
         >
-          {VIDEO_JOB_CODE_TEXT[job.errorCode]}
+          {videoEndText(job.errorCode, job.costUsd)}
         </p>
       )}
       {notice?.kind === "changed" && (

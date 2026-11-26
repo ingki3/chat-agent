@@ -1119,7 +1119,7 @@ describe("video jobs — review r1 regressions", () => {
 
   it("P2: notified_at only once published — a failed publish is tried again (same dedupe key, one row)", async () => {
     const t = await start();
-    const publish = vi.spyOn(t.app.notifications!, "publish").mockImplementationOnce(() => {
+    const publish = vi.spyOn(t.app.notifications!, "publishOutcome").mockImplementationOnce(() => {
       throw new Error("notifications table busy");
     });
     const { jobId } = await t.card();
@@ -1190,5 +1190,178 @@ describe("video jobs — review r1 regressions", () => {
     expect(r).toMatchObject({ ok: true, output: { durationSec: 900 } });
     const s = await t.app.media!.tools.run("video", await t.scopeOf(), { prompt: "강", durationSec: 5000 });
     expect(s).toMatchObject({ ok: true, output: { durationSec: 900 } });
+    // Review r2: any positive safe integer — no cap of its own before the model's list.
+    const u = await t.app.media!.tools.run("video", await t.scopeOf(), { prompt: "강", durationSec: 86_401 });
+    expect(u).toMatchObject({ ok: true, output: { durationSec: 900 } });
+    expect(
+      await t.app.media!.tools.run("video", await t.scopeOf(), { prompt: "강", durationSec: 1e12 }),
+    ).toMatchObject({ ok: true, output: { durationSec: 900 } });
+  });
+});
+
+// ---------------------------------------------------------------- review round 2 (#255)
+
+describe("video jobs — review r2 regressions", () => {
+  it("A: a 202 whose `pending` write fails: no 500, the received id is written on the next pass, never resent", async () => {
+    const t = await start();
+    const { jobId } = await t.card();
+    t.db.$client.exec(
+      "CREATE TRIGGER r2_fail_pending BEFORE UPDATE OF status ON video_jobs WHEN NEW.status='pending' BEGIN SELECT RAISE(ABORT,'transient write failure'); END",
+    );
+    const r = await t.approve(jobId, 0);
+    expect(r.statusCode).toBe(200);
+    expect(r.json()).toMatchObject({ status: "submitting" });
+    t.db.$client.exec("DROP TRIGGER r2_fail_pending");
+    await t.video.tick();
+    expect(t.job(jobId)).toMatchObject({ status: "pending", remoteId: rid(1) });
+    expect(await t.drive(jobId)).toMatchObject({ status: "done" });
+    expect(t.server.posts()).toHaveLength(1);
+  });
+
+  it("A: a `submitting` row whose submit is not under way here and has no id: video_unconfirmed, never resent", async () => {
+    const t = await start();
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    t.db.$client
+      .prepare("UPDATE video_jobs SET status = 'submitting', remote_id = NULL WHERE id = ?")
+      .run(jobId);
+    await t.video.tick();
+    expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_unconfirmed" });
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "unconfirmed" })]);
+    expect(t.server.posts()).toHaveLength(1);
+  });
+
+  it("B: a refused submit whose release failed, then its conversation deleted: the reservation goes with it", async () => {
+    const t = await start({
+      server: fakeServer({ submit: () => Response.json({ error: { code: 402 } }, { status: 402 }) }),
+    });
+    const { jobId, scope } = await t.card();
+    const other = await t.card();
+    await t.approve(other.jobId, 0);
+    const spy = vi.spyOn(t.app.usageStore!, "releaseMedia").mockImplementation(() => {
+      throw new Error("transient write failure");
+    });
+    expect((await t.approve(jobId, 0)).json()).toMatchObject({ errorCode: "video_payment" });
+    spy.mockRestore();
+    // A job of another conversation stays as it is; this conversation's unresolved reservation is resolved.
+    t.app.conversations!.delete(scope.conversationId);
+    expect(t.usage().map((u) => u.s)).toEqual([]);
+    expect(
+      t.db.$client.prepare("SELECT count(*) n FROM usage_records WHERE media_settlement = 'video_job'").get(),
+    ).toEqual({
+      n: 0,
+    });
+  });
+
+  it("C: a session ended while the provider answered: the job goes on, the answer carries no card", async () => {
+    let onSubmit = () => {};
+    const t = await start({
+      server: fakeServer({
+        submit: (_b, n) => {
+          onSubmit();
+          return Response.json({ id: rid(n), status: "pending" }, { status: 202 });
+        },
+      }),
+    });
+    const { jobId } = await t.card();
+    onSubmit = () => t.app.users!.deactivate(t.f.users.owner.id);
+    const r = await t.approve(jobId, 0);
+    expect(r.statusCode).toBe(403);
+    expect(r.json()).toEqual({ error: "forbidden" });
+    expect(t.job(jobId)).toMatchObject({ status: "pending", remoteId: rid(1) });
+  });
+
+  it("D: at the deadline a job waiting for the file lock ends at once (slot and place free); nothing is stored", async () => {
+    const t = await start({
+      limits: { deadlineMs: 600, pollMs: 0 },
+      server: fakeServer({ poll: (id) => Response.json({ id, status: "completed", usage: { cost: 0.8 } }) }),
+    });
+    const { jobId, scope } = await t.card();
+    await t.approve(jobId, 0);
+    let unlock!: () => void;
+    const locked = t.app.fileWrites.exclusive(() => new Promise<void>((r) => (unlock = r)));
+    const store = vi.spyOn(t.app.files!, "addGenerated");
+    const pass = t.video.tick();
+    try {
+      await vi.waitFor(() => expect(store).toHaveBeenCalled());
+      await new Promise((r) => setTimeout(r, Math.max(0, t.job(jobId).deadlineAt! - Date.now()) + 100));
+      // Ended in the database while the write still waits: its slot and file place are free.
+      expect(t.job(jobId)).toMatchObject({
+        status: "failed",
+        errorCode: "video_timeout",
+        costMicros: 800_000,
+      });
+      expect(t.app.files!.placesTaken(scope.conversationId)).toBe(0);
+    } finally {
+      unlock();
+      await locked;
+      await pass;
+      await t.video.idle();
+    }
+    expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_timeout", fileId: null });
+    expect(t.db.$client.prepare("SELECT count(*) n FROM files").get()).toEqual({ n: 0 });
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "settled", p: 800_000 })]);
+  });
+
+  it("E: a lookup error while publishing is not a refusal — notified_at stays empty and it is published later", async () => {
+    const t = await start();
+    const { jobId, scope } = await t.card();
+    await t.approve(jobId, 0);
+    const original = t.app.resources.load.bind(t.app.resources);
+    let transient = true;
+    const spy = vi.spyOn(t.app.resources, "load").mockImplementation((kind, id) => {
+      if (transient && kind === "conversation" && id === scope.conversationId) {
+        transient = false;
+        throw new Error("transient resource read failure");
+      }
+      return original(kind, id);
+    });
+    await t.drive(jobId);
+    expect(transient).toBe(false);
+    expect(t.job(jobId).notifiedAt).toBeNull();
+    await t.video.tick();
+    spy.mockRestore();
+    expect(t.job(jobId).notifiedAt).not.toBeNull();
+    expect(t.db.$client.prepare("SELECT kind FROM notifications").all()).toEqual([{ kind: "video_done" }]);
+    // A refusal for good (another user's key, the account gone): done, not tried again.
+    expect(
+      t.app.notifications!.publishOutcome(
+        t.f.users.stranger.id,
+        { kind: "video_done", url: "/c/x" },
+        {
+          dedupeKey: `video:${jobId}:end`,
+        },
+      ),
+    ).toEqual({ status: "refused" });
+  });
+
+  it("F: a notified_at write that fails never throws out of a pass; the next pass marks it (one notification)", async () => {
+    const t = await start();
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    t.db.$client.exec(
+      "CREATE TRIGGER r2_notify BEFORE UPDATE OF notified_at ON video_jobs BEGIN SELECT RAISE(ABORT,'transient marker write'); END",
+    );
+    await t.drive(jobId);
+    expect(t.job(jobId).notifiedAt).toBeNull();
+    await expect(t.video.tick()).resolves.toBeUndefined();
+    // A pass whose own reads fail does not throw either.
+    const select = vi.spyOn(t.db, "select").mockImplementationOnce(() => {
+      throw new Error("SQLITE_BUSY");
+    });
+    expect(() => t.video.tick()).not.toThrow();
+    select.mockRestore();
+    t.db.$client.exec("DROP TRIGGER r2_notify");
+    await t.video.tick();
+    expect(t.job(jobId).notifiedAt).not.toBeNull();
+    expect(t.db.$client.prepare("SELECT count(*) n FROM notifications").get()).toEqual({ n: 1 });
+  });
+
+  it("G: the end text says the confirmed cost when there is one, the bound only when none", async () => {
+    const { videoEndText } = await import("@agentlee/shared");
+    expect(videoEndText("video_timeout", 0.8)).toContain("실제 비용이 기록돼 있어요");
+    expect(videoEndText("video_timeout", 0.8)).not.toContain("최대");
+    expect(videoEndText("video_timeout", null)).toContain("최대 비용으로 기록");
+    expect(videoEndText("video_payment", null)).toContain("비용은 나가지 않았어요");
   });
 });

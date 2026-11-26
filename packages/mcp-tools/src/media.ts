@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { MEDIA_TOOL_LIMITS, VIDEO_LIMITS } from "@agentlee/shared";
+import { MEDIA_TOOL_LIMITS } from "@agentlee/shared";
 import type { ServerToolInfo } from "./index.js";
 
 /**
@@ -91,7 +91,7 @@ export const VIDEO_GENERATE_TOOL: MediaToolInfo = {
       .number()
       .int()
       .min(1)
-      .max(VIDEO_LIMITS.requestMaxSec)
+      .max(Number.MAX_SAFE_INTEGER)
       .optional()
       .describe(
         "Length in seconds — only when the user asked for one; the model's nearest supported length is used.",

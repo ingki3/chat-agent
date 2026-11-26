@@ -96,6 +96,12 @@ class ToolError extends Error {
 
 export type VideoNotify = {
   publish(userId: string, input: PublishInput, opts?: { dedupeKey?: string }): string | undefined;
+  /** Review r2: whether it was published, refused for good, or failed for now (then tried again). */
+  publishOutcome?(
+    userId: string,
+    input: PublishInput,
+    opts?: { dedupeKey?: string },
+  ): { status: "published" | "refused" | "failed"; id?: string };
   wants?(userId: string, kind: "video_done" | "video_failed"): boolean;
 };
 
@@ -188,6 +194,10 @@ export class VideoJobs {
    * never reaches another conversation's).
    */
   private readonly deleting = new Map<string, string[]>();
+  /** Jobs whose submit request is under way here (review r2: any other `submitting` row is recovered). */
+  private readonly submitting = new Set<string>();
+  /** Remote ids received whose `pending` write failed (review r2: written again on the next passes). */
+  private readonly received = new Map<string, string>();
   /** Until when the probe's readiness (a known-good MP4 checked in the sandbox) holds (review r1, P1). */
   private probeOkUntil = 0;
   private timer: NodeJS.Timeout | undefined;
@@ -204,12 +214,23 @@ export class VideoJobs {
     // cost stays settled, an open bound becomes `unconfirmed`: kept for good), then their requests stopped.
     o.conversations.onDelete((conversationId) => {
       const rows = this.o.db
-        .select({ id: videoJobs.id, usageKey: videoJobs.usageKey, status: videoJobs.status })
+        .select({
+          id: videoJobs.id,
+          usageKey: videoJobs.usageKey,
+          status: videoJobs.status,
+          errorCode: videoJobs.errorCode,
+        })
         .from(videoJobs)
         .where(eq(videoJobs.conversationId, conversationId))
         .all();
-      for (const r of rows)
-        if (VIDEO_ACTIVE.has(r.status) && r.usageKey) this.o.usage?.unconfirmVideoMedia(r.usageKey);
+      // Review r2: no reservation of the conversation is left unresolved — a refusal's (never billed) goes, every
+      // other still held is `unconfirmed` (kept for good), a settled cost stays (both only touch `video_job` rows).
+      for (const r of rows) {
+        if (!r.usageKey) continue;
+        if (r.status === "failed" && REFUSED.includes(r.errorCode as VideoJobCode))
+          this.o.usage?.releaseVideoMedia(r.usageKey);
+        else this.o.usage?.unconfirmVideoMedia(r.usageKey);
+      }
       this.deleting.set(
         conversationId,
         rows.map((r) => r.id),
@@ -219,6 +240,7 @@ export class VideoJobs {
       const ids = this.deleting.get(c.id) ?? [];
       this.deleting.delete(c.id);
       for (const id of ids) {
+        this.received.delete(id);
         this.stops.get(id)?.abort();
         this.due.delete(id);
         this.changed(id);
@@ -696,9 +718,16 @@ export class VideoJobs {
     // ---- the paid request.
     const stop = new AbortController();
     this.stops.set(id, stop);
+    this.submitting.add(id);
     try {
       return await this.submit(id, usageKey, key.key, body, stop.signal);
+    } catch (e) {
+      // Review r2: what follows the paid request never strands the approval as a 500 — the engine takes the job up
+      // (`recoverSubmitting`: the received id written again, or `video_unconfirmed`; never sent again).
+      logEvent(this.o.log, "warn", "error", { videoJobId: id, err: e });
+      return this.get(id);
     } finally {
+      this.submitting.delete(id);
       this.stops.delete(id);
     }
   }
@@ -753,20 +782,55 @@ export class VideoJobs {
       remote = null;
     }
     if (!remote) return this.fail(id, "video_unconfirmed") ?? this.get(id);
-    const r = this.write(id, ["submitting"], {
-      status: "pending",
-      remoteId: remote,
-      submittedAt: this.now(),
-    });
-    if (r) {
-      this.due.set(id, { at: this.now() + this.limits.pollMs, failures: 0 });
-      logEvent(this.o.log, "info", "video.submitted", {
-        userId: r.ownerId,
-        conversationId: r.conversationId,
-        videoJobId: id,
-      });
+    // The id is what lets the job be followed: kept here until it is written (review r2).
+    this.received.set(id, remote);
+    return this.accepted(id) ?? this.get(id);
+  }
+
+  /** The received remote id written (`pending`); tried three times, else kept for the next pass. Null: not written. */
+  private accepted(id: string): VideoJobRow | null {
+    const remote = this.received.get(id);
+    if (!remote) return null;
+    for (let i = 0; i < 3; i++) {
+      let r: VideoJobRow | null;
+      try {
+        r = this.write(id, ["submitting"], { status: "pending", remoteId: remote, submittedAt: this.now() });
+      } catch {
+        continue;
+      }
+      this.received.delete(id);
+      if (r) {
+        this.due.set(id, { at: this.now() + this.limits.pollMs, failures: 0 });
+        logEvent(this.o.log, "info", "video.submitted", {
+          userId: r.ownerId,
+          conversationId: r.conversationId,
+          videoJobId: id,
+        });
+      }
+      return r;
     }
-    return r ?? this.get(id);
+    return null;
+  }
+
+  /**
+   * `submitting` rows whose submit is not under way here (review r2): a received id is written again (until the
+   * deadline); without one the outcome is unknown — `video_unconfirmed`, its bound kept, never sent again.
+   */
+  private recoverSubmitting(at: number): void {
+    for (const r of this.o.db
+      .select({ id: videoJobs.id, deadlineAt: videoJobs.deadlineAt })
+      .from(videoJobs)
+      .where(eq(videoJobs.status, "submitting"))
+      .all()) {
+      if (this.submitting.has(r.id)) continue;
+      if (this.received.has(r.id) && (r.deadlineAt === null || at < r.deadlineAt)) {
+        this.accepted(r.id);
+        continue;
+      }
+      const timedOut = this.received.has(r.id);
+      this.received.delete(r.id);
+      this.fail(r.id, timedOut ? "video_timeout" : "video_unconfirmed");
+    }
   }
 
   // ---------------------------------------------------------------- the engine
@@ -785,12 +849,8 @@ export class VideoJobs {
     if (this.running) return;
     this.running = true;
     if (!sweepVideoScratch(this.o.dataDir)) logEvent(this.o.log, "warn", "media.sweep_failed");
-    for (const r of this.o.db
-      .select({ id: videoJobs.id })
-      .from(videoJobs)
-      .where(eq(videoJobs.status, "submitting"))
-      .all())
-      this.fail(r.id, "video_unconfirmed");
+    // Nothing is being submitted by this process yet: every `submitting` row is the last process's.
+    this.recoverSubmitting(this.now());
     for (const r of this.o.db
       .select({ id: videoJobs.id })
       .from(videoJobs)
@@ -799,9 +859,9 @@ export class VideoJobs {
       this.due.set(r.id, { at: this.now(), failures: 0 });
     this.releaseRefused();
     this.notifyMissing();
-    this.timer = setInterval(() => void this.tick(), this.limits.tickMs);
+    this.timer = setInterval(() => void this.tick().catch(() => undefined), this.limits.tickMs);
     this.timer.unref();
-    void this.tick();
+    void this.tick().catch(() => undefined);
   }
 
   /** No new poll starts; the requests under way are stopped; open streams close. Waits for the jobs to let go. */
@@ -820,7 +880,18 @@ export class VideoJobs {
   /** One pass (tests call it directly): expired cards, deadlines, and the due jobs started — each on its own. */
   tick(): Promise<void> {
     if (!this.running || this.stopping) return Promise.resolve();
+    // Review r2: a pass never throws (its timer has no one to catch it) — what failed is tried on the next one.
+    try {
+      return this.pass();
+    } catch (e) {
+      logEvent(this.o.log, "warn", "error", { err: e });
+      return Promise.resolve();
+    }
+  }
+
+  private pass(): Promise<void> {
     const at = this.now();
+    this.recoverSubmitting(at);
     for (const r of this.o.db
       .select()
       .from(videoJobs)
@@ -846,7 +917,10 @@ export class VideoJobs {
       this.busy.set(r.id, p);
       started.push(p);
     }
-    return Promise.all(started).then(() => undefined);
+    return Promise.all(started).then(
+      () => undefined,
+      () => undefined,
+    );
   }
 
   /** Every job being handled now, finished (tests). */
@@ -882,6 +956,13 @@ export class VideoJobs {
             () => {
               late = true;
               stop.abort();
+              // Review r2: ended at once — its slot and file place free, a settled cost kept; a file write still
+              // waiting for the lock finds the job ended there (`guard`) and stores nothing.
+              try {
+                this.fail(row.id, "video_timeout");
+              } catch {
+                // the pass after it ends it
+              }
             },
             Math.max(0, row.deadlineAt - this.now()),
           );
@@ -950,7 +1031,11 @@ export class VideoJobs {
     } finally {
       if (deadline) clearTimeout(deadline);
       if (this.stops.get(row.id) === stop) this.stops.delete(row.id);
-      if (late || this.pastDeadline(row.id)) this.fail(row.id, "video_timeout");
+      try {
+        if (late || this.pastDeadline(row.id)) this.fail(row.id, "video_timeout");
+      } catch {
+        // the next pass ends it
+      }
     }
   }
 
@@ -1255,12 +1340,11 @@ export class VideoJobs {
     const n = this.o.notifications();
     if (!n) return;
     const kind = row.status === "done" ? "video_done" : "video_failed";
-    if (n.wants?.(row.ownerId, kind) ?? true) {
-      const url = `/c/${row.conversationId}#m-${row.messageId}`;
-      const ref = { kind: "conversation", id: row.conversationId };
-      try {
-        n.publish(
-          row.ownerId,
+    try {
+      if (n.wants?.(row.ownerId, kind) ?? true) {
+        const url = `/c/${row.conversationId}#m-${row.messageId}`;
+        const ref = { kind: "conversation", id: row.conversationId };
+        const input: PublishInput =
           kind === "video_done"
             ? { kind, url, ref }
             : {
@@ -1269,18 +1353,25 @@ export class VideoJobs {
                   VIDEO_FAILURE_SHORT[(row.errorCode as VideoJobCode | null) ?? "video_failed"] ?? "실패",
                 url,
                 ref,
-              },
-          { dedupeKey: `video:${row.id}:end` },
-        );
-      } catch {
-        return;
+              };
+        const opts = { dedupeKey: `video:${row.id}:end` };
+        // Review r2: a refusal for good (the account, the conversation, its access gone) is done; a lookup that
+        // failed is not — tried again on the next pass (the dedupe key keeps it one row).
+        const outcome = n.publishOutcome
+          ? n.publishOutcome(row.ownerId, input, opts).status
+          : n.publish(row.ownerId, input, opts) === undefined
+            ? "refused"
+            : "published";
+        if (outcome === "failed") return;
       }
+      this.o.db
+        .update(videoJobs)
+        .set({ notifiedAt: this.now() })
+        .where(and(eq(videoJobs.id, row.id), sql`${videoJobs.notifiedAt} IS NULL`))
+        .run();
+    } catch {
+      // Tried again on the next pass and after a restart (`notified_at` still empty).
     }
-    this.o.db
-      .update(videoJobs)
-      .set({ notifiedAt: this.now() })
-      .where(and(eq(videoJobs.id, row.id), sql`${videoJobs.notifiedAt} IS NULL`))
-      .run();
   }
 
   /** The ends of approved jobs whose notification is not published yet (start, every pass). */

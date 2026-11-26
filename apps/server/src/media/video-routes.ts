@@ -79,7 +79,11 @@ export function registerVideoRoutes(
     const b = body(req, reply);
     if (!b) return reply;
     try {
-      const row = await jobs.approve(req.params.id, req.ctx.user!.id, b.version, stillAllowed(req));
+      const allowed = stillAllowed(req);
+      const row = await jobs.approve(req.params.id, req.ctx.user!.id, b.version, allowed);
+      // Review r2: the provider's answer took a while — the card goes back only to a caller still allowed to see it
+      // (the job itself goes on either way).
+      if (!allowed()) return reply.code(403).header("Cache-Control", "no-store").send({ error: "forbidden" });
       if (!row) return reply.code(404).header("Cache-Control", "no-store").send({ error: "not_found" });
       return reply.header("Cache-Control", "no-store").send(jobs.view(row));
     } catch (e) {
