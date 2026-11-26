@@ -278,6 +278,8 @@ a.cite-title:hover {
   font-size: 13px;
 }
 .refs-style {
+  /* Its visually hidden radio stays inside the box (#247: positioned leftovers never hang off an outer box). */
+  position: relative;
   display: flex;
   flex: 1 1 160px;
   flex-direction: column;

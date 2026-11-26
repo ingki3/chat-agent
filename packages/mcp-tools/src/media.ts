@@ -42,7 +42,7 @@ export const IMAGE_GENERATE_TOOL: MediaToolInfo = {
 export const SPEECH_GENERATE_TOOL: MediaToolInfo = {
   name: "speech_generate",
   kind: "speech",
-  description: `Reads a text aloud with the text-to-speech model the admin chose and saves it as an MP3 file of this conversation; the user can play it in the chat under your reply. ${RULES} Only the model's own voices: never clone or imitate someone's voice (no voice samples are taken). Up to ${MEDIA_TOOL_LIMITS.speechChars} characters per call. Returns fileId, file {fileId, name, bytes, url, kind}, model, voice and costUsd (OpenRouter's reported cost; null when not reported).`,
+  description: `Reads a text aloud with the text-to-speech model the admin chose and saves it as an MP3 file of this conversation; the user can play it in the chat under your reply. ${RULES} Only the model's own voices: never clone or imitate someone's voice (no voice samples are taken). Up to ${MEDIA_TOOL_LIMITS.speechChars} characters per call: a long script is split automatically at sentence and paragraph boundaries, read piece by piece with the same voice and instructions, and joined into ONE MP3 — always pass the whole script in one call, never split it yourself. Returns fileId, file {fileId, name, bytes, url, kind}, model, voice, durationSeconds (the audio's length), chunks (pieces read) and costUsd (OpenRouter's reported cost of all pieces; null when not reported).`,
   input: {
     text: z
       .string()

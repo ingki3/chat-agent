@@ -582,12 +582,14 @@ export const usageRecords = sqliteTable(
     /** 미디어 생성 (#238): OpenRouter's generation id (`gen-…`, from the 2xx answer), to look its cost up later. */
     mediaGenerationId: text("media_generation_id"),
     /**
-     * 미디어 생성 (#238): where the row's cost stands — `reserved` (sent, no answer yet), `awaiting_cost` (answered,
-     * the cost not reported yet: looked up again later), `settled`, `unconfirmed` (it can never be confirmed: no id,
-     * an unknown outcome, or the lookups gave up). NULL for every other purpose.
+     * 미디어 생성 (#238): where the row's cost stands — `pending_send` (#248: a speech piece reserved, its request
+     * not sent yet — never billed; released when the call stops, and by the start-up recovery), `reserved` (sent, no
+     * answer yet), `awaiting_cost` (answered, the cost not reported yet: looked up again later), `settled`,
+     * `unconfirmed` (it can never be confirmed: no id, an unknown outcome, or the lookups gave up). NULL for every
+     * other purpose. A plain text column (no CHECK): a new state needs no migration.
      */
     mediaSettlement: text("media_settlement", {
-      enum: ["reserved", "awaiting_cost", "settled", "unconfirmed"],
+      enum: ["pending_send", "reserved", "awaiting_cost", "settled", "unconfirmed"],
     }),
     /** Cost lookups after the call (the background settler's backoff). */
     mediaSettleTries: integer("media_settle_tries"),

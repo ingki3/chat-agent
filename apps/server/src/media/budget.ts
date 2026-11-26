@@ -53,6 +53,16 @@ export class MediaBudget {
     return left > 0 && estimate <= left;
   }
 
+  /**
+   * #248: the same check with the estimate already in integer micro-USD — the exact amounts the reserving rows
+   * hold (no second rounding between the check and the rows).
+   */
+  allowsMicros(userId: string, micros: number, at: number = this.now()): boolean {
+    if (!Number.isSafeInteger(micros) || micros < 0) return false;
+    const { left } = this.micros(userId, at);
+    return left > 0 && micros <= left;
+  }
+
   private micros(userId: string, at: number) {
     const day = monthInfo(at, this.timeZone);
     const rows = this.db

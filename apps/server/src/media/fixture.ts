@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import zlib from "node:zlib";
 import {
   MEDIA_CATALOG_URLS,
@@ -7,6 +9,7 @@ import {
   OPENROUTER_SPEECH_URL,
   SPEECH_PRICING_URL,
 } from "./openrouter.js";
+import { makeSpeechWorkdir, type Measured, type SpeechAudio } from "./speech-audio.js";
 
 /**
  * A scripted OpenRouter for the e2e run and manual testing with FAKE_RUNTIME=1 (#238): the server never reaches
@@ -217,4 +220,109 @@ export function fixtureOpenRouterFetch(): typeof fetch {
     if (body) return Response.json(body);
     return Response.json({ error: { code: 404 } }, { status: 404 });
   }) as typeof fetch;
+}
+
+/** In a scripted answer: makes the scripted decoder fail on it (a corrupt MP3, as the strict decode would). */
+export const FIXTURE_CORRUPT_MARK = "FIXTURE-CORRUPT";
+
+/** Layer III bit rates (kbit/s) by index (MPEG-1, then MPEG-2/2.5) and sample rates by version. */
+const KBPS_V1 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+const KBPS_V2 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+const RATES: Record<number, readonly number[]> = {
+  3: [44100, 48000, 32000],
+  2: [22050, 24000, 16000],
+  0: [11025, 12000, 8000],
+};
+
+/**
+ * The fake's own model of an MP3 (test and FAKE_RUNTIME only — production asks the decoder, `speech-audio.ts`): its
+ * MPEG audio frames, walked one after another from the start (after an ID3v2 tag) until something is not a frame.
+ * Each frame's layer, rate and channel count; `samples` per frame (1152 MPEG-1, 576 MPEG-2/2.5, Layer III). It does
+ * not care about Xing/Info frames (they count as audio here) — the real decoder's exact trimming is not modelled.
+ */
+export function fixtureMp3Frames(
+  b: Buffer,
+): { start: number; end: number; layer: number; rate: number; channels: 1 | 2; samples: number }[] {
+  let p = 0;
+  if (b.length >= 10 && b.toString("latin1", 0, 3) === "ID3")
+    p = 10 + (((b[6]! & 0x7f) << 21) | ((b[7]! & 0x7f) << 14) | ((b[8]! & 0x7f) << 7) | (b[9]! & 0x7f));
+  const out: { start: number; end: number; layer: number; rate: number; channels: 1 | 2; samples: number }[] =
+    [];
+  while (p + 4 <= b.length) {
+    if (b[p] !== 0xff || (b[p + 1]! & 0xe0) !== 0xe0) break;
+    const version = (b[p + 1]! >> 3) & 3;
+    const layer = (b[p + 1]! >> 1) & 3;
+    const bi = (b[p + 2]! >> 4) & 15;
+    const si = (b[p + 2]! >> 2) & 3;
+    if (version === 1 || layer === 0 || bi === 0 || bi === 15 || si === 3) break;
+    const rate = RATES[version]![si]!;
+    const v1 = version === 3;
+    const kbps = (v1 ? KBPS_V1 : KBPS_V2)[bi]!;
+    // (Layer I/II lengths are not modelled: such a frame is taken with the Layer III length — enough to report it.)
+    const len = Math.floor(((v1 ? 144 : 72) * kbps * 1000) / rate) + ((b[p + 2]! >> 1) & 1);
+    if (p + len > b.length) break;
+    out.push({
+      start: p,
+      end: p + len,
+      layer,
+      rate,
+      channels: ((b[p + 3]! >> 6) & 3) === 3 ? 1 : 2,
+      samples: v1 ? 1152 : 576,
+    });
+    p += len;
+  }
+  return out;
+}
+
+/** One silent MPEG Layer III frame at `rate` (any of the nine MPEG-1/2/2.5 rates), mono. */
+function silentFrame(rate: number): Buffer {
+  const version = [3, 2, 0].find((v) => RATES[v]!.includes(rate));
+  if (version === undefined) throw new Error(`no MPEG rate ${rate}`);
+  const si = RATES[version]!.indexOf(rate);
+  const v1 = version === 3;
+  const bi = 9;
+  const len = Math.floor(((v1 ? 144 : 72) * (v1 ? KBPS_V1 : KBPS_V2)[bi]! * 1000) / rate);
+  const f = Buffer.alloc(len);
+  f.set([0xff, 0xe2 | (version << 3) | (1 << 1) | 1, (bi << 4) | (si << 2), 0xc4]);
+  return f;
+}
+
+/**
+ * A scripted ffprobe/ffmpeg (measure, encode) for the FAKE_RUNTIME (e2e) server and tests, with the real one's
+ * semantics (#251 re-plan 5) on its own small model (`fixtureMp3Frames`): `corrupt` for `FIXTURE_CORRUPT_MARK`;
+ * `unsupported` when there is no Layer III frame at all, or another layer among the frames it follows; the "decode" converts every frame's samples to the call's
+ * rate (the first answer's) and writes that many PCM samples (silence) into `out/`; `too_long` over the cap. The
+ * "encode" writes silent frames for the PCM files' samples. It does not model the decoder's delay/padding trimming
+ * or Xing/Info frames — boundary tests use counts the real decoder confirmed. No program runs.
+ */
+export function fixtureSpeechAudio(dataDir: string): SpeechAudio {
+  let n = 0;
+  return {
+    workdir: () => makeSpeechWorkdir(dataDir),
+    async measure(file, m): Promise<Measured> {
+      const b = fs.readFileSync(file);
+      if (b.includes(FIXTURE_CORRUPT_MARK, 0, "latin1")) return { ok: false, reason: "corrupt" };
+      const frames = fixtureMp3Frames(b);
+      const first = frames[0];
+      // No Layer III frame, or another layer among them: the fake does not model how the real decoder plays mixed
+      // layers (it cannot even follow MP2 frames' lengths) — it refuses them; real-decoder tests cover that case.
+      if (!first || frames.some((f) => f.layer !== 1)) return { ok: false, reason: "unsupported" };
+      const sampleRate = m.sampleRate ?? first.rate;
+      const samples = Math.round(frames.reduce((a, f) => a + (f.samples * sampleRate) / f.rate, 0));
+      if (samples > m.maxSeconds * sampleRate) return { ok: false, reason: "too_long" };
+      const pcm = path.join(path.dirname(path.dirname(file)), "out", `pcm-${++n}.s16`);
+      fs.writeFileSync(pcm, Buffer.alloc(samples * 2), { mode: 0o600 });
+      return { ok: true, samples, seconds: samples / sampleRate, sampleRate, pcm };
+    },
+    async encode(job) {
+      const samples = job.pcms.reduce((a, f) => a + fs.statSync(f).size / 2, 0);
+      const frame = silentFrame(job.sampleRate);
+      const spf = job.sampleRate >= 32000 ? 1152 : 576;
+      const out = path.join(job.workdir, "out", `speech-${++n}.mp3`);
+      fs.writeFileSync(out, Buffer.concat(Array.from({ length: Math.round(samples / spf) }, () => frame)), {
+        mode: 0o600,
+      });
+      return out;
+    },
+  };
 }

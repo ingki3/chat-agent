@@ -13,12 +13,10 @@ export const COST_MARGIN = 1.2;
 export const MAX_IMAGE_PIXELS = 8192 * 8192;
 export const MAX_IMAGE_MEGAPIXELS = MAX_IMAGE_PIXELS / 1_000_000;
 /**
- * Speech: the longest the audio of a text can be — half a second per character (far slower than any voice reads),
- * plus 30 s — and the most audio tokens a second of it can be billed as (Gemini TTS: 32/s; 50 here).
+ * A bound as the integer micro-USD a reserving row holds (rounded up once). #248: a speech call's pieces are summed,
+ * checked against the budget and written in these same integers.
  */
-export const SPEECH_SECONDS_PER_CHAR = 0.5;
-export const SPEECH_EXTRA_SECONDS = 30;
-export const AUDIO_TOKENS_PER_SECOND = 50;
+export const boundMicros = (usd: number): number => Math.ceil(usd * 1_000_000);
 /** Text tokens never outnumber UTF-8 bytes (byte-level tokenizers); a per-character price is bounded the same. */
 const utf8 = (s: string) => Buffer.byteLength(s, "utf8");
 
@@ -122,9 +120,9 @@ const REQUIRED = ["prompt", "completion"];
  * A speech request's bound from its model's endpoints in the Models API (`data.endpoints[].pricing`, decimal
  * strings): per endpoint, over the union of the price keys of the base and its `overrides`, each key's dearest value
  * times its most possible quantity — input prices × the text's UTF-8 bytes (characters and tokens alike), `request`
- * × 1, every other (output) price × the longest audio as tokens (`AUDIO_TOKENS_PER_SECOND` × seconds — also a
- * bound for a per-second price). The unit is not stated in the answer, so every interpretation is covered. A value
- * that does not read as a number or is negative (variable) anywhere — base or override — is no bound. Null = none.
+ * × 1. A non-zero **output** price (per audio token or second: `completion`, `audio_output`, …) is no bound (#251
+ * r9 — the audio's length is the provider's to decide): only models priced on their input are used. A value that
+ * does not read as a number or is negative (variable) anywhere — base or override — is no bound. Null = none.
  */
 export function speechCostBound(
   endpoints: readonly unknown[],
@@ -132,8 +130,6 @@ export function speechCostBound(
 ): number | null {
   if (!endpoints.length) return null;
   const input = utf8(o.text) + utf8(o.instructions ?? "") + 64;
-  const seconds = [...o.text].length * SPEECH_SECONDS_PER_CHAR + SPEECH_EXTRA_SECONDS;
-  const output = seconds * AUDIO_TOKENS_PER_SECOND;
   let worst = 0;
   for (const ep of endpoints) {
     if (!isObj(ep) || !isObj(ep.pricing)) return null;
@@ -157,9 +153,51 @@ export function speechCostBound(
       if (NONE_KEYS.has(k)) continue;
       const dearest = Math.max(...values);
       if (dearest === 0) continue;
-      sum += dearest * (INPUT_KEYS.has(k) ? input : k === "request" ? 1 : output);
+      // An output price (per audio token or second — `completion`, `audio_output`, …): how much audio comes back is
+      // the provider's, not bounded by the text (#251 r9: one character and an instruction to talk for 90 s billed
+      // past the reservation). No bound: such a model is refused before anything is sent, and when it is chosen.
+      if (!INPUT_KEYS.has(k) && k !== "request") return null;
+      sum += dearest * (INPUT_KEYS.has(k) ? input : 1);
     }
     worst = Math.max(worst, sum);
   }
   return worst * COST_MARGIN;
+}
+
+/**
+ * Whether a speech model is priced on its output (#251 r9): any endpoint with a non-zero price for what comes back
+ * (`completion`, `audio_output`, … — base or override). Such a model has no bound (`speechCostBound`) and is refused
+ * when chosen (관리자 → 미디어 생성) and before any request.
+ */
+export function speechOutputPriced(endpoints: readonly unknown[]): boolean {
+  for (const ep of endpoints) {
+    if (!isObj(ep) || !isObj(ep.pricing)) continue;
+    const base = ep.pricing;
+    const tiers = [base, ...(Array.isArray(base.overrides) ? base.overrides.filter(isObj) : [])];
+    for (const t of tiers)
+      for (const [k, v] of Object.entries(t)) {
+        if (NOT_PRICES.has(k) || INPUT_KEYS.has(k) || NONE_KEYS.has(k) || k === "request") continue;
+        const n = price(v);
+        if (n !== undefined && n > 0) return true;
+      }
+  }
+  return false;
+}
+
+/**
+ * A speech model's price record judged (#251 r10 — the same verdict when it is chosen and before every call): the
+ * Models API answer for `/models/<id>/endpoints` must be that model's record with endpoints (`invalid` otherwise);
+ * priced on its output is `output_priced`; a price that gives no bound (missing, unreadable, variable `-1`) is
+ * `no_price`. `ok`: its endpoints, whose bound `speechCostBound` gives.
+ */
+export function speechPricing(
+  answer: unknown,
+  model: string,
+): { ok: true; endpoints: unknown[] } | { ok: false; reason: "invalid" | "output_priced" | "no_price" } {
+  const data = isObj(answer) && isObj(answer.data) ? answer.data : undefined;
+  const endpoints = data && Array.isArray(data.endpoints) ? data.endpoints : [];
+  if (!data || data.id !== model || !endpoints.length) return { ok: false, reason: "invalid" };
+  if (speechOutputPriced(endpoints)) return { ok: false, reason: "output_priced" };
+  if (speechCostBound(endpoints, { text: "가" }) === null) return { ok: false, reason: "no_price" };
+  return { ok: true, endpoints };
 }

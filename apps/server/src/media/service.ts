@@ -9,7 +9,15 @@ import {
 } from "@agentlee/shared";
 import type { SettingsStore } from "../db/settings-store.js";
 import { OPENROUTER_KEY_SETTING, OPENROUTER_KEY_STATUS_SETTING, type OpenRouterKeys } from "./keys.js";
-import { checkKey, fetchCatalog, OpenRouterError, type KeyStatus } from "./openrouter.js";
+import { speechPricing } from "./cost.js";
+import {
+  checkKey,
+  fetchCatalog,
+  modelEndpointsUrl,
+  OpenRouterError,
+  openRouterGet,
+  type KeyStatus,
+} from "./openrouter.js";
 import { YOUTH_STRICT_MODERATION } from "./policy.js";
 import type { MediaSettingsStore } from "./settings.js";
 
@@ -223,6 +231,32 @@ export class MediaAdminService {
    * nor returned (`media_key_changed`); so is one asked for under another generation than the current one
    * (`expected` — the screen's).
    */
+  /**
+   * A speech model's price record judged as a call judges it (`speechPricing`, #251 r10): the endpoints of that model,
+   * priced on its input with a readable bound. Not so: `media_model_output_priced` (priced on its output) or
+   * `media_model_no_price` (no record, another model's, prices missing, unreadable or variable); a read that fails is
+   * `media_catalog_failed` (nothing is saved).
+   */
+  private async checkSpeechPricing(model: string): Promise<void> {
+    const resolved = this.o.keys.resolve();
+    if (!resolved) throw new MediaError(400, "media_no_key");
+    const url = modelEndpointsUrl(model);
+    if (!url) throw new MediaError(409, "media_model_unknown", "speech");
+    let answer: unknown;
+    try {
+      answer = await openRouterGet(url, { apiKey: resolved.key, ...this.fetchOpts() });
+    } catch {
+      throw new MediaError(502, "media_catalog_failed", "speech");
+    }
+    const verdict = speechPricing(answer, model);
+    if (verdict.ok) return;
+    throw new MediaError(
+      409,
+      verdict.reason === "output_priced" ? "media_model_output_priced" : "media_model_no_price",
+      "speech",
+    );
+  }
+
   async catalog(kind: MediaKind, fresh = false, expected?: string, prices = true): Promise<MediaCatalog> {
     if (expected !== undefined && expected !== this.generation())
       throw new MediaError(409, "media_key_changed");
@@ -289,6 +323,8 @@ export class MediaAdminService {
         if (!listed) throw new MediaError(409, "media_model_unknown", kind);
         // A vector-only image model (SVG) is paid for on every call and never stored (#238 review r1).
         if (kind === "image" && listed.vectorOnly) throw new MediaError(409, "media_model_unsupported", kind);
+        // A speech model whose call cost has no bound — priced on its output, or no usable price (#251 r9–r10).
+        if (kind === "speech") await this.checkSpeechPricing(n.model);
       }
       if (!authorize()) throw new MediaError(403, "forbidden");
       this.o.transaction(() => {
