@@ -4,6 +4,7 @@ import type { ComposeJob } from "@agentlee/shared";
 import {
   composeJobIds,
   composePollMs,
+  durationText,
   isComposeTool,
   newestComposeJob,
   secondsText,
@@ -47,5 +48,11 @@ describe("compose card (#238 stage 4)", () => {
     expect(composeReadinessPollMs({ ready: true })).toBe(false);
     expect(composeReadinessPollMs({ ready: false })).toBe(false);
     expect(composeReadinessPollMs(undefined)).toBe(false);
+  });
+
+  it("review r5: an ended job without a known length never says '계산 중'", () => {
+    expect(durationText({ durationSec: 0, status: "queued" })).toBe("계산 중");
+    expect(durationText({ durationSec: 0, status: "failed" })).toBe("확인할 수 없음");
+    expect(durationText({ durationSec: 2, status: "failed" })).toBe("2초");
   });
 });

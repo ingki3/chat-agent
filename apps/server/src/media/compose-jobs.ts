@@ -696,7 +696,9 @@ export class ComposeJobs {
       if (!p.ok)
         return p.reason === "kind"
           ? new ToolError("compose_input_kind")
-          : new ToolError("compose_input_unreadable", `${f.id}: could not be read (${p.reason})`);
+          : p.reason === "animated"
+            ? new ToolError("compose_input_animated")
+            : new ToolError("compose_input_unreadable", `${f.id}: could not be read (${p.reason})`);
       infos.set(f.id, { ...p.info, fileId: f.id, name });
     }
     if (!this.get(id)) return new ToolError("media_cancelled");

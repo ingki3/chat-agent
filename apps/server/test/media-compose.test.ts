@@ -39,9 +39,11 @@ import {
 } from "../src/media/compose-plan.js";
 import {
   fixtureComposer,
+  isAnimatedWebp,
   judgeInput,
   judgeResult,
   mixPcm,
+  mp4EmptyLeads,
   sandboxedComposer,
   type Composer,
   type ComposeOutcome,
@@ -53,6 +55,7 @@ import { FakeRuntime } from "../src/runtime/fake.js";
 import { storagePaths } from "../src/storage/paths.js";
 import { runIsolated } from "../src/isolation/sandbox.js";
 import { createFamily } from "./helpers/permission-matrix.js";
+import { silentMp3 } from "../src/media/fixture.js";
 import { newestComposeJob } from "../../web/src/chat/compose-card.js";
 
 vi.setConfig({ testTimeout: 120_000 });
@@ -111,7 +114,13 @@ let media:
       | "vbr100"
       | "prores"
       | "qtrleRed"
-      | "qtrleBlue",
+      | "qtrleBlue"
+      | "noel"
+      | "silent1"
+      | "silent29"
+      | "loud"
+      | "rb"
+      | "anim",
       string
     >
   | undefined;
@@ -390,6 +399,68 @@ function inputs() {
       ...["-f", "lavfi", "-i", `color=c=${c}@0.0:s=64x64:r=30:d=1,format=rgba`],
       ...["-c:v", "qtrle", "-pix_fmt", "argb", path.join(dir, `qtrle-${c}.mov`)],
     );
+  // Review r5 inputs. H.264 with B-frames and no edit list (its first picture at 0.0667 s — a reorder delay, no gap).
+  ff(
+    ...["-f", "lavfi", "-i", "color=c=red:s=64x64:r=30:d=1", "-c:v", "libx264", "-bf", "2"],
+    ...["-pix_fmt", "yuv420p", "-use_editlist", "0", path.join(dir, "noel.mp4")],
+  );
+  // Silent WAVs (1 s, 2.9 s); a loud 500 Hz tone in PCM under a black picture; red until exactly 1.000 s, then blue.
+  for (const d of ["1", "2.9"])
+    ff(
+      "-f",
+      "lavfi",
+      "-i",
+      `anullsrc=r=48000:cl=stereo,atrim=duration=${d}`,
+      "-c:a",
+      "pcm_s16le",
+      path.join(dir, `silent-${d}.wav`),
+    );
+  ff(
+    ...[
+      "-f",
+      "lavfi",
+      "-i",
+      "color=c=black:s=64x64:r=30:d=1",
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=f=500:r=48000:d=1,volume=0.9",
+    ],
+    ...[
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "pcm_s16le",
+      "-shortest",
+      path.join(dir, "loud.mov"),
+    ],
+  );
+  ff(
+    ...[
+      "-f",
+      "lavfi",
+      "-i",
+      "nullsrc=s=64x64:r=30:d=2,format=rgb24,geq=r='if(lt(T\\,1)\\,255\\,0)':g=0:b='if(gte(T\\,1)\\,255\\,0)'",
+    ],
+    ...["-c:v", "libx264", "-pix_fmt", "yuv420p", path.join(dir, "rb.mp4")],
+  );
+  // An animated WebP's header (VP8X with its animation flag, an ANIM chunk) — enough for the check that refuses it.
+  const vp8x = Buffer.alloc(10);
+  vp8x[0] = 0x02;
+  const anim = Buffer.alloc(6);
+  const chunk = (id: string, body: Buffer) => {
+    const h = Buffer.alloc(8);
+    h.write(id, 0, "latin1");
+    h.writeUInt32LE(body.length, 4);
+    return Buffer.concat([h, body]);
+  };
+  const body = Buffer.concat([Buffer.from("WEBP", "latin1"), chunk("VP8X", vp8x), chunk("ANIM", anim)]);
+  const riff = Buffer.alloc(8);
+  riff.write("RIFF", 0, "latin1");
+  riff.writeUInt32LE(body.length, 4);
+  fs.writeFileSync(path.join(dir, "anim.webp"), Buffer.concat([riff, body]));
   media = {
     late: path.join(dir, "late.mov"),
     shortSound: path.join(dir, "short.mp4"),
@@ -411,6 +482,12 @@ function inputs() {
     prores: path.join(dir, "prores.mov"),
     qtrleRed: path.join(dir, "qtrle-red.mov"),
     qtrleBlue: path.join(dir, "qtrle-blue.mov"),
+    noel: path.join(dir, "noel.mp4"),
+    silent1: path.join(dir, "silent-1.wav"),
+    silent29: path.join(dir, "silent-2.9.wav"),
+    loud: path.join(dir, "loud.mov"),
+    rb: path.join(dir, "rb.mp4"),
+    anim: path.join(dir, "anim.webp"),
     vbr: path.join(dir, "vbr.mp3"),
     png: path.join(dir, "a.png"),
     wide: path.join(dir, "wide.png"),
@@ -716,9 +793,9 @@ describe("the plan (review R1–R3)", () => {
   });
 
   it("subtitles: the text as given; each format escapes only its own syntax (review r3)", () => {
-    // Only line endings, control characters and empty lines change.
+    // Only line endings and control characters change (review r5: blank lines and indentation stay).
     expect(cueText("  <b>안녕</b> {\\an8}세계\r\n\r\n둘째 --> 줄 \\N C:\\temp ")).toBe(
-      "  <b>안녕</b> {\\an8}세계\n둘째 --> 줄 \\N C:\\temp ",
+      "  <b>안녕</b> {\\an8}세계\n\n둘째 --> 줄 \\N C:\\temp ",
     );
     const subs = [
       { startSec: 0.25, endSec: 1, text: "A & B < C" },
@@ -795,8 +872,10 @@ describe("the plan (review R1–R3)", () => {
       { file: path.join(dir, "b.pcm"), start: 50, length: 100, fadeIn: 50, fadeOut: 0 },
     ]);
     const out = fs.readFileSync(path.join(dir, "out.pcm"));
-    expect(out.length).toBe(150 * 4);
-    for (const i of [0, 49, 50, 75, 99, 100, 149]) expect(out.readInt16LE(i * 4)).toBe(1000);
+    // Float out (review r5): the same values, never clipped.
+    expect(out.length).toBe(150 * 8);
+    for (const i of [0, 49, 50, 75, 99, 100, 149])
+      expect(Math.round(out.readFloatLE(i * 8) * 32768)).toBe(1000);
   });
 
   it("ffprobe's reports judged: an input of the right kind; the result's streams and lengths (review R5, R11)", () => {
@@ -1466,10 +1545,58 @@ describe("review r2: the plan (pure)", () => {
     expect(a).not.toContain("-ss");
     expect(a).not.toContain("-noaccurate_seek");
     const g = a[a.indexOf("-filter_complex") + 1]!;
-    expect(g).toContain("overlay=eof_action=repeat:repeatlast=1,trim=start_frame=60:end_frame=90,");
+    // The canvas starts at the trim's start (review r5): the source shifted by it, then 30 frames.
+    expect(g).toContain("[0:v]setpts=PTS-2/TB,");
+    expect(g).toContain("overlay=eof_action=repeat:repeatlast=1,trim=end_frame=30,");
     // The picture only: its sound is a slice of the input's decoded PCM.
     expect(g).not.toContain("[0:a");
     expect(a).not.toContain("pcm_s16le");
+  });
+});
+
+describe("review r5: the call's own judgements (pure)", () => {
+  it("transitions that together outrun a stated clip are refused at the call — no file length needed", () => {
+    const I = ins(info("a", { kind: "image" }));
+    const three = {
+      clips: [
+        { fileId: "a", durationSec: 1, transition: { type: "fade" as const, durationSec: 0.7 } },
+        { fileId: "a", durationSec: 1, transition: { type: "fade" as const, durationSec: 0.7 } },
+        { fileId: "a", durationSec: 1 },
+      ],
+    };
+    expect(checkInputs(three, I)).toMatchObject({
+      code: "compose_invalid_timeline",
+      hint: expect.stringContaining("clips[1]"),
+    });
+    // A video of its own (unknown) length: judged at the run.
+    const V = ins(info("a", { kind: "image" }), info("v", { kind: "video" }));
+    expect(
+      checkInputs(
+        {
+          clips: [
+            { fileId: "a", durationSec: 1, transition: { type: "fade", durationSec: 0.7 } },
+            { fileId: "v", transition: { type: "fade", durationSec: 0.7 } },
+            { fileId: "a", durationSec: 1 },
+          ],
+        },
+        V,
+      ),
+    ).toBeNull();
+  });
+
+  it("the tool refuses it before anything is reserved", async () => {
+    const t = await start();
+    const scope = await t.scopeOf();
+    const img = await t.putFile(scope, inputsOrFake().png, "png");
+    const r = await t.call(scope, {
+      clips: [
+        { fileId: img, durationSec: 1, transition: { type: "fade", durationSec: 0.7 } },
+        { fileId: img, durationSec: 1, transition: { type: "fade", durationSec: 0.7 } },
+        { fileId: img, durationSec: 1 },
+      ],
+    });
+    expect(r).toMatchObject({ ok: false, code: "compose_invalid_timeline" });
+    expect(t.db.$client.prepare("SELECT count(*) n FROM compose_jobs").get()).toEqual({ n: 0 });
   });
 });
 
@@ -1573,6 +1700,12 @@ function inputsOrFake() {
     prores: w("pr.mov", "mp4"),
     qtrleRed: w("qr.mov", "mp4"),
     qtrleBlue: w("qb.mov", "mp4"),
+    noel: w("noel.mp4", "mp4"),
+    silent1: w("s1.wav", "wav"),
+    silent29: w("s29.wav", "wav"),
+    loud: w("loud.mov", "mp4"),
+    rb: w("rb.mp4", "mp4"),
+    anim: w("anim.webp", "webp"),
     vbr: w("vbr.mp3", "mp3"),
   };
 }
@@ -2343,6 +2476,200 @@ describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", 
     await composeOne(t, s1, { clips: [{ fileId: f, trim: { startSec: 0, endSec: 300 }, durationSec: 1 }] });
     const ingest = calls.find((a) => a.includes("-vf") && a.includes("null"))!;
     expect(ingest[ingest.indexOf("-t") + 1]).toBe("2");
+  });
+
+  // ---- review r5, with the real ffmpeg
+  it("review r5: one presentation timeline — a B-frame MP4 without an edit list starts at its first picture", async () => {
+    const m = inputs();
+    // The explicit empty edit is read from the file's own boxes; a reorder delay has none.
+    expect(mp4EmptyLeads(m.edit)).toEqual({ video: 3.5, audio: expect.closeTo(3.478, 3) });
+    expect(mp4EmptyLeads(m.noel)).toEqual({ video: 0, audio: 0 });
+    const t = await start({ composer: real });
+    const s1 = await t.scopeOf();
+    const f = await t.putFile(s1, m.noel, "mp4");
+    const out = await composeOne(t, s1, { clips: [{ fileId: f }] });
+    expect(colours(out)).toEqual(Array(30).fill("red"));
+    // A normal libx264 B-frame MP4 with its edit list: its length, nothing added.
+    const s2 = await t.scopeOf();
+    const g = await t.putFile(s2, m.bframes, "mp4");
+    const out2 = await composeOne(t, s2, { clips: [{ fileId: g }] });
+    expect(Number(probeJson(out2).streams.find((x) => x.codec_type === "video")!.nb_read_packets)).toBe(60);
+  });
+
+  it("review r5: a 300 s B-frame MP4 without an edit list is exactly 5 minutes (not refused)", async () => {
+    const dir = tmp();
+    const long = path.join(dir, "noel300.mp4");
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=32x32:r=30:d=300"],
+      ...[
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-bf",
+        "2",
+        "-pix_fmt",
+        "yuv420p",
+        "-use_editlist",
+        "0",
+        long,
+      ],
+    ]);
+    const t = await start({ composer: real });
+    const s1 = await t.scopeOf();
+    const f = await t.putFile(s1, long, "mp4");
+    const id = await t.queue(s1, { clips: [{ fileId: f }] });
+    await t.drive();
+    const done = t.job(id);
+    expect(done.status, String(done.errorCode)).toBe("done");
+    expect(done.durationMs).toBe(300_000);
+  }, 600_000);
+
+  it("review r5: silent narration (WAV, the speech fixture's silent MP3) of 1–2.9 s makes a sound track", async () => {
+    const t = await start({ composer: real });
+    const silentMp3File = path.join(tmp(), "silent.mp3");
+    fs.writeFileSync(silentMp3File, silentMp3(40));
+    for (const [src, kind, sec] of [
+      [inputs().silent1, "wav", 1],
+      [inputs().silent29, "wav", 2.9],
+      [silentMp3File, "mp3", 1],
+    ] as const) {
+      const s = await t.scopeOf();
+      const img = await t.putFile(s, inputs().png, "png");
+      const nar = await t.putFile(s, src, kind);
+      const id = await t.queue(s, {
+        clips: [{ fileId: img, durationSec: sec }],
+        narration: [{ fileId: nar, startSec: 0 }],
+      });
+      await t.drive();
+      expect([src, t.job(id).status, t.job(id).errorCode]).toEqual([src, "done", null]);
+    }
+  });
+
+  it("review r5: a clip's gain above 1 is not clipped before the mix (no added harmonics)", async () => {
+    const t = await start({ composer: real });
+    const s1 = await t.scopeOf();
+    const f = await t.putFile(s1, inputs().loud, "mp4");
+    const out = await composeOne(t, s1, { clips: [{ fileId: f, volume: 2 }] });
+    const pcm = pcmOf(out).slice(12_000, 36_000);
+    const level = (hz: number) => {
+      let re = 0;
+      let im = 0;
+      for (let i = 0; i < pcm.length; i++) {
+        re += pcm[i]! * Math.cos((2 * Math.PI * hz * i) / 48_000);
+        im += pcm[i]! * Math.sin((2 * Math.PI * hz * i) / 48_000);
+      }
+      return Math.hypot(re, im);
+    };
+    const dbc = 20 * Math.log10(level(1500) / level(500));
+    expect(dbc).toBeLessThan(-40);
+  });
+
+  it("review r5: cues at a 31-frame video's end and back-to-back cues in the last 1/20 s all reach the MP4", async () => {
+    const t = await start({ composer: real });
+    for (const [sec, cues] of [
+      [31 / 30, [{ startSec: 1.031, endSec: 1.032, text: "끝" }]],
+      [
+        1,
+        [
+          { startSec: 0.955, endSec: 0.995, text: "하나" },
+          { startSec: 0.996, endSec: 0.999, text: "둘" },
+        ],
+      ],
+    ] as const) {
+      const s = await t.scopeOf();
+      const img = await t.putFile(s, inputs().png, "png");
+      const id = await t.queue(s, { clips: [{ fileId: img, durationSec: sec }], subtitles: cues });
+      await t.drive();
+      const done = t.job(id);
+      expect(done.status, String(done.errorCode)).toBe("done");
+      const out = t.app.files!.pathOf(t.app.files!.get(done.fileId!)!);
+      const srt = execFileSync(FFMPEG, [
+        "-hide_banner",
+        "-v",
+        "error",
+        "-i",
+        out,
+        "-map",
+        "0:s:0",
+        "-f",
+        "srt",
+        "-",
+      ]).toString();
+      for (const c of cues) expect(srt).toContain(c.text);
+    }
+  });
+
+  it("review r5: a trim's first frame is the one on screen at its start (0.990 s: still red)", async () => {
+    const t = await start({ composer: real });
+    const s1 = await t.scopeOf();
+    const f = await t.putFile(s1, inputs().rb, "mp4");
+    const out = await composeOne(t, s1, {
+      clips: [{ fileId: f, trim: { startSec: 0.99, endSec: 1.023333 } }],
+    });
+    expect(colours(out)).toEqual(["red"]);
+  });
+
+  it("review r5: subtitles keep indentation, blank lines and a trailing tab (MP4 and VTT)", async () => {
+    const t = await start({ composer: real });
+    const s1 = await t.scopeOf();
+    const img = await t.putFile(s1, inputs().png, "png");
+    const text = "    들여쓰기\n\n빈 줄 뒤\t";
+    const id = await t.queue(s1, {
+      clips: [{ fileId: img, durationSec: 1 }],
+      subtitles: [{ startSec: 0, endSec: 0.9, text }],
+    });
+    await t.drive();
+    const done = t.job(id);
+    expect(done.status, String(done.errorCode)).toBe("done");
+    const out = t.app.files!.pathOf(t.app.files!.get(done.fileId!)!);
+    const packets = JSON.parse(
+      execFileSync(FFPROBE, [
+        "-v",
+        "error",
+        "-select_streams",
+        "s",
+        "-show_packets",
+        "-show_data",
+        "-of",
+        "json",
+        out,
+      ]).toString(),
+    ) as { packets: { data: string }[] };
+    const fromMp4 = packets.packets
+      .map((p) =>
+        Buffer.from(
+          p.data
+            .split("\n")
+            .map((l) => l.slice(10, 49).replace(/\s/g, ""))
+            .join(""),
+          "hex",
+        ),
+      )
+      .filter((b) => b.length > 2 && b.readUInt16BE(0) > 0)
+      .map((b) =>
+        b
+          .subarray(2, 2 + b.readUInt16BE(0))
+          .toString("utf8")
+          .replace(/⁠/g, ""),
+      );
+    expect(fromMp4).toEqual([text]);
+    const vtt = (await t.api(t.f.cookies.owner, "GET", `/api/compose-jobs/${id}/subtitles.vtt`)).body;
+    const cue = vtt.split("\n").slice(3, -1).join("\n").replace(/⁠/g, "");
+    expect(cue).toBe(text);
+  });
+
+  it("review r5: an animated WebP is refused at the call with its own code", async () => {
+    expect(isAnimatedWebp(inputs().anim)).toBe(true);
+    expect(isAnimatedWebp(inputs().png)).toBe(false);
+    const t = await start({ composer: real });
+    const s1 = await t.scopeOf();
+    const f = await t.putFile(s1, inputs().anim, "webp");
+    expect(await t.call(s1, { clips: [{ fileId: f, durationSec: 1 }] })).toMatchObject({
+      ok: false,
+      code: "compose_input_animated",
+      hint: MEDIA_TOOL_HINTS.compose_input_animated,
+    });
   });
 
   it("readiness: a tiny composition checked in the same sandbox", async () => {

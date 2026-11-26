@@ -55,3 +55,12 @@ export function composePollMs(
   if (!status || COMPOSE_ENDED.has(status)) return false;
   return streamFailed || !hasEventSource ? 3000 : false;
 }
+
+/**
+ * The card's length line (review r5): the length once known; while the job may still work it out, "계산 중"; ended
+ * without one (failed before its lengths were decoded), "확인할 수 없음" — never "계산 중" for good.
+ */
+export function durationText(job: Pick<ComposeJob, "durationSec" | "status">): string {
+  if (job.durationSec > 0) return secondsText(job.durationSec);
+  return COMPOSE_ENDED.has(job.status) ? "확인할 수 없음" : "계산 중";
+}

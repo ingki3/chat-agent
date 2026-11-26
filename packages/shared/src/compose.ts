@@ -139,7 +139,12 @@ export const ComposeTimeline = z
           .object({
             startSec: Sec,
             endSec: Sec,
-            text: z.string().trim().min(1).max(COMPOSE_LIMITS.subtitleChars),
+            // The text as given (review r5: indentation, blank lines and tabs are kept) — only not all whitespace.
+            text: z
+              .string()
+              .min(1)
+              .max(COMPOSE_LIMITS.subtitleChars)
+              .refine((t) => t.trim().length > 0, { message: "not only whitespace" }),
           })
           .strict(),
       )

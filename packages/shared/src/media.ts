@@ -309,6 +309,8 @@ export const MEDIA_TOOL_CODES = [
   "compose_input_unreadable",
   /** Stage 4: the result would be longer than 5 minutes (or the inputs over 2GB together). */
   "compose_too_long",
+  /** Stage 4 (review r5): an animated WebP — this server's ffmpeg cannot decode one (a still image is taken). */
+  "compose_input_animated",
 ] as const;
 export type MediaToolCode = (typeof MEDIA_TOOL_CODES)[number];
 
@@ -361,6 +363,8 @@ export const MEDIA_TOOL_HINTS: Partial<Record<MediaToolCode, string>> = {
     "그 자리에 쓸 수 없는 파일 종류예요. 클립은 png·jpg·webp 이미지나 mp4·mov 영상, 나레이션·음악은 mp3·m4a·wav(또는 소리 있는 영상)만 돼요.",
   compose_input_unreadable:
     "입력 파일을 읽지 못했어요(손상됐거나 지원하지 않는 형식). 다른 파일로 해 보세요.",
+  compose_input_animated:
+    "움직이는(애니메이션) WebP는 합성에 쓸 수 없어요. 정지 이미지(png·jpg·정지 webp)로 바꿔 다시 요청해 주세요.",
   compose_too_long:
     "결과가 너무 길어요(최대 5분, 입력 합계 2GB). 클립이나 나레이션을 줄여 다시 요청해 주세요.",
   media_truncated:

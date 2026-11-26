@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { COMPOSE_ENDED, COMPOSE_JOB_CODE_TEXT, ComposeJob } from "@agentlee/shared";
 import { ApiError, composeJobs, errorText, files } from "../api.js";
 import { canPlayMp4 } from "./video-card.js";
-import { COMPOSE_STATUS_TEXT, composePollMs, newestComposeJob, secondsText } from "./compose-card.js";
+import { COMPOSE_STATUS_TEXT, composePollMs, durationText, newestComposeJob } from "./compose-card.js";
 
 const key = (id: string) => ["compose-job", id] as const;
 
@@ -84,11 +84,15 @@ export function ComposeCard({ jobId }: { jobId: string }) {
       </div>
       <dl className="sched-facts small">
         <dt>길이</dt>
-        <dd data-testid="compose-card-duration">
-          {job.durationSec > 0 ? secondsText(job.durationSec) : "계산 중"}
-        </dd>
+        <dd data-testid="compose-card-duration">{durationText(job)}</dd>
         <dt>크기</dt>
-        <dd>{job.width > 0 ? `${job.width}×${job.height}, 30fps` : "계산 중"}</dd>
+        <dd>
+          {job.width > 0
+            ? `${job.width}×${job.height}, 30fps`
+            : COMPOSE_ENDED.has(job.status)
+              ? "확인할 수 없음"
+              : "계산 중"}
+        </dd>
         <dt>클립</dt>
         <dd>{job.clips}개</dd>
         <dt>자막</dt>

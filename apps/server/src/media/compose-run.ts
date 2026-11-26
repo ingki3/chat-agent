@@ -49,7 +49,7 @@ export type ComposeOutcome =
   { ok: true; file: string; bytes: number; plan: Plan } | { ok: false; code: ComposeJobCode };
 export type ProbeOutcome =
   | { ok: true; info: Omit<InputInfo, "fileId" | "name"> }
-  | { ok: false; reason: "unreadable" | "kind" | "failed" };
+  | { ok: false; reason: "unreadable" | "kind" | "failed" | "animated" };
 
 export type Composer = {
   /** A fresh job folder with `in/`, `work/` and `out/` (its name is the job's id). */
@@ -125,8 +125,122 @@ const Probe = z.object({
     .optional(),
 });
 
-/** ffprobe's report of an input judged (exported for tests). */
-export function judgeInput(stdout: string, fileKind: FileKind): ProbeOutcome {
+/** Leading empty edits of an MP4/MOV's first picture and sound tracks, in seconds (`mp4EmptyLeads`). */
+export type EmptyLeads = { video: number; audio: number };
+
+/**
+ * An MP4/MOV's explicit leading empty edits (review r5), read from its own boxes — `moov/mvhd` (the movie's timescale)
+ * and each `trak`'s handler (`vide`/`soun`) and edit list (`edts/elst`: the entries at its start whose media time is
+ * −1). Box headers only, the `moov` box read whole when it is at most 32 MB; anything unexpected is no empty edit
+ * (0) — ffmpeg's own reading of the file then decides, as before. Exported for tests.
+ */
+export function mp4EmptyLeads(file: string): EmptyLeads {
+  const none = { video: 0, audio: 0 };
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const size = fs.fstatSync(fd).size;
+    const head = Buffer.alloc(16);
+    let off = 0;
+    let moov: Buffer | undefined;
+    for (let n = 0; off + 8 <= size && n < 1000; n++) {
+      fs.readSync(fd, head, 0, 16, off);
+      let len = head.readUInt32BE(0);
+      const type = head.toString("latin1", 4, 8);
+      if (len === 1) len = Number(head.readBigUInt64BE(8));
+      else if (len === 0) len = size - off;
+      if (len < 8 || off + len > size) return none;
+      if (type === "moov") {
+        if (len > 32 * 1024 * 1024) return none;
+        moov = Buffer.alloc(len);
+        fs.readSync(fd, moov, 0, len, off);
+        break;
+      }
+      off += len;
+    }
+    if (!moov) return none;
+    const kids = function* (b: Buffer, from: number, to: number) {
+      let at = from;
+      while (at + 8 <= to) {
+        let len = b.readUInt32BE(at);
+        let hdr = 8;
+        if (len === 1) {
+          if (at + 16 > to) return;
+          len = Number(b.readBigUInt64BE(at + 8));
+          hdr = 16;
+        } else if (len === 0) len = to - at;
+        if (len < hdr || at + len > to) return;
+        yield { type: b.toString("latin1", at + 4, at + 8), start: at + hdr, end: at + len };
+        at += len;
+      }
+    };
+    let scale = 0;
+    const leads: EmptyLeads = { video: 0, audio: 0 };
+    const seen = { video: false, audio: false };
+    for (const box of kids(moov, 8, moov.length)) {
+      if (box.type === "mvhd") {
+        const v = moov[box.start]!;
+        scale = moov.readUInt32BE(box.start + (v === 1 ? 20 : 12));
+      }
+      if (box.type !== "trak") continue;
+      let handler = "";
+      let empty = 0;
+      for (const t of kids(moov, box.start, box.end)) {
+        if (t.type === "mdia")
+          for (const m of kids(moov, t.start, t.end))
+            if (m.type === "hdlr") handler = moov.toString("latin1", m.start + 8, m.start + 12);
+        if (t.type === "edts")
+          for (const e of kids(moov, t.start, t.end)) {
+            if (e.type !== "elst") continue;
+            const v = moov[e.start]!;
+            const count = moov.readUInt32BE(e.start + 4);
+            const size1 = v === 1 ? 20 : 12;
+            for (let k = 0, at = e.start + 8; k < count && at + size1 <= e.end; k++, at += size1) {
+              const dur = v === 1 ? Number(moov.readBigUInt64BE(at)) : moov.readUInt32BE(at);
+              const media = v === 1 ? Number(moov.readBigInt64BE(at + 8)) : moov.readInt32BE(at + 4);
+              if (media !== -1) break;
+              empty += dur;
+            }
+          }
+      }
+      const kind = handler === "vide" ? "video" : handler === "soun" ? "audio" : null;
+      if (!kind || seen[kind] || !scale) continue;
+      seen[kind] = true;
+      leads[kind] = empty / scale;
+    }
+    return leads;
+  } catch {
+    return none;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+/** Whether a WebP is animated (its `VP8X` header's animation flag, or an `ANIM` chunk) — review r5. */
+export function isAnimatedWebp(file: string): boolean {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const b = Buffer.alloc(64);
+    const got = fs.readSync(fd, b, 0, 64, 0);
+    if (got < 21 || b.toString("latin1", 0, 4) !== "RIFF" || b.toString("latin1", 8, 12) !== "WEBP")
+      return false;
+    return (
+      (b.toString("latin1", 12, 16) === "VP8X" && (b[20]! & 0x02) !== 0) || b.includes("ANIM", 12, "latin1")
+    );
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+/** ffprobe's report of an input judged (exported for tests); `leads`: an MP4/MOV's explicit leading empty edits. */
+export function judgeInput(
+  stdout: string,
+  fileKind: FileKind,
+  leads: EmptyLeads = { video: 0, audio: 0 },
+): ProbeOutcome {
   const kind = inputKindOf(fileKind);
   if (!kind) return { ok: false, reason: "kind" };
   let r: z.infer<typeof Probe>;
@@ -159,6 +273,13 @@ export function judgeInput(stdout: string, fileKind: FileKind): ProbeOutcome {
     DEMUXER[fileKind] === "mov" && a && Number.isFinite(a.duration) && a.duration! > 0
       ? (Number.isFinite(a.start_time) ? a.start_time! : 0) + a.duration!
       : null;
+  // Review r5: an MP4/MOV's presentation 0 on its `-copyts` timeline — the earliest first sample of its picture and
+  // sound, not counting an explicit leading empty edit (that stays); a reorder delay without an edit list is no gap.
+  const firsts = [
+    ...(v && Number.isFinite(v.start_time) ? [v.start_time! - leads.video] : []),
+    ...(a && Number.isFinite(a.start_time) ? [a.start_time! - leads.audio] : []),
+  ];
+  const originSec = DEMUXER[fileKind] === "mov" && firsts.length ? Math.max(0, Math.min(...firsts)) : 0;
 
   if (kind === "image") {
     if (!v || !side(v.width) || !side(v.height)) return { ok: false, reason: "unreadable" };
@@ -190,6 +311,7 @@ export function judgeInput(stdout: string, fileKind: FileKind): ProbeOutcome {
         hasAudio: audio.length > 0,
         audioSec,
         audioEndSec,
+        originSec,
         width: v?.width ?? null,
         height: v?.height ?? null,
       },
@@ -204,6 +326,7 @@ export function judgeInput(stdout: string, fileKind: FileKind): ProbeOutcome {
       durationSec: duration,
       audioSec,
       audioEndSec,
+      originSec,
       hasVideo: false,
       hasAudio: true,
       width: null,
@@ -294,9 +417,9 @@ export type Track = {
 };
 
 /**
- * PCM tracks (48 kHz stereo s16) summed into one of `total` samples, second by second (exported for tests): each at its
- * start, cut to its length, faded in and out linearly over its overlaps (two crossfading clips add up to one), clipped
- * to 16 bits. The clips' sound (`bed.pcm`: their transitions are their crossfades) and the narration (`narration.pcm`).
+ * PCM tracks (48 kHz stereo s16) summed into one of `total` samples (48 kHz stereo float — review r5), second by second (exported for tests): each at its
+ * start, cut to its length, faded in and out linearly over its overlaps (two crossfading clips add up to one), never
+ * clipped. The clips' sound (`bed.pcm`: their transitions are their crossfades) and the narration (`narration.pcm`).
  */
 export async function mixPcm(out: string, total: number, tracks: readonly Track[]): Promise<void> {
   const CHUNK = 48_000;
@@ -304,7 +427,7 @@ export async function mixPcm(out: string, total: number, tracks: readonly Track[
   const fds = new Map<string, number>();
   try {
     const acc = new Float64Array(CHUNK * 2);
-    const outBuf = Buffer.alloc(CHUNK * 4);
+    const outBuf = Buffer.alloc(CHUNK * 8);
     const inBuf = Buffer.alloc(CHUNK * 4);
     for (let c0 = 0; c0 < total; c0 += CHUNK) {
       const n = Math.min(CHUNK, total - c0);
@@ -332,10 +455,10 @@ export async function mixPcm(out: string, total: number, tracks: readonly Track[
           acc[o + 1] = acc[o + 1]! + inBuf.readInt16LE(k * 4 + 2) * w;
         }
       }
-      for (let k = 0; k < n * 2; k++)
-        outBuf.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(acc[k]!))), k * 2);
+      // Float, not clipped (review r5): a gain above 1 reaches the ducking and the loudness normalisation intact.
+      for (let k = 0; k < n * 2; k++) outBuf.writeFloatLE(acc[k]! / 32768, k * 4);
       let off = 0;
-      while (off < n * 4) off += fs.writeSync(fd, outBuf, off, n * 4 - off);
+      while (off < n * 8) off += fs.writeSync(fd, outBuf, off, n * 8 - off);
       await yieldNow();
     }
   } finally {
@@ -409,6 +532,8 @@ export function sandboxedComposer(o: {
   const probe: Composer["probe"] = async (file, fileKind, signal) => {
     if (!inputKindOf(fileKind)) return { ok: false, reason: "kind" };
     if (plainSize(file) === undefined) return { ok: false, reason: "failed" };
+    // Review r5: ffmpeg cannot decode an animated WebP — refused with its own code (no other decoder is run).
+    if (fileKind === "webp" && isAnimatedWebp(file)) return { ok: false, reason: "animated" };
     const dir = path.dirname(file);
     const r = await exec(tools.ffprobe, probeArgs(file, fileKind), {
       cwd: dir,
@@ -421,7 +546,7 @@ export function sandboxedComposer(o: {
     const v = decodeVerdict(r);
     if (v === "failed") return { ok: false, reason: "failed" };
     if (v !== "ok") return { ok: false, reason: "unreadable" };
-    return judgeInput(r!.stdout, fileKind);
+    return judgeInput(r!.stdout, fileKind, DEMUXER[fileKind] === "mov" ? mp4EmptyLeads(file) : undefined);
   };
 
   const compose: Composer["compose"] = async (job) => {
@@ -498,6 +623,7 @@ export function sandboxedComposer(o: {
           countPicture: u.count && info.hasVideo,
           capSec: u.cap,
           soundEndSec: info.audioEndSec ?? null,
+          originSec: info.originSec ?? 0,
         }),
         0,
         0,

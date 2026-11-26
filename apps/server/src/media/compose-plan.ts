@@ -77,6 +77,13 @@ export type InputInfo = {
    * estimate): the decoded sound is cut there (an AAC's last frame is padding past it). Null for other kinds.
    */
   audioEndSec?: number | null;
+  /**
+   * Review r5: an MP4/MOV's presentation 0 on its `-copyts` timeline (seconds): the earliest first sample of its picture
+   * and sound tracks, not counting an explicit leading empty edit (that stays, as nothing) — so a codec's reorder delay
+   * without an edit list (a B-frame MP4 whose first picture is at 0.0667 s) is not taken for an empty edit. 0 when
+   * there is nothing to take away; never negative (a preroll before 0 is cut).
+   */
+  originSec?: number;
   hasVideo: boolean;
   hasAudio: boolean;
   width: number | null;
@@ -95,6 +102,8 @@ export type PlanClip = {
   kenBurns: "in" | "out" | "left" | "right" | null;
   volume: number;
   hasAudio: boolean;
+  /** Its input's presentation 0 on the `-copyts` timeline (`InputInfo.originSec`). */
+  origin?: number;
   /**
    * Review r1: frames at its end that only hold its last picture (the last clip, held for the narration) — a Ken
    * Burns move ends at the clip's own length, then holds.
@@ -228,6 +237,17 @@ export function checkInputs(t: ComposeTimeline, inputs: ReadonlyMap<string, Inpu
       );
     if (total !== null) total -= d;
   }
+  // A clip between two transitions must hold both (review r5: three 1 s images with two 0.7 s transitions).
+  for (const [i, c] of t.clips.entries()) {
+    const n = stated[i] ?? null;
+    const into = i > 0 && t.clips[i - 1]!.transition ? frames(t.clips[i - 1]!.transition!.durationSec) : 0;
+    const out = c.transition ? frames(c.transition.durationSec) : 0;
+    if (n !== null && into + out > n)
+      return err(
+        "compose_invalid_timeline",
+        `clips[${i}]: its transitions in and out together must not be longer than the clip`,
+      );
+  }
   if (total !== null && total > COMPOSE_LIMITS.maxSeconds * FPS)
     return err(
       "compose_too_long",
@@ -321,6 +341,7 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
       kenBurns: null,
       volume: c.volume ?? 1,
       hasAudio: info.hasAudio,
+      origin: info.originSec ?? 0,
       head: 0,
       tail: 0,
       transition: null,
@@ -428,47 +449,46 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
 // ---------------------------------------------------------------- subtitles
 
 /**
- * A cue's text (review r3): the text as given — NFC, line breaks as "\n", control characters (not tabs) and empty lines out
- * (neither track can carry them) — and nothing else changed. Each format escapes only its own syntax (`toAss`,
+ * A cue's text (review r3, r5): the text as given — NFC, line breaks as "\n", control characters (not tabs) out — and
+ * nothing else changed (indentation, blank lines, trailing whitespace stay). Each format escapes only its own syntax (`toAss`,
  * `toVtt`).
  */
 export function cueText(raw: string): string {
-  return (
-    raw
-      .normalize("NFC")
-      .replace(/\r\n?/g, "\n")
-      // A tab is text (review r4: "항목\t값"); other control characters are not part of a cue.
-      // eslint-disable-next-line no-control-regex -- control characters are not part of a cue
-      .replace(/[\0-\x08\x0b-\x1f\x7f-\x9f]/g, "")
-      .split("\n")
-      .filter((l) => l.trim())
-      .join("\n")
-  );
+  const text = raw
+    .normalize("NFC")
+    .replace(/\r\n?/g, "\n")
+    // A tab is text (review r4: "항목\t값"); other control characters are not part of a cue.
+    // eslint-disable-next-line no-control-regex -- control characters are not part of a cue
+    .replace(/[\0-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+  // Indentation, blank lines and trailing whitespace stay (review r5); only a text of nothing but whitespace is none.
+  return text.trim() ? text : "";
 }
 
 type Cue = { startSec: number; endSec: number; text: string };
 type Timed = { start: number; end: number; text: string };
 
 /**
- * Cues in whole `unit`s (ASS: 1/100 s, VTT: 1/1000 s — review r3): each keeps a positive length after rounding
+ * Cues in whole `unit`s (ASS: 1/100 s, VTT: 1/1000 s — reviews r3–r5): each keeps a positive length after rounding
  * (at least one unit), none starts before the one before it ended, and none goes past the video's end (`totalSec`:
- * the real length worked out at the run — a cue starting at or after it is left out, one ending after it is cut).
+ * the real length worked out at the run, rounded up to a unit — a cue starting at or after it is left out, one ending
+ * after it is cut). Each cue keeps room for the ones after it, so rounding never drops one.
  */
 export function timedCues(subs: readonly Cue[], unit: number, totalSec?: number): Timed[] {
-  const total = totalSec === undefined ? Infinity : Math.round(totalSec * unit);
+  // The video's end in whole units, rounded up (review r5: a cue inside a 31-frame video's last unit is inside it).
+  const total = totalSec === undefined ? Infinity : Math.ceil(totalSec * unit - 1e-9);
+  const kept = subs
+    .map((s) => ({ ...s, text: cueText(s.text) }))
+    .filter((s) => s.text && (totalSec === undefined || s.startSec < totalSec));
   const out: Timed[] = [];
   let prev = 0;
-  for (const s of subs) {
-    const text = cueText(s.text);
-    if (!text) continue;
-    // A cue that starts inside the video keeps at least its last unit (review r4: 0.996–0.999 s of a 1 s video).
-    const start = Math.max(
-      s.startSec * unit < total ? Math.min(Math.round(s.startSec * unit), total - 1) : total,
-      prev,
-    );
-    const end = Math.min(Math.max(Math.round(s.endSec * unit), start + 1), total);
-    if (start >= total || end <= start) continue;
-    out.push({ start, end, text });
+  for (const [k, s] of kept.entries()) {
+    // Room for every cue after this one: one unit each before the end (review r5 — a cue is never squeezed out by
+    // rounding; it takes its unit from the cue before it).
+    const last = total - (kept.length - 1 - k);
+    const start = Math.min(Math.max(Math.round(s.startSec * unit), prev), last - 1);
+    const end = Math.min(Math.max(Math.round(s.endSec * unit), start + 1), last);
+    if (start < prev || end <= start) continue;
+    out.push({ start, end, text: s.text });
     prev = end;
   }
   return out;
@@ -493,10 +513,12 @@ const WJ = "\u2060";
  * break.
  */
 export function assText(text: string): string {
-  return text
+  const body = text
     .split("\n")
     .map((l) => l.replace(/\\([Nnh])/g, `\\${WJ}$1`).replace(/\{\\/g, `{${WJ}\\`))
     .join("\\N");
+  // ASS drops whitespace at the start of a dialogue's text: an invisible word joiner keeps the indentation (review r5).
+  return /^\s/.test(body) ? `${WJ}${body}` : body;
 }
 
 /**
@@ -533,7 +555,14 @@ export function toVtt(subs: readonly Cue[], totalSec?: number): string {
   return (
     "WEBVTT\n\n" +
     timedCues(subs, 1000, totalSec)
-      .map((c) => `${clock(c.start, 1000)} --> ${clock(c.end, 1000)}\n${esc(c.text)}\n`)
+      .map(
+        (c) =>
+          // A blank line would end the cue: it carries an invisible word joiner instead (review r5).
+          `${clock(c.start, 1000)} --> ${clock(c.end, 1000)}\n${c.text
+            .split("\n")
+            .map((l) => (l.trim() ? esc(l) : `${esc(l)}${WJ}`))
+            .join("\n")}\n`,
+      )
       .join("\n")
   );
 }
@@ -653,13 +682,16 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
     // starts late), the last one repeated after the picture ends. A picture with alpha (ProRes 4444, QuickTime
     // Animation) is blended over that black by the overlay itself. Then the trim's frames by number, the output size,
     // and held to the clip's length. The graph's trim ends the run (nothing after it is decoded).
-    const from = Math.round(c.startSec * FPS);
+    // The canvas starts at the trim's start (review r5): its first slot shows the source frame on screen at that very
+    // moment (a frame that began before it), and every later slot samples the source at start + k/30.
     const own = Math.max(1, Math.round(c.useSec * FPS));
+    // The canvas is the output's size (no frame of the source is kept for its size — review r5: a reference branch
+    // buffered every frame before the start); the picture is fitted to it first, its alpha kept for the overlay.
     picture =
-      `[0:v]${square},split[src][ref];color=c=black:s=16x16:r=${FPS},format=yuv420p[canvas];` +
-      `[canvas][ref]scale=rw:rh[bg];[bg][src]overlay=eof_action=repeat:repeatlast=1,` +
-      `trim=start_frame=${from}:end_frame=${from + own},setpts=N,` +
-      `${fit(W, H)},setsar=1,format=yuv420p,tpad=stop_mode=clone:stop=-1,${exact}`;
+      `[0:v]setpts=PTS-${num((c.origin ?? 0) + c.startSec)}/TB,${square},${fit(W, H)},setsar=1,format=yuva420p[src];` +
+      `color=c=black:s=${W}x${H}:r=${FPS},format=yuv420p[canvas];` +
+      `[canvas][src]overlay=eof_action=repeat:repeatlast=1,trim=end_frame=${own},setpts=N,` +
+      `format=yuv420p,tpad=stop_mode=clone:stop=-1,${exact}`;
   }
   const outs: { label: string; from: number; to: number; args: string[] }[] = [];
   if (c.head) outs.push({ label: "hv", from: 0, to: c.head, args: [...LOSSLESS, p.head] });
@@ -731,7 +763,12 @@ export function ingestArgs(o: {
   capSec: number;
   /** An MP4/MOV sound track's presentation end (`InputInfo.audioEndSec`): nothing past it (its codec's padding). */
   soundEndSec?: number | null;
+  /** Its presentation 0 on the `-copyts` timeline (`InputInfo.originSec`). */
+  originSec?: number;
 }): string[] {
+  const o0 = o.originSec ?? 0;
+  const shiftA = o0 > 0 ? `asetpts=PTS-${num(o0)}/TB,` : "";
+  const shiftV = o0 > 0 ? `setpts=PTS-${num(o0)}/TB,` : "";
   const cap = num(Math.max(1, o.capSec));
   return [
     ...FF_COMMON,
@@ -742,8 +779,8 @@ export function ingestArgs(o: {
           "-map",
           "0:a:0",
           "-af",
-          `aresample=${RATE}:async=1:first_pts=0${
-            o.soundEndSec ? `,atrim=end=${num(o.soundEndSec)}` : ""
+          `${shiftA}aresample=${RATE}:async=1:first_pts=0${
+            o.soundEndSec ? `,atrim=end=${num(o.soundEndSec - o0)}` : ""
           },aformat=sample_fmts=s16:channel_layouts=stereo`,
           "-t",
           cap,
@@ -752,12 +789,28 @@ export function ingestArgs(o: {
         ]
       : []),
     ...(o.countPicture
-      ? ["-map", "0:v:0", "-vf", `fps=${FPS}:start_time=0`, "-t", cap, "-an", "-sn", "-dn", "-f", "null", "-"]
+      ? [
+          "-map",
+          "0:v:0",
+          "-vf",
+          `${shiftV}fps=${FPS}:start_time=0`,
+          "-t",
+          cap,
+          "-an",
+          "-sn",
+          "-dn",
+          "-f",
+          "null",
+          "-",
+        ]
       : []),
   ];
 }
 
 const RAW = ["-f", "s16le", "-ar", String(RATE), "-ac", "2"];
+/** The server's mixes (`bed.pcm`, `narration.pcm`) are float (review r5: a clip's gain above 1 is not clipped before the
+ * ducking and the loudness normalisation). */
+const RAW_FLOAT = ["-f", "f32le", "-ar", String(RATE), "-ac", "2"];
 const DUCK = "sidechaincompress=threshold=0.03:ratio=8:attack=20:release=400";
 
 /**
@@ -769,12 +822,12 @@ export function audioArgs(plan: Plan, o: { narration: boolean; music: string | n
   const T = plan.samples;
   const m = plan.music;
   const duckMusic = !!(o.music && m?.duck && o.narration);
-  const ins: string[] = ["-protocol_whitelist", "file,pipe", ...RAW, "-i", "bed.pcm"];
+  const ins: string[] = ["-protocol_whitelist", "file,pipe", ...RAW_FLOAT, "-i", "bed.pcm"];
   const graph: string[] = [];
   const mix: string[] = [];
   let k = 1;
   if (o.narration) {
-    ins.push("-protocol_whitelist", "file,pipe", ...RAW, "-i", "narration.pcm");
+    ins.push("-protocol_whitelist", "file,pipe", ...RAW_FLOAT, "-i", "narration.pcm");
     const taps = 2 + (duckMusic ? 1 : 0);
     graph.push(`[${k}:a]asplit=${taps}[nar][scb]${duckMusic ? "[scm]" : ""}`);
     graph.push(`[0:a][scb]${DUCK}[bed]`);
@@ -806,7 +859,14 @@ export function audioArgs(plan: Plan, o: { narration: boolean; music: string | n
     mix.push("[mus]");
   }
   // loudnorm needs 3 s to measure: a shorter (or silent) sound is padded first (else it gives NaN), then cut back.
-  const tail = `apad=whole_len=${Math.max(T, 3 * RATE)},loudnorm=I=-16:TP=-1.5:LRA=11,aresample=${RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=end_sample=${T},asetpts=N/SR/TB[out]`;
+  // Loudness normalisation needs 3 s to measure (`loudnorm` gives NaN on less, reviews r1 and r5): a result of 3 s or
+  // more is normalised as it is (no padding — padding in front of `loudnorm` cut the end of the sound); a shorter one is
+  // only kept from clipping (`alimiter` at −1.5 dBFS, its delay compensated).
+  const level =
+    T >= 3 * RATE
+      ? `loudnorm=I=-16:TP=-1.5:LRA=11,aresample=${RATE}`
+      : "alimiter=limit=0.8414:level=0:latency=1";
+  const tail = `${level},aformat=sample_fmts=fltp:sample_rates=${RATE}:channel_layouts=stereo,apad,atrim=end_sample=${T},asetpts=N/SR/TB[out]`;
   graph.push(
     mix.length === 1
       ? `${mix[0]}${tail}`
