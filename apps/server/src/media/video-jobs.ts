@@ -176,6 +176,8 @@ const ACTIVE = [...VIDEO_ACTIVE] as VideoJobStatus[];
 const POLLED: VideoJobStatus[] = ["pending", "in_progress", "downloading"];
 /** How long a stop may take — waiting for submits under way and recording held outcomes, in one loop. */
 const STOP_BUDGET_MS = 10_000;
+/** The lock wait of each write of the stop's one last try, after its budget. */
+const STOP_LAST_WRITE_MS = 50;
 /** How long a job's work may hold it (a poll, a download, its check, the file lock) before a pass picks it again. */
 const LEASE_MS = (l: { requestTimeoutMs: number; downloadTimeoutMs: number }) =>
   l.requestTimeoutMs + l.downloadTimeoutMs + 2 * 60_000;
@@ -233,6 +235,8 @@ export class VideoJobs {
    * a rolled-back delete's entry is replaced by the next delete of that conversation.
    */
   private readonly deleting = new Map<string, string[]>();
+  /** Wakes the stop's flush from its wait at once (an outcome held or handed over, a work settled — review r13). */
+  private wake: (() => void) | undefined;
   /** Held outcomes whose work ended while the engine stops: recorded by its final flush. */
   private readonly handedOver = new Map<string, Held>();
   /** Until when the probe's readiness (a known-good MP4 checked in the sandbox) holds. */
@@ -813,6 +817,7 @@ export class VideoJobs {
         this.inflight.delete(id);
         // The invariant (review r8): a held outcome outlives its work until the row reflects it.
         if (e.held) this.handOver(id, e.held);
+        this.wake?.();
       });
     this.inflight.set(id, { stop, done, kind, ...(held ? { held } : {}) });
     return done;
@@ -824,6 +829,7 @@ export class VideoJobs {
     if (!e) return;
     if (held) e.held = held;
     else delete e.held;
+    if (held) this.wake?.();
   }
 
   /** A held outcome whose work ended: nothing more if the row reflects it, else kept — retried, or flushed at stop. */
@@ -1075,18 +1081,19 @@ export class VideoJobs {
     // Until no work of any kind is under way any more — an aborted poll may still hand over a cost it had read
     // (review r12) — and, after a round made once the last of it settled, nothing is unrecorded; or the budget ends.
     const unrecorded = new Set<string>();
-    const round = () => {
+    const round = (floorMs = 0) => {
       const held = new Map(this.handedOver);
       for (const [id, w] of this.inflight) if (w.held) held.set(id, w.held);
       unrecorded.clear();
       for (const [id, h] of held) {
-        if (left() <= 0) {
+        const wait = Math.max(left(), floorMs);
+        if (wait <= 0) {
           unrecorded.add(id);
           continue;
         }
         let recorded: boolean;
         try {
-          recorded = this.withLockWait(left(), () => this.recordHeld(id, h));
+          recorded = this.withLockWait(wait, () => this.recordHeld(id, h));
         } catch {
           recorded = false;
         }
@@ -1099,8 +1106,22 @@ export class VideoJobs {
       const settled = this.inflight.size === 0;
       round();
       if (left() <= 0 || (settled && !unrecorded.size)) break;
-      await new Promise<void>((r) => setTimeout(r, Math.min(200, left())).unref());
+      // Waits up to 200 ms — or less: an outcome held or handed over, or a work settled, wakes it at once.
+      await new Promise<void>((r) => {
+        const timer = setTimeout(r, Math.min(200, left()));
+        timer.unref();
+        this.wake = () => {
+          clearTimeout(timer);
+          r();
+        };
+      });
+      this.wake = undefined;
+      // Timers already due run first (a woken round never starves them).
+      await new Promise<void>((r) => setTimeout(r, 0).unref());
     }
+    // The budget's end: one last try of what is still unrecorded (anything handed over at its very end included),
+    // each write waiting on a lock at most STOP_LAST_WRITE_MS — past the budget by at most that much per outcome.
+    if (left() <= 0 || unrecorded.size) round(STOP_LAST_WRITE_MS);
     // Still not recorded (the database not writable through the shutdown): the next start ends these jobs by the
     // rows' own rule (bound kept) — said in the log (the job's id only).
     for (const id of unrecorded) logEvent(this.o.log, "warn", "video.held_lost", { videoJobId: id });

@@ -3005,3 +3005,45 @@ describe("video jobs — review r12 regressions (the stop ends only once every w
       expect(t.usage()[0]).toMatchObject({ s: "settled", p: 800_000 });
     }, 30_000);
 });
+
+// ---------------------------------------------------------------- review round 13 (#255)
+
+describe("video jobs — review r13 regressions (a hand-over wakes the stop's flush)", () => {
+  it("a 402 received while the flush waits near the budget's end is recorded (bound released)", async () => {
+    let deliver!: (answer: Response) => void;
+    const server = fakeServer({ submit: () => new Promise<Response>((resolve) => (deliver = resolve)) });
+    const t = await start({ server, dbFile: true });
+    const card = await t.card();
+    const approval = t.approve(card.jobId, 0);
+    await vi.waitFor(() => expect(deliver).toBeDefined());
+    const begin = Date.now();
+    let deliveredAt = -1;
+    const timer = globalThis.setTimeout;
+    const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+      fn: (...args: unknown[]) => void,
+      ms: number,
+      ...args: unknown[]
+    ) => {
+      const h = timer(fn, ms, ...args);
+      if (Date.now() - begin > 9600 && ms > 3 && ms < 200 && deliveredAt < 0)
+        timer(
+          () => {
+            deliveredAt = Date.now() - begin;
+            deliver(new Response(null, { status: 402 }));
+          },
+          Math.max(1, Math.floor(ms / 4)),
+        );
+      return h;
+    }) as typeof setTimeout);
+    try {
+      await Promise.all([approval, t.video.stop()]);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(deliveredAt).toBeGreaterThan(0);
+    expect(deliveredAt).toBeLessThan(10_000);
+    expect(t.job(card.jobId)).toMatchObject({ status: "failed", errorCode: "video_payment" });
+    expect(t.usage()).toHaveLength(0);
+    expect(server.posts()).toHaveLength(1);
+  }, 25_000);
+});
