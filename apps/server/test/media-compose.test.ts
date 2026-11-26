@@ -26,6 +26,7 @@ import { knownSecrets } from "../src/secrets/known.js";
 import {
   checkTimeline,
   clipArgs,
+  timedCues,
   concatList,
   cueText,
   isPlanError,
@@ -98,7 +99,9 @@ let media:
       | "v1a4"
       | "frame30"
       | "alphaBlue"
-      | "alphaRed",
+      | "alphaRed"
+      | "early"
+      | "vbr",
       string
     >
   | undefined;
@@ -272,6 +275,54 @@ function inputs() {
     "1",
     path.join(dir, "alpha-red.png"),
   );
+  // Re-plan r3 inputs: sound from 0, picture from 1.2 s (3 s in all); a VBR MP3 written to a pipe (no length header —
+  // ffprobe can only estimate it): 5 s of noise, then 5 s of a quiet tone.
+  ff(
+    ...[
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=f=440:r=48000:d=3",
+      "-itsoffset",
+      "1.2",
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc2=s=64x64:r=30:d=1.8",
+    ],
+    ...[
+      "-map",
+      "1:v",
+      "-map",
+      "0:a",
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "aac",
+      path.join(dir, "early.mp4"),
+    ],
+  );
+  fs.writeFileSync(
+    path.join(dir, "vbr.mp3"),
+    execFileSync(
+      FFMPEG,
+      [
+        ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "anoisesrc=r=44100:d=5:a=0.3"],
+        ...[
+          "-f",
+          "lavfi",
+          "-i",
+          "sine=f=330:r=44100:d=5,volume=0.2",
+          "-filter_complex",
+          "[0:a][1:a]concat=n=2:v=0:a=1",
+        ],
+        ...["-c:a", "libmp3lame", "-q:a", "2", "-f", "mp3", "-"],
+      ],
+      { maxBuffer: 64 * 1024 * 1024 },
+    ),
+  );
   media = {
     late: path.join(dir, "late.mov"),
     shortSound: path.join(dir, "short.mp4"),
@@ -285,6 +336,8 @@ function inputs() {
     frame30: path.join(dir, "frame30.mp4"),
     alphaBlue: path.join(dir, "alpha-blue.png"),
     alphaRed: path.join(dir, "alpha-red.png"),
+    early: path.join(dir, "early.mp4"),
+    vbr: path.join(dir, "vbr.mp3"),
     png: path.join(dir, "a.png"),
     wide: path.join(dir, "wide.png"),
     video: path.join(dir, "v.mp4"),
@@ -494,11 +547,17 @@ describe("the plan (review R1–R3)", () => {
     expect(p.frames).toBe(Math.ceil(2.8 * 30));
     expect(p.clips[0]!.frames).toBe(p.frames);
     expect(p.narration[0]).toMatchObject({ startSample: 24_000, maxSamples: p.samples - 24_000 });
-    const long = planTimeline(
-      { clips: [{ fileId: "a", durationSec: 1 }], narration: [{ fileId: "n", startSec: 299 }] },
-      ins(info("a", { kind: "image" }), info("n", { kind: "audio", durationSec: 2 })),
+    const over = { clips: [{ fileId: "a", durationSec: 1 }], narration: [{ fileId: "n", startSec: 299 }] };
+    const two = ins(info("a", { kind: "image" }), info("n", { kind: "audio", durationSec: 2, audioSec: 2 }));
+    // Re-plan r3: at the call the narration's length is an estimate — refused only when clearly over (10 %); the run
+    // checks the decoded length exactly.
+    expect(isPlanError(planTimeline(over, two))).toBe(false);
+    expect(planTimeline(over, two, { runtime: true })).toMatchObject({ code: "compose_too_long" });
+    const forty = ins(
+      info("a", { kind: "image" }),
+      info("n", { kind: "audio", durationSec: 40, audioSec: 40 }),
     );
-    expect(long).toMatchObject({ code: "compose_too_long" });
+    expect(planTimeline(over, forty)).toMatchObject({ code: "compose_too_long" });
   });
 
   it("refuses what does not hold, saying where (review R1, R5)", () => {
@@ -583,27 +642,49 @@ describe("the plan (review R1–R3)", () => {
     });
   });
 
-  it("subtitles: one text for both tracks — no tags, no override codes, no cue arrow; VTT escapes", () => {
-    expect(cueText("  <b>안녕</b> {\\an8}세계\r\n\r\n둘째 --> 줄 \\N ")).toBe("안녕 세계\n둘째 → 줄 ＼N");
-    // Review r1: plain braces are text — only an override block (`{\…}`) is control syntax.
-    expect(cueText("집합 {1, 2}와 한국어")).toBe("집합 {1, 2}와 한국어");
-    expect(toVtt([{ startSec: 0, endSec: 1, text: "집합 {1, 2}" }])).toContain("\n집합 {1, 2}\n");
+  it("subtitles: the text as given; each format escapes only its own syntax (review r3)", () => {
+    // Only line endings, control characters and empty lines change.
+    expect(cueText("  <b>안녕</b> {\\an8}세계\r\n\r\n둘째 --> 줄 \\N C:\\temp ")).toBe(
+      "  <b>안녕</b> {\\an8}세계\n둘째 --> 줄 \\N C:\\temp ",
+    );
     const subs = [
       { startSec: 0.25, endSec: 1, text: "A & B < C" },
-      { startSec: 61.5, endSec: 3725.004, text: "<i></i>" },
-      { startSec: 62, endSec: 63, text: "끝" },
+      { startSec: 62, endSec: 63, text: "끝 {1, 2}" },
+      { startSec: 64, endSec: 65, text: "첫 줄\n둘째, 줄 \\N {\\i1}" },
     ];
-    // A cue that is only tags is dropped; a lone "<" is text; lines joined with ASS's own break (review r2: the mux
-    // reads ASS, which takes "<", ">" and "&" as they are).
-    const ass = toAss([...subs, { startSec: 64, endSec: 65, text: "첫 줄\n둘째, 줄" }]);
-    expect(ass.split("\n").filter((l) => l.startsWith("Dialogue:"))).toEqual([
+    // ASS: a word joiner only inside "\N" / "\n" / "\h" and "{\"; lines joined with ASS's own break.
+    expect(
+      toAss(subs)
+        .split("\n")
+        .filter((l) => l.startsWith("Dialogue:")),
+    ).toEqual([
       "Dialogue: 0,0:00:00.25,0:00:01.00,Default,,0,0,0,,A & B < C",
-      "Dialogue: 0,0:01:02.00,0:01:03.00,Default,,0,0,0,,끝",
-      "Dialogue: 0,0:01:04.00,0:01:05.00,Default,,0,0,0,,첫 줄\\N둘째, 줄",
+      "Dialogue: 0,0:01:02.00,0:01:03.00,Default,,0,0,0,,끝 {1, 2}",
+      "Dialogue: 0,0:01:04.00,0:01:05.00,Default,,0,0,0,,첫 줄\\N둘째, 줄 \\\u2060N {\u2060\\i1}",
     ]);
-    expect(toVtt([{ startSec: 0, endSec: 1, text: "A & B > C" }])).toBe(
-      "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nA &amp; B &gt; C\n",
+    // VTT: entities for & < > (a "-->" in a cue is "--&gt;").
+    expect(toVtt([{ startSec: 0, endSec: 1, text: "A & B --> C" }])).toBe(
+      "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nA &amp; B --&gt; C\n",
     );
+  });
+
+  it("short cues keep a positive length in whole units, never overlap after rounding, end with the video (review r3)", () => {
+    const subs = [
+      { startSec: 1.071, endSec: 1.074, text: "짧다" },
+      { startSec: 1.0745, endSec: 1.0749, text: "더 짧다" },
+      { startSec: 2, endSec: 9, text: "끝을 넘는다" },
+      { startSec: 9.5, endSec: 9.9, text: "끝 뒤" },
+    ];
+    expect(timedCues(subs, 100, 3).map((c) => [c.start, c.end])).toEqual([
+      [107, 108],
+      [108, 109],
+      [200, 300],
+    ]);
+    expect(timedCues(subs, 1000, 3).map((c) => [c.start, c.end])).toEqual([
+      [1071, 1074],
+      [1075, 1076],
+      [2000, 3000],
+    ]);
   });
 
   it("the arguments are the server's own: named demuxers, local files and the progress pipe only", () => {
@@ -785,7 +866,7 @@ describe("compose_video: the call and the queue", () => {
     const vtt = await t.api(t.f.cookies.owner, "GET", `/api/compose-jobs/${id}/subtitles.vtt`);
     expect(vtt.statusCode).toBe(200);
     expect(vtt.headers["content-type"]).toMatch(/^text\/vtt/);
-    expect(vtt.body).toBe("WEBVTT\n\n00:00:00.000 --> 00:00:01.500\n첫 장면 안녕\n");
+    expect(vtt.body).toBe("WEBVTT\n\n00:00:00.000 --> 00:00:01.500\n첫 장면 &lt;b&gt;안녕&lt;/b&gt;\n");
     // Not someone else's.
     expect((await t.api(t.f.cookies.stranger, "GET", `/api/compose-jobs/${id}`)).statusCode).toBe(403);
     expect((await t.api(t.f.cookies.shared, "GET", `/api/compose-jobs/${id}/subtitles.vtt`)).statusCode).toBe(
@@ -1237,6 +1318,50 @@ describe("review r2: the engine's one running slot", () => {
     release!();
     await t.jobs.idle();
   });
+  it("re-plan r3: a job prepared later but asked earlier goes first — the jobs it passes hear their new place", async () => {
+    let releaseRun: (() => void) | undefined;
+    const running = new Promise<void>((r) => (releaseRun = r));
+    let releaseProbe: (() => void) | undefined;
+    const slowProbe = new Promise<void>((r) => (releaseProbe = r));
+    let probes = 0;
+    const t = await start({
+      composer: (d) => {
+        const base = fixtureComposer(d, { stepMs: 1 });
+        return {
+          ...base,
+          // The second call's probe (A's) waits; everyone else's is quick.
+          probe: async (file, kind, signal) => (
+            (probes += 1) === 2 ? await slowProbe : undefined,
+            base.probe(file, kind, signal)
+          ),
+          compose: async (job) => (await running, base.compose(job)),
+        };
+      },
+    });
+    const run = await t.scopeOf("owner");
+    const a = await t.scopeOf("shared");
+    const b = await t.scopeOf("stranger");
+    const [ir, ia, ib] = [
+      await t.putFile(run, inputsOrFake().png, "png"),
+      await t.putFile(a, inputsOrFake().png, "png"),
+      await t.putFile(b, inputsOrFake().png, "png"),
+    ];
+    await t.queue(run, { clips: [{ fileId: ir, durationSec: 1 }] });
+    await new Promise((r) => setTimeout(r, 20));
+    const callA = t.queue(a, { clips: [{ fileId: ia, durationSec: 1 }] });
+    await new Promise((r) => setTimeout(r, 20));
+    const jb = await t.queue(b, { clips: [{ fileId: ib, durationSec: 1 }] });
+    expect(t.jobs.view(t.job(jb)).queuePosition).toBe(1);
+    const heard: (number | null)[] = [];
+    const off = t.jobs.subscribe(jb, () => heard.push(t.jobs.view(t.job(jb)).queuePosition));
+    releaseProbe!();
+    await callA;
+    off();
+    expect(t.jobs.view(t.job(jb)).queuePosition).toBe(2);
+    expect(heard).toContain(2);
+    releaseRun!();
+    await t.jobs.idle();
+  });
 });
 
 describe("review r2: the plan (pure)", () => {
@@ -1252,31 +1377,19 @@ describe("review r2: the plan (pure)", () => {
     });
   });
 
-  it("only real markup leaves a cue; plain < > stay (both tracks)", () => {
-    expect(cueText("1 < 2 이고 4 > 3")).toBe("1 < 2 이고 4 > 3");
-    expect(cueText('<b>굵게</b> <I>기울임</I> <font color="red">빨강</font> 줄<br>바꿈 <3')).toBe(
-      "굵게 기울임 빨강 줄바꿈 <3",
-    );
-    expect(toVtt([{ startSec: 0, endSec: 1, text: "1 < 2 & 4 > 3" }])).toContain(
-      "\n1 &lt; 2 &amp; 4 &gt; 3\n",
-    );
-  });
-
-  it("a trimmed video is opened at the keyframe before its start, and its frames counted from that start", () => {
+  it("a trimmed video is decoded from its start — no input seeking — and its frames counted on the container's timeline (re-plan r3)", () => {
     const p = planTimeline(
       { clips: [{ fileId: "v", trim: { startSec: 2, endSec: 3 } }] },
       ins(info("v", { kind: "video", durationSec: 4 })),
     ) as Plan;
     const a = clipArgs(p, 0, "/in");
-    expect(a.slice(a.indexOf("-noaccurate_seek"), a.indexOf("-noaccurate_seek") + 3)).toEqual([
-      "-noaccurate_seek",
-      "-ss",
-      "2",
-    ]);
-    expect(a).not.toContain("-t");
+    expect(a).not.toContain("-ss");
+    expect(a).not.toContain("-noaccurate_seek");
     const g = a[a.indexOf("-filter_complex") + 1]!;
-    expect(g).toContain("fps=30:start_time=0,trim=end_frame=30,");
-    expect(g).toContain("atrim=start=0:end=1,");
+    expect(g).toContain("fps=30:start_time=0,trim=start_frame=60:end_frame=90,");
+    // The picture only: its sound is a slice of the input's decoded PCM.
+    expect(g).not.toContain("[0:a");
+    expect(a).not.toContain("pcm_s16le");
   });
 });
 
@@ -1372,6 +1485,8 @@ function inputsOrFake() {
     frame30: w("f30.mp4", "mp4"),
     alphaBlue: w("ab.png", "png"),
     alphaRed: w("ar.png", "png"),
+    early: w("e.mp4", "mp4"),
+    vbr: w("vbr.mp3", "mp3"),
   };
 }
 
@@ -1411,7 +1526,8 @@ describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", 
     // own length) → 160 frames (the last picture held for 31).
     const frames = 160;
     expect(queued.durationMs).toBe(Math.round((frames / 30) * 1000));
-    expect((JSON.parse(queued.planJson!) as Plan).held).toBe(frames - 129);
+    // The call stored its inputs (their lengths estimates); the run decodes them and plans again.
+    expect((JSON.parse(queued.planJson!) as { inputs: InputInfo[] }).inputs).toHaveLength(6);
     // Progress from ffmpeg's own progress lines (review R6), written as it goes.
     const seen: number[] = [];
     const off = t.jobs.subscribe(id, () => seen.push(t.jobs.get(id)?.progress ?? -1));
@@ -1488,8 +1604,8 @@ describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", 
     const t0 = Date.now();
     const r = await c.compose({
       dir,
-      plan,
-      srt: null,
+      timeline: { output: { resolution: "1080p" }, clips },
+      inputs: [...infos.values()],
       signal: new AbortController().signal,
       deadlineAt: Date.now() + 10 * 60_000,
       onProgress: () => {},
@@ -1786,6 +1902,168 @@ describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", 
     // Escaped in the VTT itself: no raw "<", ">" or bare "&" in a cue.
     const cueLines = vtt.split("\n").filter((l) => l && !l.includes("-->") && l !== "WEBVTT");
     expect(cueLines.join("\n")).not.toMatch(/[<>]|&(?!lt;|gt;|amp;)/);
+  });
+
+  // ---- the re-plan after review r3: lengths decoded, no input seeking, subtitles as given
+  const loudness = (pcm: number[], from: number, to: number) =>
+    Math.max(0, ...pcm.slice(Math.round(from * 48_000), Math.round(to * 48_000)).map(Math.abs));
+
+  it("re-plan r3: sound that starts before the picture is kept — untrimmed and trimmed", async () => {
+    const t = await start({ composer: real });
+    const s1 = await t.scopeOf();
+    const f1 = await t.putFile(s1, inputs().early, "mp4");
+    const whole = await composeOne(t, s1, { clips: [{ fileId: f1 }] });
+    // 3 s (the sound's end), the sound from the very start.
+    expect(Number(probeJson(whole).streams.find((x) => x.codec_type === "video")!.nb_read_packets)).toBe(90);
+    const pcm = pcmOf(whole);
+    expect(loudness(pcm, 0, 0.1)).toBeGreaterThan(1000);
+    expect(loudness(pcm, 1, 1.1)).toBeGreaterThan(1000);
+    const s2 = await t.scopeOf();
+    const f2 = await t.putFile(s2, inputs().early, "mp4");
+    const part = await composeOne(t, s2, { clips: [{ fileId: f2, trim: { startSec: 0, endSec: 0.8 } }] });
+    const pcm2 = pcmOf(part);
+    expect(loudness(pcm2, 0.05, 0.75)).toBeGreaterThan(1000);
+    expect(Number(probeJson(part).streams.find((x) => x.codec_type === "video")!.nb_read_packets)).toBe(24);
+  });
+
+  it("re-plan r3: a VBR MP3 without a length header — narration and music by their decoded length", async () => {
+    const est = Number(
+      execFileSync(FFPROBE, [
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "csv=p=0",
+        inputs().vbr,
+      ]).toString(),
+    );
+    const t = await start({ composer: real });
+    const s1 = await t.scopeOf();
+    const img = await t.putFile(s1, inputs().png, "png");
+    const nar = await t.putFile(s1, inputs().vbr, "mp3");
+    const id = await t.queue(s1, {
+      clips: [{ fileId: img, durationSec: 1 }],
+      narration: [{ fileId: nar, startSec: 0 }],
+    });
+    await t.drive();
+    const done = t.job(id);
+    expect(done.status, String(done.errorCode)).toBe("done");
+    // Decoded: about 10 s (whatever ffprobe estimated) — the picture held that long and the tone heard to its end.
+    expect(done.durationMs).toBeGreaterThan(9_900);
+    expect(done.durationMs).toBeLessThan(10_200);
+    const out = t.app.files!.pathOf(t.app.files!.get(done.fileId!)!);
+    expect(loudness(pcmOf(out), 9.5, 9.8)).toBeGreaterThan(300);
+    console.log(
+      `VBR MP3: ffprobe estimate ${est.toFixed(3)} s, decoded result ${(done.durationMs / 1000).toFixed(3)} s`,
+    );
+    // As music (not looped) under a 10 s picture: heard to its real end.
+    const s2 = await t.scopeOf();
+    const img2 = await t.putFile(s2, inputs().png, "png");
+    const mus = await t.putFile(s2, inputs().vbr, "mp3");
+    const out2 = await composeOne(t, s2, {
+      clips: [{ fileId: img2, durationSec: 10 }],
+      music: { fileId: mus, volume: 1, loop: false },
+    });
+    expect(loudness(pcmOf(out2), 9.5, 9.8)).toBeGreaterThan(300);
+  });
+
+  it("re-plan r3: a long-GOP 1080p trim at 50 s — the frame at 50 s, decoded from the start (time and memory measured)", async () => {
+    const dir = tmp();
+    const gop = path.join(dir, "gop60.mp4");
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=1920x1080:r=30:d=60"],
+      ...["-f", "lavfi", "-i", "sine=f=440:r=48000:d=60", "-c:v", "libx264", "-preset", "ultrafast"],
+      ...[
+        "-g",
+        "1800",
+        "-keyint_min",
+        "1800",
+        "-sc_threshold",
+        "0",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        gop,
+      ],
+    ]);
+    let peak = 0;
+    const t = await start({
+      composer: (d) =>
+        sandboxedComposer({ dataDir: d, ffmpegPath: FFMPEG, onPeakRss: (b) => (peak = Math.max(peak, b)) }),
+    });
+    const s1 = await t.scopeOf();
+    const f = await t.putFile(s1, gop, "mp4");
+    const t0 = Date.now();
+    const out = await composeOne(t, s1, {
+      output: { resolution: "1080p" },
+      clips: [{ fileId: f, trim: { startSec: 50, endSec: 51 } }],
+    });
+    const ms = Date.now() - t0;
+    console.log(`60 s-GOP 1080p, trim 50–51 s: ${ms} ms (job), peak RSS ${(peak / 2 ** 20).toFixed(0)} MiB`);
+    expect(ms).toBeLessThan(120_000);
+    expect(peak).toBeLessThan(2 * 1024 ** 3);
+    // Its first frame is the source's frame at 50 s (decoded outside the server, accurately).
+    const ref = execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-ss", "50", "-i", gop, "-frames:v", "1"],
+      ...["-vf", "scale=160:90", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+    ]);
+    const got = frameAt(out, 0);
+    expect(got.reduce((n, v, i) => n + Math.abs(v - ref[i]!), 0) / got.length).toBeLessThan(6);
+  }, 600_000);
+
+  it("re-plan r3: special characters round-trip — the MP4's track and the card's VTT decode to the text given", async () => {
+    const t = await start({ composer: real });
+    const scope = await t.scopeOf();
+    const img = await t.putFile(scope, inputs().png, "png");
+    const texts = [
+      "C:\\temp 폴더",
+      "A --> B",
+      "1 < 2 & 3 > 2",
+      "{1, 2} <b>굵게</b> &amp;",
+      "줄 하나\n줄 둘",
+      "역슬래시 \\N 그대로 {\\i1}",
+    ];
+    const id = await t.queue(scope, {
+      clips: [{ fileId: img, durationSec: 6 }],
+      subtitles: texts.map((text, i) => ({ startSec: i, endSec: i + 0.9, text })),
+    });
+    await t.drive();
+    const done = t.job(id);
+    expect(done.status, String(done.errorCode)).toBe("done");
+    const out = t.app.files!.pathOf(t.app.files!.get(done.fileId!)!);
+    // mov_text samples straight from the file (a 2-byte length, then UTF-8; style boxes after it are not text).
+    const packets = execFileSync(FFPROBE, [
+      ...["-v", "error", "-select_streams", "s", "-show_packets", "-show_data", "-of", "json", out],
+    ]).toString();
+    const fromMp4 = (JSON.parse(packets) as { packets: { data: string }[] }).packets
+      .map((p) =>
+        Buffer.from(
+          p.data
+            .split("\n")
+            .map((l) => l.slice(10, 49).replace(/\s/g, ""))
+            .join(""),
+          "hex",
+        ),
+      )
+      .filter((b) => b.length > 2 && b.readUInt16BE(0) > 0)
+      // The word joiner ASS needs between "\" and N is invisible — what is shown is the text given.
+      .map((b) =>
+        b
+          .subarray(2, 2 + b.readUInt16BE(0))
+          .toString("utf8")
+          .replace(/\u2060/g, ""),
+      );
+    expect(fromMp4).toEqual(texts);
+    const vtt = (await t.api(t.f.cookies.owner, "GET", `/api/compose-jobs/${id}/subtitles.vtt`)).body;
+    const fromVtt = vtt
+      .split("\n\n")
+      .slice(1)
+      .map((b) => b.split("\n").slice(1).filter(Boolean).join("\n"))
+      .filter(Boolean)
+      .map((x) => x.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&"));
+    expect(fromVtt).toEqual(texts);
   });
 
   it("readiness: a tiny composition checked in the same sandbox", async () => {

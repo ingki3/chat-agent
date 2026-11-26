@@ -9,14 +9,17 @@ import {
 
 /**
  * 멀티미디어 합성's plan (#238 stage 4-1, docs/decisions/media-generation.md §15) — pure: no file is read and no program
- * runs here. From the validated timeline and what ffprobe said about the job's copies of its inputs, it works out every
- * number the composition uses — frames (30 per second) and samples (48 000 per second, 1600 per frame) — and builds every
+ * runs here. From the validated timeline and the lengths of the job's copies of its inputs, it works out every number
+ * the composition uses — frames (30 per second) and samples (48 000 per second, 1600 per frame) — and builds every
  * ffmpeg argument list itself (the model only ever gives the timeline; review R1–R4):
  *
  * - **clips**: each one rendered once, at the output size and 30 fps, to exactly its frame count (`trim`/`tpad`/`loop`/
  *   `zoompan`, PTS from the frame number), split into its own frames only (`body`, the final H.264) and the frames a
- *   transition overlaps (`head`/`tail`, lossless FFV1) — and its sound to exactly frames × 1600 samples of PCM (silence
- *   without sound);
+ *   transition overlaps (`head`/`tail`, lossless FFV1); its sound is a slice of its input's PCM (below);
+ * - **lengths are decoded, never read from metadata** (the re-plan after review r3): when the tool is called the lengths
+ *   are ffprobe's estimates (the call's answer and its 5-minute check); when the job runs, each input is decoded once
+ *   from its start (`ingestArgs`, no input seeking) — its sound to 48 kHz PCM from the container's start (the sample
+ *   count is its length), its picture counted at 30 fps from the same start — and the plan is made again from those;
  * - **transitions**: one `xfade` of a clip's tail and the next clip's head (two small inputs, the same frame count): the
  *   overlap is a whole number of frames, shorter than both clips;
  * - **the picture** is then the bodies and transitions one after another (the concat demuxer, stream copy: every piece is
@@ -62,12 +65,12 @@ export type InputInfo = {
   kind: InputKind;
   /** The copy's name in `in/` (server-made: `in-<n>.<kind>`). */
   name: string;
-  /** Seconds (video, audio); null for an image. */
-  durationSec: number | null;
   /**
-   * Review r1: where its first sound stream ends, from the file's start (its own start and length — a video's sound
-   * may be shorter than its picture); null without sound.
+   * Its length in seconds (video, audio — the later of its picture's and its sound's end); null for an image. When the
+   * tool is called: ffprobe's estimate; when the job runs: decoded (`ingestArgs`).
    */
+  durationSec: number | null;
+  /** Where its sound ends, from the file's start (estimated, then decoded); null without sound. */
   audioSec?: number | null;
   hasVideo: boolean;
   hasAudio: boolean;
@@ -158,7 +161,15 @@ export function checkTimeline(t: ComposeTimeline): PlanError | null {
 }
 
 /** The plan of a checked timeline over its probed inputs (by fileId), or why it does not hold. */
-export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, InputInfo>): Plan | PlanError {
+export function planTimeline(
+  t: ComposeTimeline,
+  inputs: ReadonlyMap<string, InputInfo>,
+  /**
+   * `runtime`: the lengths are decoded truths, not estimates — a trim may end past a picture that ended (it holds),
+   * and subtitles past the end are cut when they are written (`timedCues`), not refused.
+   */
+  o: { runtime?: boolean } = {},
+): Plan | PlanError {
   const early = checkTimeline(t);
   if (early) return early;
   const { width, height } = composeFrame(t.output?.resolution ?? "720p", t.output?.aspectRatio ?? "16:9");
@@ -208,7 +219,7 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
         "compose_invalid_timeline",
         `${where}.trim.startSec: the video is ${length.toFixed(2)} s long`,
       );
-    if (c.trim && c.trim.endSec > length + 0.05)
+    if (!o.runtime && c.trim && c.trim.endSec > length + 0.05)
       return err(
         "compose_invalid_timeline",
         `${where}.trim.endSec: the video is ${length.toFixed(2)} s long`,
@@ -282,7 +293,10 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
     needed = Math.max(needed, Math.ceil((n.startSec + sound) * FPS - 1e-6));
   }
   const max = COMPOSE_LIMITS.maxSeconds * FPS;
-  if (needed > max || total > max)
+  // When the tool is called the narration's length is ffprobe's estimate (a VBR MP3 without a length header can be off
+  // either way — re-plan r3): it is refused only when clearly over (10 %); the run checks the decoded length exactly.
+  const narrationMax = o.runtime ? max : Math.ceil(max * 1.1);
+  if (needed > narrationMax || total > max)
     return err(
       "compose_too_long",
       `the video would be ${(Math.max(needed, total) / FPS).toFixed(1)} s (at most ${COMPOSE_LIMITS.maxSeconds})`,
@@ -315,7 +329,7 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
   }
   const subs = t.subtitles ?? [];
   for (const [i, s] of subs.entries())
-    if (s.endSec > total / FPS + 1e-6)
+    if (!o.runtime && s.endSec > total / FPS + 1e-6)
       return err(
         "compose_invalid_timeline",
         `subtitles[${i}].endSec: the video is ${(total / FPS).toFixed(2)} s long`,
@@ -335,7 +349,11 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
 
 // ---------------------------------------------------------------- subtitles
 
-/** A cue's text as both tracks carry it: plain lines, no tags, no override codes, no cue arrow, no blank line. */
+/**
+ * A cue's text (review r3): the text as given — NFC, line breaks as "\n", control characters and empty lines out
+ * (neither track can carry them) — and nothing else changed. Each format escapes only its own syntax (`toAss`,
+ * `toVtt`).
+ */
 export function cueText(raw: string): string {
   return (
     raw
@@ -343,49 +361,68 @@ export function cueText(raw: string): string {
       .replace(/\r\n?/g, "\n")
       // eslint-disable-next-line no-control-regex -- control characters are not part of a cue
       .replace(/[\0-\x09\x0b-\x1f\x7f-\x9f]/g, "")
-      // Only real markup (`<b>`, `</i>`, `<font color=…>`, `<br>` …) is removed — a plain "<" or ">" is text (review r2).
-      .replace(/<\/?(?:b|i|u|s|font|br)(?:\s[^<>]*)?\/?>/gi, "")
-      // Only an override block (`{\an8}`, `{\i1}`) is control syntax; plain braces are text (review r1).
-      .replace(/\{\\[^}]*\}/g, "")
-      .replace(/\\/g, "＼")
-      .replace(/-->/g, "→")
       .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean)
+      .filter((l) => l.trim())
       .join("\n")
   );
 }
 
-const clock = (sec: number, sep: "," | ".") => {
-  const ms = Math.max(0, Math.round(sec * 1000));
-  const h = Math.floor(ms / 3_600_000);
-  const m = Math.floor((ms % 3_600_000) / 60_000);
-  const s = Math.floor((ms % 60_000) / 1000);
-  const p = (n: number, w = 2) => String(n).padStart(w, "0");
-  return `${p(h)}:${p(m)}:${p(s)}${sep}${p(ms % 1000, 3)}`;
-};
-
 type Cue = { startSec: number; endSec: number; text: string };
-const cues = (subs: readonly Cue[]) =>
-  subs.map((s) => ({ ...s, text: cueText(s.text) })).filter((s) => s.text);
+type Timed = { start: number; end: number; text: string };
 
-/** ASS time: `H:MM:SS.cc`. */
-const assClock = (sec: number) => {
-  const cs = Math.max(0, Math.round(sec * 100));
-  const h = Math.floor(cs / 360_000);
-  const m = Math.floor((cs % 360_000) / 6000);
-  const s = Math.floor((cs % 6000) / 100);
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${h}:${p(m)}:${p(s)}.${p(cs % 100)}`;
+/**
+ * Cues in whole `unit`s (ASS: 1/100 s, VTT: 1/1000 s — review r3): each keeps a positive length after rounding
+ * (at least one unit), none starts before the one before it ended, and none goes past the video's end (`totalSec`:
+ * the real length worked out at the run — a cue starting at or after it is left out, one ending after it is cut).
+ */
+export function timedCues(subs: readonly Cue[], unit: number, totalSec?: number): Timed[] {
+  const total = totalSec === undefined ? Infinity : Math.round(totalSec * unit);
+  const out: Timed[] = [];
+  let prev = 0;
+  for (const s of subs) {
+    const text = cueText(s.text);
+    if (!text) continue;
+    const start = Math.max(Math.round(s.startSec * unit), prev);
+    let end = Math.min(Math.max(Math.round(s.endSec * unit), start + 1), total);
+    if (start >= total || end <= start) continue;
+    end = Math.max(end, start + 1);
+    out.push({ start, end, text });
+    prev = end;
+  }
+  return out;
+}
+
+const clock = (units: number, unit: 100 | 1000) => {
+  const h = Math.floor(units / (3600 * unit));
+  const m = Math.floor((units % (3600 * unit)) / (60 * unit));
+  const s = Math.floor((units % (60 * unit)) / unit);
+  const f = units % unit;
+  const p = (n: number, w = 2) => String(n).padStart(w, "0");
+  return unit === 100 ? `${h}:${p(m)}:${p(s)}.${p(f)}` : `${p(h)}:${p(m)}:${p(s)}.${p(f, 3)}`;
 };
+
+/** U+2060 WORD JOINER: invisible, it keeps ASS from reading a backslash sequence or an override block. */
+const WJ = "\u2060";
+
+/**
+ * A cue's text as ASS dialogue (review r3): only what ASS itself would interpret is neutralised — a backslash before
+ * N, n or h (line breaks, a hard space) and a "{" that opens an override block ("{\") get an invisible word joiner
+ * between; every other character is kept ("C:\temp", "A --> B", "<b>", "&", "{1, 2}"). Lines are joined with ASS's own
+ * break.
+ */
+export function assText(text: string): string {
+  return text
+    .split("\n")
+    .map((l) => l.replace(/\\([Nnh])/g, `\\${WJ}$1`).replace(/\{\\/g, `{${WJ}\\`))
+    .join("\\N");
+}
 
 /**
  * The subtitles the mux turns into the MP4's `mov_text` track (review r2): ASS, because its decoder takes text as it is
  * — "<", ">" and "&" are plain characters there (ffmpeg's SRT decoder drops anything that looks like a tag, its WebVTT
- * decoder mangles braces). The cue text has no backslash (`cueText`) and no override block, so nothing in it is ASS
- * syntax; its lines are joined with ASS's own line break.
+ * decoder mangles braces).
  */
-export function toAss(subs: readonly Cue[]): string {
+export function toAss(subs: readonly Cue[], totalSec?: number): string {
   return [
     "[Script Info]",
     "ScriptType: v4.00+",
@@ -398,21 +435,23 @@ export function toAss(subs: readonly Cue[]): string {
     "",
     "[Events]",
     "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-    ...cues(subs).map(
-      (s) =>
-        `Dialogue: 0,${assClock(s.startSec)},${assClock(s.endSec)},Default,,0,0,0,,${s.text.split("\n").join("\\N")}`,
+    ...timedCues(subs, 100, totalSec).map(
+      (c) => `Dialogue: 0,${clock(c.start, 100)},${clock(c.end, 100)},Default,,0,0,0,,${assText(c.text)}`,
     ),
     "",
   ].join("\n");
 }
 
-/** The WebVTT of the card's player (`<track>`): the same cues, `&`, `<` and `>` escaped. */
-export function toVtt(subs: readonly Cue[]): string {
+/**
+ * The WebVTT of the card's player (`<track>`): the same cues, the text as given with "&", "<" and ">" as entities (so
+ * a "-->" in it is "--&gt;" — never a cue timing).
+ */
+export function toVtt(subs: readonly Cue[], totalSec?: number): string {
   const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   return (
     "WEBVTT\n\n" +
-    cues(subs)
-      .map((s) => `${clock(s.startSec, ".")} --> ${clock(s.endSec, ".")}\n${esc(s.text)}\n`)
+    timedCues(subs, 1000, totalSec)
+      .map((c) => `${clock(c.start, 1000)} --> ${clock(c.end, 1000)}\n${esc(c.text)}\n`)
       .join("\n")
   );
 }
@@ -432,12 +471,12 @@ export const FF_COMMON = [
   "-filter_complex_threads",
   "1",
 ];
-const input = (o: { demuxer: string; file: string; before?: string[] }) => [
+/** One input, read from its start (never an input seek — re-plan r3), with its demuxer named. */
+const input = (o: { demuxer: string; file: string }) => [
   "-protocol_whitelist",
   "file,pipe",
   "-threads",
   String(FF_THREADS),
-  ...(o.before ?? []),
   "-f",
   o.demuxer,
   "-i",
@@ -484,10 +523,9 @@ export const pieces = (i: number) => ({
   body: `body-${i}.mp4`,
   head: `head-${i}.nut`,
   tail: `tail-${i}.nut`,
-  audio: `clip-${i}.pcm`,
 });
 
-/** The picture and sound of one clip: its pieces and its PCM (cwd `work/`; the input in `../in/`). */
+/** The picture of one clip: its pieces (cwd `work/`; the input in `../in/`). Its sound is its input's PCM. */
 export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
   const c = plan.clips[i]!;
   const { width: W, height: H } = plan;
@@ -520,15 +558,16 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
       ? `[0:v]trim=end_frame=1,${opaque},${square},${fit(W * 2, H * 2)},setsar=1,format=yuv420p,zoompan=${kb[c.kenBurns]}:d=${moving}:s=${W}x${H}:fps=${FPS},tpad=stop_mode=clone:stop=-1,${exact}`
       : `[0:v]trim=end_frame=1,${opaque},${square},${fit(W, H)},setsar=1,format=yuv420p,loop=loop=${N - 1}:size=1:start=0,${exact}`;
   } else {
-    // The trim on one timeline (reviews r1–r2). The input is opened at the keyframe before the trim's start (`-ss`
-    // without accurate seeking), and the trim's start is 0 for picture and sound alike. The picture: its last frame
-    // repeated past its end (a picture that ends before the trim's start, or inside it, holds), then 30 fps from 0 —
-    // each slot shows the frame on screen at that moment, also the one already showing at the start (a slide of a
-    // 1 fps video) and the first one when the picture starts late —, the trim's own frames, then held to the clip's
-    // length. The sound: cut exactly at the trim (0 … its length), silence before a sound that starts late.
+    // The trim on the container's own timeline (the re-plan after review r3: no input seeking — a seek to the picture's
+    // keyframe would skip sound and frames before it). Decoded from the start: the picture's last frame repeated past
+    // its end (a picture that ends before or inside the trim holds), then 30 fps from the container's start — each
+    // slot shows the frame on screen at that moment (the one already showing at the trim's start; the first one when
+    // the picture starts late) —, the trim's frames by number, then held to the clip's length. The graph's trim ends
+    // the run (nothing after it is decoded).
+    const from = Math.round(c.startSec * FPS);
     const own = Math.max(1, Math.round(c.useSec * FPS));
     picture =
-      `[0:v]tpad=stop_mode=clone:stop=-1,fps=${FPS}:start_time=0,trim=end_frame=${own},` +
+      `[0:v]tpad=stop_mode=clone:stop=-1,fps=${FPS}:start_time=0,trim=start_frame=${from}:end_frame=${from + own},setpts=N,` +
       `${square},${fit(W, H)},setsar=1,format=yuv420p,tpad=stop_mode=clone:stop=-1,${exact}`;
   }
   const outs: { label: string; from: number; to: number; args: string[] }[] = [];
@@ -542,23 +581,14 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
       ? `${picture}[s0]`
       : `${picture},split=${outs.length}${outs.map((_, k) => `[s${k}]`).join("")}`,
     ...outs.map((o, k) => `[s${k}]trim=start_frame=${o.from}:end_frame=${o.to},setpts=N[${o.label}]`),
-    c.kind === "video" && c.hasAudio
-      ? `[0:a:0]atrim=start=0:end=${num(Math.max(c.useSec, 1 / FPS))},aresample=${RATE}:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,volume=${num(c.volume)},apad,atrim=end_sample=${N * SPF}[a]`
-      : `anullsrc=r=${RATE}:cl=stereo,atrim=end_sample=${N * SPF},aformat=sample_fmts=s16[a]`,
   ].join(";");
-  // No input duration: the graph's trims end the run (an input `-t` would also cut what precedes the seek point).
-  const seek = c.kind === "video" ? ["-noaccurate_seek", "-ss", num(c.startSec)] : [];
   return [
     ...FF_COMMON,
     ...PROGRESS,
-    ...input({ demuxer: DEMUXER[c.fileKind]!, file, before: seek }),
+    ...input({ demuxer: DEMUXER[c.fileKind]!, file }),
     "-filter_complex",
     graph,
     ...outs.flatMap((o) => ["-map", `[${o.label}]`, ...o.args]),
-    "-map",
-    "[a]",
-    ...PCM,
-    p.audio,
   ];
 }
 
@@ -591,23 +621,44 @@ export function concatList(plan: Plan): string {
   return `ffconcat version 1.0\n${names.map((n) => `file '${n}'`).join("\n")}\n`;
 }
 
-/** One narration or the music decoded to PCM (48 kHz stereo s16, at most `maxSamples`). */
-export function decodeArgs(o: {
+/** The PCM of an input's sound, in `work/` (`ingestArgs`). */
+export const sourcePcm = (input: string) => `src-${input.replace(/[^A-Za-z0-9-]/g, "_")}.pcm`;
+
+/**
+ * One input decoded once from its start (the re-plan after review r3 — the lengths' truth): its first sound to 48 kHz
+ * stereo s16 PCM from the container's start (`sourcePcm`; silence before a sound that starts late, nothing lost
+ * before a picture that starts late), and — `countPicture` — its first picture counted at 30 fps from the same start
+ * (a null output: the progress lines' last `frame=` is the count). Both stop at `capSec` (output `-t`; what is needed
+ * plus a margin — the 30-minute limit bounds the rest).
+ */
+export function ingestArgs(o: {
   inDir: string;
   input: string;
   fileKind: FileKind;
-  maxSamples: number;
-  out: string;
+  sound: boolean;
+  countPicture: boolean;
+  capSec: number;
 }): string[] {
+  const cap = num(Math.max(1, o.capSec));
   return [
     ...FF_COMMON,
+    ...PROGRESS,
     ...input({ demuxer: DEMUXER[o.fileKind]!, file: path.join(o.inDir, o.input) }),
-    "-map",
-    "0:a:0",
-    "-af",
-    `aresample=${RATE}:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,atrim=end_sample=${Math.max(1, o.maxSamples)}`,
-    ...PCM,
-    o.out,
+    ...(o.sound
+      ? [
+          "-map",
+          "0:a:0",
+          "-af",
+          `aresample=${RATE}:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo`,
+          "-t",
+          cap,
+          ...PCM,
+          sourcePcm(o.input),
+        ]
+      : []),
+    ...(o.countPicture
+      ? ["-map", "0:v:0", "-vf", `fps=${FPS}:start_time=0`, "-t", cap, "-an", "-sn", "-dn", "-f", "null", "-"]
+      : []),
   ];
 }
 
@@ -616,10 +667,10 @@ const DUCK = "sidechaincompress=threshold=0.03:ratio=8:attack=20:release=400";
 
 /**
  * The sound (review R3): the clips' PCM (`bed.pcm`), the narration (`narration.pcm`, when there is any) and the music
- * (`music.pcm`) mixed — the clips' own sound always ducked under the narration, the music when `duck` — loudness-
+ * (its input's decoded PCM, `sourcePcm`, looped) mixed — the clips' own sound always ducked under the narration, the music when `duck` — loudness-
  * normalised and encoded to AAC of exactly `plan.samples`.
  */
-export function audioArgs(plan: Plan, o: { narration: boolean; music: boolean }): string[] {
+export function audioArgs(plan: Plan, o: { narration: boolean; music: string | null }): string[] {
   const T = plan.samples;
   const m = plan.music;
   const duckMusic = !!(o.music && m?.duck && o.narration);
@@ -645,7 +696,7 @@ export function audioArgs(plan: Plan, o: { narration: boolean; music: boolean })
       ...(m.loop ? ["-stream_loop", "-1"] : []),
       ...RAW,
       "-i",
-      "music.pcm",
+      o.music,
     );
     const fades = [
       ...(m.fadeInSec > 0 ? [`afade=t=in:st=0:d=${num(m.fadeInSec)}`] : []),

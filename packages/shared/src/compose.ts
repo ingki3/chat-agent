@@ -171,6 +171,10 @@ export const COMPOSE_JOB_CODES = [
   "compose_too_large",
   /** It could not be stored (the conversation's files, the disk). */
   "compose_store_failed",
+  /** The inputs' decoded lengths make it longer than 5 minutes (the call only had estimates — re-plan after r3). */
+  "compose_too_long",
+  /** The inputs' decoded lengths no longer fit the timeline (a trim starting past a source's real end). */
+  "compose_timeline_mismatch",
 ] as const;
 export const ComposeJobCode = z.enum(COMPOSE_JOB_CODES);
 export type ComposeJobCode = z.infer<typeof ComposeJobCode>;
@@ -208,6 +212,10 @@ export const COMPOSE_JOB_CODE_TEXT: Record<ComposeJobCode, string> = {
   compose_verify_failed: "합성한 영상이 예상한 모양(길이·스트림)이 아니어서 저장하지 않았어요.",
   compose_too_large: "합성한 영상이 너무 커서(1GB 초과) 저장하지 않았어요.",
   compose_store_failed: "합성한 영상을 이 대화에 저장하지 못했어요.",
+  compose_too_long:
+    "입력 파일을 실제로 읽어 보니 결과가 5분을 넘어 합성하지 않았어요. 나레이션이나 클립을 줄여 다시 요청해 주세요.",
+  compose_timeline_mismatch:
+    "입력 파일을 실제로 읽어 보니 타임라인(트림 위치 등)이 파일 길이와 맞지 않아 합성하지 않았어요.",
 };
 
 /** The failure's short reason on a lock screen (fixed words). */
@@ -218,6 +226,8 @@ export const COMPOSE_FAILURE_SHORT: Record<ComposeJobCode, string> = {
   compose_verify_failed: "결과 확인 실패",
   compose_too_large: "영상이 너무 커요",
   compose_store_failed: "저장하지 못했어요",
+  compose_too_long: "5분을 넘어요",
+  compose_timeline_mismatch: "타임라인이 파일과 맞지 않아요",
 };
 
 /** The card's refused reads. */

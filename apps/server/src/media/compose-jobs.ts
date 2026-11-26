@@ -36,7 +36,6 @@ import {
   inputKindOf,
   isPlanError,
   planTimeline,
-  toAss,
   toVtt,
   type InputInfo,
   type Plan,
@@ -277,7 +276,8 @@ export class ComposeJobs {
     try {
       const t = ComposeTimeline.safeParse(scrubKnownDeep(JSON.parse(row.timelineJson) as unknown));
       if (!t.success || !t.data.subtitles?.length) return undefined;
-      return toVtt(t.data.subtitles);
+      // A finished job's real length cuts the cues the same way its MP4 track was cut (`timedCues`).
+      return toVtt(t.data.subtitles, row.status === "done" ? row.durationMs / 1000 : undefined);
     } catch {
       return undefined;
     }
@@ -462,7 +462,7 @@ export class ComposeJobs {
       stop.abort();
     }, this.limits.prepareTimeoutMs);
     this.work.set(id, { stop });
-    let outcome: { plan: Plan } | ToolError;
+    let outcome: { plan: Plan; inputs: InputInfo[] } | ToolError;
     try {
       outcome = await this.prepare(id, dir, composer, files, inputs, timeline, stop.signal);
     } catch {
@@ -484,14 +484,16 @@ export class ComposeJobs {
         ? new ToolError("media_cancelled")
         : outcome;
     }
-    const { plan } = outcome;
+    // The call's plan is an estimate (ffprobe's lengths — re-plan after review r3): the job keeps its inputs and is
+    // planned again from their decoded lengths when it runs.
+    const { plan, inputs: probed } = outcome;
     let queued: { changes: number };
     try {
       queued = this.o.db
         .update(composeJobs)
         .set({
           status: "queued",
-          planJson: JSON.stringify(plan),
+          planJson: JSON.stringify({ inputs: probed }),
           durationMs: Math.round((plan.frames / FPS) * 1000),
           width: plan.width,
           height: plan.height,
@@ -514,6 +516,8 @@ export class ComposeJobs {
       throw new ToolError("media_cancelled");
     }
     this.changed(id);
+    // A job that waited longer to be prepared goes before those queued meanwhile (review r3): every waiting card hears.
+    this.queuedChanged();
     logEvent(this.o.log, "info", "compose.queued", {
       userId: scope.userId,
       conversationId: scope.conversationId,
@@ -663,7 +667,7 @@ export class ComposeJobs {
     rows: FileRow[],
     timeline: ComposeTimeline,
     signal: AbortSignal,
-  ): Promise<{ plan: Plan } | ToolError> {
+  ): Promise<{ plan: Plan; inputs: InputInfo[] } | ToolError> {
     const infos = new Map<string, InputInfo>();
     for (const [k, f] of rows.entries()) {
       if (signal.aborted) return new ToolError("media_cancelled");
@@ -681,7 +685,7 @@ export class ComposeJobs {
     if (!this.get(id)) return new ToolError("media_cancelled");
     const plan = planTimeline(timeline, infos);
     if (isPlanError(plan)) return new ToolError(plan.code, plan.hint);
-    return { plan };
+    return { plan, inputs: [...infos.values()] };
   }
 
   /** A preparation that did not end queued: its row (still preparing) and its folder go. */
@@ -918,12 +922,10 @@ export class ComposeJobs {
       const composer = this.o.composer();
       if (!row || row.status !== "running") return;
       if (!composer || !row.planJson) return void this.finish(id, "compose_failed");
-      const plan = JSON.parse(row.planJson) as Plan;
-      let subs: string | null = null;
-      if (row.subtitles) {
-        const t = ComposeTimeline.safeParse(scrubKnownDeep(JSON.parse(row.timelineJson) as unknown));
-        subs = t.success && t.data.subtitles?.some((x) => cueText(x.text)) ? toAss(t.data.subtitles) : null;
-      }
+      const { inputs } = JSON.parse(row.planJson) as { inputs: InputInfo[] };
+      // The stored timeline, scrubbed again (a secret registered since); its subtitles are written by the composer.
+      const timeline = ComposeTimeline.safeParse(scrubKnownDeep(JSON.parse(row.timelineJson) as unknown));
+      if (!timeline.success || !Array.isArray(inputs)) return void this.finish(id, "compose_failed");
       const deadlineAt = this.now() + this.limits.timeoutMs;
       const deadline = new AbortController();
       // Review r1: the deadline holds until the file is committed — its moment ends the job at once (its row: the
@@ -945,8 +947,8 @@ export class ComposeJobs {
       try {
         const outcome = await composer.compose({
           dir: realDir,
-          plan,
-          subs,
+          timeline: timeline.data,
+          inputs,
           signal: both,
           deadlineAt: Date.now() + (deadlineAt - this.now()),
           onProgress: (f) => {
@@ -959,7 +961,7 @@ export class ComposeJobs {
         if (signal.aborted) return; // deleted, or the engine stopping (`stop` interrupts it)
         if (deadline.signal.aborted) return void this.finish(id, "compose_timeout");
         if (!outcome.ok) return void this.finish(id, outcome.code);
-        await this.store(id, outcome.file, outcome.bytes, deadline.signal);
+        await this.store(id, outcome.file, outcome.bytes, deadline.signal, outcome.plan);
       } finally {
         clearTimeout(timer);
       }
@@ -982,7 +984,14 @@ export class ComposeJobs {
   }
 
   /** The checked MP4 as a file of the conversation: the file row, `file_id` and `done` in one transaction. */
-  private async store(id: string, file: string, bytes: number, deadline: AbortSignal): Promise<void> {
+  private async store(
+    id: string,
+    file: string,
+    bytes: number,
+    deadline: AbortSignal,
+    /** The plan the result was made from (decoded lengths): the card shows its real length. */
+    plan: Plan,
+  ): Promise<void> {
     const row = this.get(id);
     const files = this.o.files();
     if (!row || row.status !== "running") return;
@@ -1019,6 +1028,7 @@ export class ComposeJobs {
                 status: "done",
                 fileId: f.id,
                 progress: 100,
+                durationMs: Math.round((plan.frames / FPS) * 1000),
                 endedAt: this.now(),
                 version: sql`${composeJobs.version} + 1`,
                 updatedAt: this.now(),

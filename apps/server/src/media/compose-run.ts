@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { setImmediate as yieldNow } from "node:timers/promises";
 import { z } from "zod";
-import { COMPOSE_LIMITS, type ComposeJobCode, type FileKind } from "@agentlee/shared";
+import { COMPOSE_LIMITS, type ComposeJobCode, type ComposeTimeline, type FileKind } from "@agentlee/shared";
 import { runIsolated, type RunIsolatedOptions, type RunResult } from "../isolation/sandbox.js";
 import { removeTree } from "../python/service.js";
 import { storagePaths } from "../storage/paths.js";
@@ -11,12 +11,15 @@ import {
   audioArgs,
   clipArgs,
   concatList,
-  decodeArgs,
+  FPS,
+  ingestArgs,
   inputKindOf,
   muxArgs,
   pieces,
   planTimeline,
   probeArgs,
+  RATE,
+  sourcePcm,
   SPF,
   toAss,
   transitionArgs,
@@ -39,7 +42,9 @@ import { KNOWN_GOOD_MP4, MP4_BRANDS } from "./video-probe.js";
  * Working folders: `<DATA_DIR>/compose-scratch/<job id>/{in,work,out}` — the job's copies of its inputs, the pieces, the
  * result — removed when the job ends (and every one at the engine's start).
  */
-export type ComposeOutcome = { ok: true; file: string; bytes: number } | { ok: false; code: ComposeJobCode };
+/** A composition's end: the checked MP4 and the plan it was made from (lengths decoded), or why there is none. */
+export type ComposeOutcome =
+  { ok: true; file: string; bytes: number; plan: Plan } | { ok: false; code: ComposeJobCode };
 export type ProbeOutcome =
   | { ok: true; info: Omit<InputInfo, "fileId" | "name"> }
   | { ok: false; reason: "unreadable" | "kind" | "failed" };
@@ -49,12 +54,15 @@ export type Composer = {
   workdir(): string;
   /** One input copy (`in/<name>`) probed: its kind (as its file row says, read with that demuxer), streams, length. */
   probe(file: string, fileKind: FileKind, signal?: AbortSignal): Promise<ProbeOutcome>;
-  /** The whole composition in the job folder; the checked MP4 in `out/` (review R5). */
+  /**
+   * The whole composition in the job folder; the checked MP4 in `out/` (review R5). The inputs' lengths are decoded
+   * first and the plan made from them (the re-plan after review r3: what the call worked out was an estimate).
+   */
   compose(job: {
     dir: string;
-    plan: Plan;
-    /** The subtitles as ASS (`toAss`), or null without any. */
-    subs: string | null;
+    timeline: ComposeTimeline;
+    /** The inputs as the call found them (kinds, streams, names in `in/`; their lengths are estimates). */
+    inputs: readonly InputInfo[];
     signal: AbortSignal;
     deadlineAt: number;
     onProgress: (fraction: number) => void;
@@ -257,7 +265,21 @@ function plainSize(file: string): number | undefined {
   return st?.isFile() && st.nlink === 1 ? st.size : undefined;
 }
 
-type Track = { file: string; start: number; length: number; fadeIn: number; fadeOut: number };
+/**
+ * One track of a mix: placed at `start` (samples of the result) for `length` samples, faded in and out over its
+ * overlaps; its samples are read from `offset` in `file` — `take` of them at most (the rest, and whatever the file does
+ * not have, is silence) — times `gain`.
+ */
+export type Track = {
+  file: string;
+  start: number;
+  length: number;
+  fadeIn: number;
+  fadeOut: number;
+  offset?: number;
+  take?: number;
+  gain?: number;
+};
 
 /**
  * PCM tracks (48 kHz stereo s16) summed into one of `total` samples, second by second (exported for tests): each at its
@@ -277,19 +299,22 @@ export async function mixPcm(out: string, total: number, tracks: readonly Track[
       acc.fill(0, 0, n * 2);
       for (const t of tracks) {
         const from = Math.max(c0, t.start);
-        const to = Math.min(c0 + n, t.start + t.length);
+        // Only the samples it has: past `take` (and past the file's end) the track is silence.
+        const to = Math.min(c0 + n, t.start + Math.min(t.length, t.take ?? t.length));
         if (to <= from) continue;
+        const gain = t.gain ?? 1;
         let tfd = fds.get(t.file);
         if (tfd === undefined)
           fds.set(t.file, (tfd = fs.openSync(t.file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)));
         const count = to - from;
-        const got = fs.readSync(tfd, inBuf, 0, count * 4, (from - t.start) * 4);
+        const got = fs.readSync(tfd, inBuf, 0, count * 4, ((t.offset ?? 0) + from - t.start) * 4);
         const have = Math.floor(got / 4);
         for (let k = 0; k < have; k++) {
           const p = from - t.start + k;
-          let w = 1;
-          if (t.fadeIn > 0 && p < t.fadeIn) w = p / t.fadeIn;
-          if (t.fadeOut > 0 && p >= t.length - t.fadeOut) w = Math.min(w, (t.length - p) / t.fadeOut);
+          let w = gain;
+          if (t.fadeIn > 0 && p < t.fadeIn) w = (gain * p) / t.fadeIn;
+          if (t.fadeOut > 0 && p >= t.length - t.fadeOut)
+            w = Math.min(w, (gain * (t.length - p)) / t.fadeOut);
           const o = (from - c0 + k) * 2;
           acc[o] = acc[o]! + inBuf.readInt16LE(k * 4) * w;
           acc[o + 1] = acc[o + 1]! + inBuf.readInt16LE(k * 4 + 2) * w;
@@ -391,14 +416,9 @@ export function sandboxedComposer(o: {
     const inDir = path.join(job.dir, "in");
     const work = path.join(job.dir, "work");
     const outDir = path.join(job.dir, "out");
-    const { plan } = job;
-    const units = workUnits(plan);
-    const totalUnits =
-      units.clips.reduce((a, b) => a + b, 0) +
-      units.transitions.reduce((a, b) => a + b, 0) +
-      units.audio +
-      units.mux;
+    const t = job.timeline;
     let done = 0;
+    let totalUnits = 1;
     const report = (f: number) => job.onProgress(Math.max(0, Math.min(1, f)));
     /** One ffmpeg run of `weight` units over `seconds` of output (its progress lines move the bar). */
     const step = async (
@@ -406,6 +426,7 @@ export function sandboxedComposer(o: {
       weight: number,
       seconds: number,
       where: { read: string[]; write: string[] },
+      onLine?: (l: string) => void,
     ): Promise<ComposeJobCode | null> => {
       if (job.signal.aborted) return "compose_failed";
       const left = job.deadlineAt - Date.now();
@@ -417,6 +438,7 @@ export function sandboxedComposer(o: {
         timeoutMs: left,
         signal: job.signal,
         onLine: (l) => {
+          onLine?.(l);
           const s = progressSeconds(l);
           if (s !== undefined && seconds > 0) report((done + weight * Math.min(1, s / seconds)) / totalUnits);
         },
@@ -427,9 +449,81 @@ export function sandboxedComposer(o: {
       return decodeVerdict(r) === "ok" ? null : "compose_failed";
     };
     const local = { read: [inDir, work], write: [work] };
-    // 1. Every clip: its pieces and its sound.
+    // 1. Ingest (the re-plan after review r3): every input with sound or used as a clip decoded once from its start —
+    //    the sound to PCM (its sample count is its length), the picture counted at 30 fps. Nothing is read from
+    //    metadata for a length.
+    const byId = new Map(job.inputs.map((i) => [i.fileId, i]));
+    const caps = new Map<string, { cap: number; count: boolean }>();
+    const use = (fileId: string, cap: number, count: boolean) => {
+      const was = caps.get(fileId);
+      caps.set(fileId, { cap: Math.max(was?.cap ?? 0, cap), count: (was?.count ?? false) || count });
+    };
+    const longest = COMPOSE_LIMITS.maxSeconds + 1;
+    for (const c of t.clips) {
+      const info = byId.get(c.fileId);
+      if (!info || info.kind !== "video") continue;
+      // What the clip takes from its source: up to the trim's end, or its length from the start (else all of it).
+      const end = c.trim ? c.trim.endSec : (c.durationSec ?? longest);
+      use(c.fileId, Math.min(end, COMPOSE_LIMITS.maxSourceSeconds) + 1, true);
+    }
+    for (const n of t.narration ?? []) use(n.fileId, longest, false);
+    if (t.music) use(t.music.fileId, longest, false);
+    const truth = new Map<string, InputInfo>();
+    for (const info of job.inputs) truth.set(info.fileId, info);
+    for (const [fileId, u] of caps) {
+      const info = byId.get(fileId)!;
+      if (info.kind === "image") continue;
+      let pictureFrames: number | undefined;
+      const code = await step(
+        ingestArgs({
+          inDir,
+          input: info.name,
+          fileKind: info.fileKind,
+          sound: info.hasAudio,
+          countPicture: u.count && info.hasVideo,
+          capSec: u.cap,
+        }),
+        0,
+        0,
+        local,
+        (l) => {
+          const m = /^frame=(\d+)$/.exec(l.trim());
+          if (m) pictureFrames = Number(m[1]);
+        },
+      );
+      if (code) return { ok: false, code };
+      let audioSec: number | null = null;
+      if (info.hasAudio) {
+        const size = plainSize(path.join(work, sourcePcm(info.name)));
+        if (size === undefined || size % 4) return { ok: false, code: "compose_failed" };
+        audioSec = size / 4 / RATE;
+      }
+      const pictureSec = u.count && info.hasVideo ? (pictureFrames ?? 0) / FPS : null;
+      if (u.count && info.hasVideo && !pictureFrames) return { ok: false, code: "compose_failed" };
+      truth.set(fileId, {
+        ...info,
+        durationSec: Math.max(pictureSec ?? 0, audioSec ?? 0) || (info.durationSec ?? 0),
+        audioSec,
+      });
+    }
+    // 2. The plan from the decoded lengths (a narration that is really longer holds the last picture; the 5-minute cap
+    //    on the real total).
+    const plan = planTimeline(t, truth, { runtime: true });
+    if (isPlanError(plan))
+      return {
+        ok: false,
+        code: plan.code === "compose_too_long" ? "compose_too_long" : "compose_timeline_mismatch",
+      };
+    const units = workUnits(plan);
+    totalUnits =
+      done +
+      units.clips.reduce((a, b) => a + b, 0) +
+      units.transitions.reduce((a, b) => a + b, 0) +
+      units.audio +
+      units.mux;
+    // 3. Every clip's picture pieces.
     for (const [i, c] of plan.clips.entries()) {
-      const code = await step(clipArgs(plan, i, inDir), units.clips[i]!, c.frames / 30, local);
+      const code = await step(clipArgs(plan, i, inDir), units.clips[i]!, c.frames / FPS, local);
       if (code) return { ok: false, code };
       const p = pieces(i);
       if (c.frames - c.head - c.tail > 0 && plainSize(path.join(work, p.body)) === undefined)
@@ -439,13 +533,11 @@ export function sandboxedComposer(o: {
         (c.tail && plainSize(path.join(work, p.tail)) === undefined)
       )
         return { ok: false, code: "compose_failed" };
-      if (plainSize(path.join(work, p.audio)) !== c.frames * SPF * 4)
-        return { ok: false, code: "compose_failed" };
     }
-    // 2. Every transition (then its lossless pieces are no longer needed).
+    // 4. Every transition (then its lossless pieces are no longer needed).
     for (const [i, c] of plan.clips.entries()) {
       if (!c.tail) continue;
-      const code = await step(transitionArgs(plan, i), units.transitions[i]!, c.tail / 30, local);
+      const code = await step(transitionArgs(plan, i), units.transitions[i]!, c.tail / FPS, local);
       if (code) return { ok: false, code };
       if (plainSize(path.join(work, `trans-${i}.mp4`)) === undefined)
         return { ok: false, code: "compose_failed" };
@@ -453,76 +545,63 @@ export function sandboxedComposer(o: {
       fs.rmSync(path.join(work, pieces(i + 1).head), { force: true });
     }
     fs.writeFileSync(path.join(work, "list.ffconcat"), concatList(plan), { flag: "wx", mode: 0o600 });
-    // 3. The sound: the clips' PCM crossfaded, the narration placed, the music — then one graph to AAC.
+    // 5. The sound: each clip's slice of its input's PCM (from the trim's start, sample-exact; silence where it has
+    //    none), crossfaded where its picture is; the narration placed at its samples; the music — then one graph.
     try {
       await mixPcm(
         path.join(work, "bed.pcm"),
         plan.samples,
-        plan.clips.map((c, i) => ({
-          file: path.join(work, pieces(i).audio),
-          start: c.at * SPF,
-          length: c.frames * SPF,
-          fadeIn: c.head * SPF,
-          fadeOut: c.tail * SPF,
-        })),
+        plan.clips.flatMap((c) =>
+          c.kind === "video" && c.hasAudio
+            ? [
+                {
+                  file: path.join(work, sourcePcm(c.input)),
+                  start: c.at * SPF,
+                  length: c.frames * SPF,
+                  fadeIn: c.head * SPF,
+                  fadeOut: c.tail * SPF,
+                  offset: Math.round(c.startSec * RATE),
+                  take: Math.round(c.useSec * RATE),
+                  gain: c.volume,
+                },
+              ]
+            : [],
+        ),
       );
-      const narration: Track[] = [];
-      for (const [k, n] of plan.narration.entries()) {
-        if (n.maxSamples <= 0) continue;
-        const out = `nar-${k}.pcm`;
-        const code = await step(
-          decodeArgs({ inDir, input: n.input, fileKind: n.fileKind, maxSamples: n.maxSamples, out }),
-          0,
-          0,
-          local,
-        );
-        if (code) return { ok: false, code };
-        const size = plainSize(path.join(work, out));
-        if (size === undefined || size % 4) return { ok: false, code: "compose_failed" };
-        narration.push({
-          file: path.join(work, out),
+      const narration: Track[] = plan.narration
+        .filter((n) => n.maxSamples > 0)
+        .map((n) => ({
+          file: path.join(work, sourcePcm(n.input)),
           start: n.startSample,
-          length: Math.min(size / 4, n.maxSamples),
+          length: n.maxSamples,
           fadeIn: 0,
           fadeOut: 0,
-        });
-      }
+        }));
       if (narration.length) await mixPcm(path.join(work, "narration.pcm"), plan.samples, narration);
-      if (plan.music) {
-        const m = plan.music;
-        const code = await step(
-          decodeArgs({
-            inDir,
-            input: m.input,
-            fileKind: m.fileKind,
-            maxSamples: plan.samples,
-            out: "music.pcm",
-          }),
-          0,
-          0,
-          local,
-        );
-        if (code) return { ok: false, code };
-        const size = plainSize(path.join(work, "music.pcm"));
-        if (!size || size % 4) return { ok: false, code: "compose_failed" };
-      }
+      if (plan.music && !plainSize(path.join(work, sourcePcm(plan.music.input))))
+        return { ok: false, code: "compose_failed" };
       const code = await step(
-        audioArgs(plan, { narration: narration.length > 0, music: !!plan.music }),
+        audioArgs(plan, {
+          narration: narration.length > 0,
+          music: plan.music ? sourcePcm(plan.music.input) : null,
+        }),
         units.audio,
-        plan.samples / (SPF * 30),
+        plan.samples / RATE,
         { read: [work], write: [work] },
       );
       if (code) return { ok: false, code };
     } catch {
       return { ok: false, code: "compose_failed" };
     }
-    // 4. The file.
-    if (job.subs) fs.writeFileSync(path.join(work, "subs.ass"), job.subs, { flag: "wx", mode: 0o600 });
+    // 6. The file (the subtitles cut to the real length — `timedCues`).
+    const subs = (t.subtitles ?? []).length ? toAss(t.subtitles ?? [], plan.frames / FPS) : null;
+    const hasSubs = !!subs && subs.includes("\nDialogue:");
+    if (hasSubs) fs.writeFileSync(path.join(work, "subs.ass"), subs!, { flag: "wx", mode: 0o600 });
     const result = path.join(outDir, "result.mp4");
     const code = await step(
-      muxArgs({ subtitles: !!job.subs, out: result, maxBytes: COMPOSE_LIMITS.maxBytes }),
+      muxArgs({ subtitles: hasSubs, out: result, maxBytes: COMPOSE_LIMITS.maxBytes }),
       units.mux,
-      plan.frames / 30,
+      plan.frames / FPS,
       { read: [work], write: [outDir] },
     );
     const bytes = plainSize(result);
@@ -530,7 +609,7 @@ export function sandboxedComposer(o: {
       return { ok: false, code: "compose_too_large" };
     if (code) return { ok: false, code };
     if (bytes === undefined) return { ok: false, code: "compose_failed" };
-    // 5. The check (review R5): never only ffmpeg's exit status.
+    // 7. The check (review R5): never only ffmpeg's exit status.
     const left = job.deadlineAt - Date.now();
     if (left <= 0) return { ok: false, code: "compose_timeout" };
     const v = await exec(tools.ffprobe, verifyArgs(result), {
@@ -541,9 +620,9 @@ export function sandboxedComposer(o: {
       signal: job.signal,
       maxOutputBytes: 64 * 1024,
     });
-    if (decodeVerdict(v) !== "ok" || !judgeResult(v!.stdout, plan, !!job.subs))
+    if (decodeVerdict(v) !== "ok" || !judgeResult(v!.stdout, plan, hasSubs))
       return { ok: false, code: "compose_verify_failed" };
-    return { ok: true, file: result, bytes };
+    return { ok: true, file: result, bytes, plan };
   };
 
   const composer: Composer = {
@@ -564,19 +643,14 @@ async function readyOf(c: Composer, signal?: AbortSignal): Promise<boolean> {
     fs.writeFileSync(file, READY_PNG, { flag: "wx", mode: 0o600 });
     const p = await c.probe(file, "png", signal);
     if (!p.ok) return false;
-    const plan = planTimeline(
-      {
+    const r = await c.compose({
+      dir,
+      timeline: {
         output: { resolution: "720p", aspectRatio: "1:1" },
         clips: [{ fileId: "ready", durationSec: 0.5 }],
         subtitles: [{ startSec: 0, endSec: 0.4, text: "ok" }],
       },
-      new Map([["ready", { ...p.info, fileId: "ready", name: "in-0.png" }]]),
-    );
-    if (isPlanError(plan)) return false;
-    const r = await c.compose({
-      dir,
-      plan,
-      subs: toAss([{ startSec: 0, endSec: 0.4, text: "ok" }]),
+      inputs: [{ ...p.info, fileId: "ready", name: "in-0.png" }],
       signal: signal ?? new AbortController().signal,
       deadlineAt: Date.now() + 120_000,
       onProgress: () => {},
@@ -591,7 +665,8 @@ async function readyOf(c: Composer, signal?: AbortSignal): Promise<boolean> {
 
 /**
  * The FAKE_RUNTIME (e2e) and test composer — no program runs: inputs are taken by their kind (a video 2 s long with
- * sound, audio 2 s), and the "composition" is the known-good MP4 after a few progress steps (`stepMs` apart).
+ * sound, audio 2 s — the same "decoded" at the run), and the "composition" is the known-good MP4 after a few progress
+ * steps (`stepMs` apart).
  */
 export function fixtureComposer(
   dataDir: string,
@@ -624,9 +699,18 @@ export function fixtureComposer(
       }
       const forced = o.outcome?.();
       if (forced && !forced.ok) return forced;
+      // The lengths it was given stand for decoded ones.
+      const plan = planTimeline(job.timeline, new Map(job.inputs.map((i) => [i.fileId, i])), {
+        runtime: true,
+      });
+      if (isPlanError(plan))
+        return {
+          ok: false,
+          code: plan.code === "compose_too_long" ? "compose_too_long" : "compose_timeline_mismatch",
+        };
       const file = path.join(job.dir, "out", "result.mp4");
       fs.writeFileSync(file, KNOWN_GOOD_MP4, { flag: "wx", mode: 0o600 });
-      return { ok: true, file, bytes: KNOWN_GOOD_MP4.length };
+      return { ok: true, file, bytes: KNOWN_GOOD_MP4.length, plan };
     },
     ready: async () => true,
   };
