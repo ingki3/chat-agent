@@ -72,6 +72,7 @@ import {
  *                     then `audio_transcribe` on the saved file (its fileId from the first call), and a short answer
  *   /image <prompt>   a real call of our `image_generate` (#238) with that prompt, and a short answer
  *   /speech <text>    a real call of our `speech_generate` (#238) with that text, and a short answer
+ *   /video <prompt>   a real call of our `video_generate` (#238 stage 3) — its confirmation card — and a short answer
  *   /file-<scenario>   real calls of our file tools on the conversation's first upload (`fake-files.ts`: page12,
  *                     missing) and the scenario's answer with `[n]` markers (#48)
  *   /file-cite <fileId> <snippet>   one real `file_cite` of that id (e.g. another user's file) and a cited sentence
@@ -497,6 +498,13 @@ export const defaultScript: FakeScript = (input, memory) => {
       { text: "읽어 드릴게요. " },
       { call: "speech_generate", input: { text: speech[1]!.trim() } },
       { text: "음성을 만들었어요." },
+    ];
+  const video = /^\/video\s+([\s\S]+)$/.exec(t);
+  if (video)
+    return [
+      { text: "영상 확인 카드를 만들게요. " },
+      { call: "video_generate", input: { prompt: video[1]!.trim() } },
+      { text: "카드에서 길이와 예상 비용을 확인하고 승인해 주세요." },
     ];
   const chart = financeChartSteps(t);
   if (chart) return chart;

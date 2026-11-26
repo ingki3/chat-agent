@@ -1,0 +1,945 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  CSRF_HEADER,
+  DEFAULT_MEDIA_SETTINGS,
+  FILE_LIMITS,
+  type MediaSettings,
+  type Run,
+  type VideoJob,
+} from "@agentlee/shared";
+import { MEDIA_TOOLS, VIDEO_GENERATE_TOOL } from "@agentlee/mcp-tools/media";
+import { buildApp } from "../src/app.js";
+import { loadConfig } from "../src/config.js";
+import { createTestDb } from "../src/db/client.js";
+import { compose } from "../src/notifications/compose.js";
+import { videoCostBound, videoPricing } from "../src/media/cost.js";
+import { FIXTURE_OPENROUTER_KEY_PREFIX, fixtureMp4, fixtureOpenRouterFetch } from "../src/media/fixture.js";
+import {
+  MEDIA_CATALOG_URLS,
+  OPENROUTER_VIDEOS_URL,
+  VIDEO_JOB_ID,
+  videoContentUrl,
+  videoGet,
+  videoStatusUrl,
+} from "../src/media/openrouter.js";
+import { VideoJobs } from "../src/media/video-jobs.js";
+import {
+  isPlanError,
+  planVideo,
+  replanVideo,
+  videoModelVerdict,
+  videoRecordOf,
+} from "../src/media/video-plan.js";
+import {
+  fixtureVideoProbe,
+  judgeVideoProbe,
+  sandboxedVideoProbe,
+  videoProbeOptions,
+  type VideoProbe,
+} from "../src/media/video-probe.js";
+import { RuntimeRegistry } from "../src/runtime/adapter.js";
+import { FakeRuntime } from "../src/runtime/fake.js";
+import { createFamily } from "./helpers/permission-matrix.js";
+
+vi.setConfig({ testTimeout: 60_000 });
+
+/**
+ * 영상 생성 (#238 stage 3): `video_generate` makes a confirmation card only; the owner's approval reserves the bound
+ * and submits; the engine polls, downloads, checks and stores — against a fake job server (pending → in_progress →
+ * completed / failed / expired), with synthetic keys only. Never the network.
+ */
+
+const closers: (() => Promise<unknown> | unknown)[] = [];
+afterEach(async () => {
+  while (closers.length) await closers.pop()!();
+});
+
+const LOCAL = { host: "localhost:3000" };
+const WRITE = { ...LOCAL, origin: "http://localhost:3000", [CSRF_HEADER]: "1" };
+const KEY = `${FIXTURE_OPENROUTER_KEY_PREFIX}-synthetic-0000000000000000000000vid`;
+const rid = (n: number) => `gen-vid-17894808${String(n).padStart(2, "0")}-Ab3dEf9hIjKlMnOpQrSt`;
+
+function tmp(): string {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-media-video-")));
+  closers.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+/** Veo 3.1 Fast's shape (the real catalog, 2026-11-26): sound variants, tiers, 4K. */
+const VEO = {
+  id: "test/veo",
+  name: "Test Veo",
+  supported_durations: [4, 6, 8],
+  supported_resolutions: ["720p", "1080p", "4K"],
+  supported_aspect_ratios: ["16:9", "9:16"],
+  generate_audio: true,
+  pricing_skus: {
+    duration_seconds_with_audio: "0.12",
+    duration_seconds_with_audio_4k: "0.30",
+    duration_seconds_without_audio: "0.10",
+    duration_seconds_with_audio_720p: "0.10",
+    duration_seconds_without_audio_4k: "0.25",
+    duration_seconds_without_audio_720p: "0.08",
+  },
+};
+/** 8 s at 720p: the dearest SKU that may apply ($0.12/s, unsuffixed with sound) × 8 × 1.2. */
+const VEO_8S_MICROS = 1_152_000;
+
+type Req = { url: string; method: string; body: Record<string, unknown> | undefined };
+
+/** A fake job server; every behaviour can be replaced. */
+function fakeServer(
+  o: {
+    catalog?: () => Record<string, unknown>[];
+    submit?: (body: Record<string, unknown>, n: number) => Response | Promise<Response>;
+    poll?: (id: string, n: number) => Response | Promise<Response>;
+    content?: (id: string) => Response | Promise<Response>;
+  } = {},
+) {
+  const requests: Req[] = [];
+  const polls = new Map<string, number>();
+  let submits = 0;
+  const fixture = fixtureOpenRouterFetch();
+  const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    const body =
+      typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : undefined;
+    requests.push({ url, method: init?.method ?? "GET", body });
+    if (new Headers(init?.headers).get("authorization") !== `Bearer ${KEY}`)
+      return Response.json({ error: { code: 401 } }, { status: 401 });
+    if (url === MEDIA_CATALOG_URLS.video) return Response.json({ data: (o.catalog ?? (() => [VEO]))() });
+    if (init?.method === "POST" && url === OPENROUTER_VIDEOS_URL) {
+      submits += 1;
+      return o.submit
+        ? o.submit(body ?? {}, submits)
+        : Response.json({ id: rid(submits), status: "pending" }, { status: 202 });
+    }
+    const m = /^https:\/\/openrouter\.ai\/api\/v1\/videos\/([^/?]+)(\/content\?index=0)?$/.exec(url);
+    if (m && !m[2]) {
+      const n = (polls.get(m[1]!) ?? 0) + 1;
+      polls.set(m[1]!, n);
+      if (o.poll) return o.poll(m[1]!, n);
+      return n === 1
+        ? Response.json({ id: m[1], status: "in_progress", progress: 40 })
+        : Response.json({ id: m[1], status: "completed", usage: { cost: 0.8, is_byok: false } });
+    }
+    if (m && m[2])
+      return o.content
+        ? o.content(m[1]!)
+        : new Response(new Uint8Array(fixtureMp4()), { headers: { "content-type": "video/mp4" } });
+    return fixture(input, init);
+  }) as typeof fetch;
+  return {
+    fetchImpl,
+    requests,
+    posts: () => requests.filter((r) => r.method === "POST" && r.url === OPENROUTER_VIDEOS_URL),
+  };
+}
+
+const videoOn = (more: Partial<MediaSettings> = {}): MediaSettings => {
+  const s = structuredClone(DEFAULT_MEDIA_SETTINGS);
+  s.kinds.video = { enabled: true, model: "test/veo" };
+  return { ...s, ...more };
+};
+
+async function start(
+  o: {
+    server?: ReturnType<typeof fakeServer>;
+    probe?: () => VideoProbe | undefined;
+    engine?: boolean;
+    limits?: ConstructorParameters<typeof VideoJobs>[0]["limits"];
+    clock?: { t: number };
+  } = {},
+) {
+  const dataDir = path.join(tmp(), "data");
+  const registry = new RuntimeRegistry();
+  registry.register(new FakeRuntime({ runTools: true }));
+  const db = createTestDb();
+  const server = o.server ?? fakeServer();
+  const clock = o.clock;
+  const app = await buildApp(
+    loadConfig({
+      NODE_ENV: "test",
+      DATA_DIR: dataDir,
+      MASTER_KEY_PATH: path.join(tmp(), "master.key"),
+      OPENROUTER_API_KEY: KEY,
+    }),
+    {
+      db,
+      runtimes: registry,
+      runs: { flushMs: 0 },
+      media: {
+        fetchImpl: server.fetchImpl,
+        sleep: async () => {},
+        ...(clock ? { now: () => clock.t } : {}),
+        video: {
+          start: o.engine ?? true,
+          probe: o.probe ?? (() => fixtureVideoProbe()),
+          // The engine is driven by hand (`tick`): no timer fires on its own.
+          limits: { tickMs: 3_600_000, ...o.limits },
+        },
+      },
+    },
+  );
+  closers.push(() => app.close());
+  await app.ready();
+  const f = await createFamily(app);
+  app.media!.settings.set(videoOn());
+  const api = (cookie: string, method: "POST" | "GET", url: string, payload?: unknown) =>
+    app.inject({
+      method,
+      url,
+      headers: { ...WRITE, cookie, ...(payload === undefined ? {} : { "content-type": "application/json" }) },
+      ...(payload === undefined ? {} : { payload: payload as Record<string, unknown> }),
+    });
+  const send = async (conversationId: string, text: string) => {
+    const res = await api(f.cookies.owner, "POST", `/api/conversations/${conversationId}/messages`, { text });
+    expect(res.statusCode, res.body).toBe(201);
+    const runId = (res.json() as { run: Run }).run.id;
+    for (let i = 0; i < 2000 && app.runs!.get(runId)!.endedAt === null; i++)
+      await new Promise((r) => setTimeout(r, 10));
+    return app.runs!.get(runId)!;
+  };
+  /** A run of the owner that is still open (the tool works only for an open run). */
+  const scopeOf = async (conversationId?: string) => {
+    const conv = conversationId ?? app.conversations!.create(f.users.owner.id).id;
+    const r = await send(conv, "안녕");
+    db.$client.prepare("UPDATE runs SET ended_at = NULL WHERE id = ?").run(r.id);
+    return { userId: f.users.owner.id, conversationId: conv, runId: r.id };
+  };
+  const video = app.media!.video;
+  const card = async (
+    input: Record<string, unknown> = { prompt: "노을 진 바다 위 작은 배" },
+    conv?: string,
+  ) => {
+    const scope = await scopeOf(conv);
+    const r = await app.media!.tools.run("video", scope, input);
+    expect(r.ok, JSON.stringify(r)).toBe(true);
+    const jobId = (r as { output: { jobId: string } }).output.jobId;
+    return { scope, jobId, output: (r as { output: Record<string, unknown> }).output };
+  };
+  const approve = (id: string, version: number, cookie = f.cookies.owner) =>
+    api(cookie, "POST", `/api/video-jobs/${id}/approve`, { version });
+  const job = (id: string) => video.get(id)!;
+  const usage = () =>
+    db.$client
+      .prepare(
+        "SELECT run_id, media_settlement s, estimated_cost_micros e, priced_cost_micros p, created_at c FROM usage_records WHERE purpose = 'media'",
+      )
+      .all() as { run_id: string; s: string; e: number; p: number | null; c: number }[];
+  /** Polls until the job ends (or `n` passes), each pass a tick of the engine. */
+  const drive = async (id: string, n = 10) => {
+    for (let i = 0; i < n; i++) {
+      await video.tick();
+      await video.idle();
+      if (["done", "failed", "expired", "dismissed"].includes(job(id).status)) break;
+      // Every job is due again at once.
+      (video as unknown as { due: Map<string, { at: number }> }).due.forEach((d) => (d.at = 0));
+    }
+    return job(id);
+  };
+  return { app, db, f, api, server, video, card, approve, job, usage, drive, scopeOf, dataDir };
+}
+
+// ---------------------------------------------------------------- the bound and the options (pure)
+
+describe("video cost bound (review item 1)", () => {
+  it("takes the dearest per-second SKU that may apply: sound variants, the tier's own and the unsuffixed ones", () => {
+    expect(videoCostBound(VEO.pricing_skus, { resolution: "720p", durationSec: 8 })).toBeCloseTo(
+      0.12 * 8 * 1.2,
+    );
+    // 1080p: no 1080p SKU — the unsuffixed ones (with sound $0.12) apply.
+    expect(videoCostBound(VEO.pricing_skus, { resolution: "1080p", durationSec: 4 })).toBeCloseTo(
+      0.12 * 4 * 1.2,
+    );
+    // Cents per second (Grok), and an input SKU never sent (images) is left out.
+    const grok = {
+      cents_per_image_input: "1",
+      cents_per_video_output_second_480p: "8",
+      cents_per_video_output_second_720p: "14",
+      cents_per_video_output_second_1080p: "25",
+    };
+    expect(videoCostBound(grok, { resolution: "720p", durationSec: 5 })).toBeCloseTo(0.14 * 5 * 1.2);
+    // Long and reference variants count (the dearest), a minimum per generation too.
+    const heygen = {
+      duration_seconds_1080p: "0.1",
+      long_duration_seconds_1080p: "0.105",
+      reference_duration_seconds_1080p: "0.18",
+      reference_input_images: "0.04",
+    };
+    expect(videoCostBound(heygen, { resolution: "1080p", durationSec: 10 })).toBeCloseTo(0.18 * 10 * 1.2);
+    expect(
+      videoCostBound(
+        { cents_per_second_output: "28", minimum_cents_per_generation: "560" },
+        { resolution: "720p", durationSec: 2 },
+      ),
+    ).toBeCloseTo(5.6 * 1.2);
+    // Continuations and video inputs are never sent.
+    expect(
+      videoCostBound(
+        { cents_per_second_output_720p: "17", cents_per_second_video_continuation_720p: "41" },
+        { resolution: "720p", durationSec: 1 },
+      ),
+    ).toBeCloseTo(0.17 * 1.2);
+  });
+
+  it("no bound: tokens, megapixels, unreadable or negative prices, nothing for the tier, an empty list", () => {
+    const at = { resolution: "720p", durationSec: 8 };
+    expect(videoCostBound({ video_tokens: "0.000007" }, at)).toBeNull();
+    expect(videoCostBound({ duration_seconds: "0.1", video_tokens_1080p: "0.00001" }, at)).toBeNull();
+    expect(videoCostBound({ cents_per_megapixel_second_precise: "3.5" }, at)).toBeNull();
+    expect(videoCostBound({ duration_seconds: "abc" }, at)).toBeNull();
+    expect(videoCostBound({ duration_seconds: "-1" }, at)).toBeNull();
+    expect(videoCostBound({ duration_seconds_1080p: "0.2" }, at)).toBeNull();
+    expect(videoCostBound({ duration_seconds_8k_future: "0.2" }, at)).toBeNull();
+    expect(videoCostBound({}, at)).toBeNull();
+    expect(videoCostBound(null, at)).toBeNull();
+    expect(videoPricing({ video_tokens: "0.000007" }, ["720p"])).toEqual({
+      ok: false,
+      reason: "token_priced",
+    });
+    expect(videoPricing({ duration_seconds_4k: "0.4" }, ["720p"])).toEqual({ ok: false, reason: "no_price" });
+    expect(videoPricing(VEO.pricing_skus, ["720p"])).toEqual({ ok: true });
+  });
+});
+
+describe("video card options (review item 10)", () => {
+  const rec = (over: Record<string, unknown> = {}) =>
+    videoRecordOf({ data: [{ ...VEO, ...over }] }, "test/veo")!;
+
+  it("length: the longest ≤ the default, else the shortest; asked: the shortest ≥, else the longest", () => {
+    const r = rec({ supported_durations: [-1, 4, 6, 8, 10, 12, 4] });
+    expect(r.durations).toEqual([4, 6, 8, 10, 12]);
+    const p = (ask: number | undefined, def = 8) => {
+      const x = planVideo(r, { durationSec: ask }, def);
+      return isPlanError(x) ? x : x.durationSec;
+    };
+    expect(p(undefined)).toBe(8);
+    expect(p(undefined, 5)).toBe(4);
+    expect(p(undefined, 2)).toBe(4);
+    expect(p(9)).toBe(10);
+    expect(p(30)).toBe(12);
+    expect(p(1)).toBe(4);
+  });
+
+  it("resolution: 720p by default (else the lowest), ≤ 1080p only; aspect ratio: 16:9 by default, listed only", () => {
+    const r = rec();
+    expect(r.resolutions).toEqual(["720p", "1080p"]);
+    expect(planVideo(r, {}, 8)).toMatchObject({ resolution: "720p", aspectRatio: "16:9", audio: true });
+    expect(planVideo(r, { resolution: "1080p", aspectRatio: "9:16" }, 8)).toMatchObject({
+      resolution: "1080p",
+      aspectRatio: "9:16",
+    });
+    expect(planVideo(r, { resolution: "4K" }, 8)).toMatchObject({ code: "media_bad_option" });
+    expect(planVideo(r, { aspectRatio: "1:1" }, 8)).toMatchObject({ code: "media_bad_option" });
+    expect(planVideo(rec({ supported_resolutions: ["480p", "1080p"] }), {}, 8)).toMatchObject({
+      resolution: "480p",
+    });
+    expect(planVideo(rec({ supported_resolutions: ["2K", "4K"] }), {}, 8)).toEqual({
+      code: "media_video_unsupported",
+    });
+    expect(planVideo(rec({ supported_durations: null }), {}, 8)).toEqual({ code: "media_video_unsupported" });
+    // None listed: none sent; asked for one — refused.
+    expect(planVideo(rec({ supported_aspect_ratios: null }), {}, 8)).toMatchObject({ aspectRatio: null });
+    expect(planVideo(rec({ supported_aspect_ratios: null }), { aspectRatio: "16:9" }, 8)).toMatchObject({
+      code: "media_bad_option",
+    });
+    expect(planVideo(rec({ generate_audio: null }), {}, 8)).toMatchObject({ audio: null });
+    expect(planVideo(rec({ pricing_skus: { video_tokens: "0.1" } }), {}, 8)).toEqual({
+      code: "media_no_price",
+    });
+    expect(planVideo(r, {}, 8)).toMatchObject({ micros: VEO_8S_MICROS });
+  });
+
+  it("approval: the card's exact combination must still be offered", () => {
+    const c = { durationSec: 8, resolution: "720p", aspectRatio: "16:9" };
+    expect(replanVideo(rec(), c)).toMatchObject({ micros: VEO_8S_MICROS });
+    expect(replanVideo(rec({ supported_durations: [4, 6] }), c)).toBeNull();
+    expect(replanVideo(rec({ supported_resolutions: ["1080p"] }), c)).toBeNull();
+    expect(replanVideo(rec({ supported_aspect_ratios: ["9:16"] }), c)).toBeNull();
+    expect(replanVideo(rec({ supported_aspect_ratios: null }), c)).toBeNull();
+    expect(videoModelVerdict(rec({ pricing_skus: { video_tokens: "1" } }))).toEqual({
+      ok: false,
+      reason: "token_priced",
+    });
+    expect(videoModelVerdict(rec({ supported_resolutions: ["4K"] }))).toEqual({
+      ok: false,
+      reason: "unsupported",
+    });
+  });
+});
+
+describe("video ids, URLs and the MP4 check (review items 7–8)", () => {
+  it("builds status and content URLs only from a validated id; refuses redirects without following them", async () => {
+    expect(VIDEO_JOB_ID.test(rid(1))).toBe(true);
+    for (const bad of [
+      "abc123",
+      "gen-vid-1-short",
+      `${rid(1)}/../x`,
+      "gen-vid-1789480874-Ab3dEf9hIjKlMnOpQrS!",
+    ])
+      expect(videoStatusUrl(bad)).toBeNull();
+    expect(videoContentUrl(rid(1))).toBe(`${OPENROUTER_VIDEOS_URL}/${rid(1)}/content?index=0`);
+    let redirect: RequestRedirect | undefined;
+    const fetchImpl = (async (_u: string | URL | Request, init?: RequestInit) => {
+      redirect = init?.redirect;
+      return new Response(null, { status: 302, headers: { location: "https://elsewhere.example/v.mp4" } });
+    }) as typeof fetch;
+    await expect(
+      videoGet(videoContentUrl(rid(1))!, { apiKey: KEY, fetchImpl, timeoutMs: 1000 }),
+    ).rejects.toMatchObject({
+      status: -2,
+    });
+    expect(redirect).toBe("manual");
+    await expect(
+      videoGet("https://openrouter.ai/api/v1/videos/models", { apiKey: KEY, fetchImpl, timeoutMs: 1000 }),
+    ).rejects.toMatchObject({ status: -1 });
+  });
+
+  it("ffprobe's report: an MP4 brand, the mp4 family and a video stream — not QuickTime, not audio only", () => {
+    const report = (brand: string, streams: unknown[], format = "mov,mp4,m4a,3gp,3g2,mj2") =>
+      JSON.stringify({ format: { format_name: format, tags: { major_brand: brand } }, streams });
+    const v = { codec_type: "video", disposition: { attached_pic: 0 } };
+    expect(judgeVideoProbe(report("isom", [v, { codec_type: "audio" }]))).toBe("ok");
+    expect(judgeVideoProbe(report("mp42", [v]))).toBe("ok");
+    expect(judgeVideoProbe(report("qt  ", [v]))).toBe("not_mp4");
+    expect(judgeVideoProbe(report("isom", [{ codec_type: "audio" }]))).toBe("not_mp4");
+    expect(judgeVideoProbe(report("isom", [{ codec_type: "video", disposition: { attached_pic: 1 } }]))).toBe(
+      "not_mp4",
+    );
+    expect(judgeVideoProbe(report("isom", [v], "matroska,webm"))).toBe("not_mp4");
+    expect(judgeVideoProbe("not json")).toBe("not_mp4");
+    const opts = videoProbeOptions("/opt/ffprobe", ["/opt"], "/data/video-scratch/x/video.mp4");
+    expect(opts).toMatchObject({ network: "none", read: ["/data/video-scratch/x"], write: [] });
+    // Without the sandbox (not macOS) there is no probe at all.
+    expect(sandboxedVideoProbe({ dataDir: "/nonexistent", platform: "linux" })).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------- the card, the approval and the job
+
+describe("video_generate and its jobs (#238 stage 3)", () => {
+  it("the tool makes a card only — no reservation, no POST; the defaults and the bound are on it", async () => {
+    const t = await start();
+    expect(MEDIA_TOOLS).toContain(VIDEO_GENERATE_TOOL);
+    expect(VIDEO_GENERATE_TOOL.description).toContain("NOT made yet");
+    const { output, jobId } = await t.card();
+    expect(output).toMatchObject({
+      status: "awaiting_approval",
+      model: "test/veo",
+      durationSec: 8,
+      resolution: "720p",
+      aspectRatio: "16:9",
+      audio: true,
+      estimateUsd: VEO_8S_MICROS / 1e6,
+    });
+    expect(t.server.posts()).toHaveLength(0);
+    expect(t.usage()).toHaveLength(0);
+    const res = await t.api(t.f.cookies.owner, "GET", `/api/video-jobs/${jobId}`);
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({
+      status: "awaiting_approval",
+      version: 0,
+      prompt: "노을 진 바다 위 작은 배",
+    });
+    // Someone else (a family member, the admin): nothing of it.
+    expect((await t.api(t.f.cookies.stranger, "GET", `/api/video-jobs/${jobId}`)).statusCode).toBe(403);
+    expect((await t.api(t.f.cookies.admin, "GET", `/api/video-jobs/${jobId}`)).statusCode).toBe(403);
+    // Asked for: the nearest supported length, 1080p.
+    const longer = await t.card({ prompt: "산", durationSec: 7, resolution: "1080p", aspectRatio: "9:16" });
+    expect(longer.output).toMatchObject({ durationSec: 8, resolution: "1080p", aspectRatio: "9:16" });
+    expect(
+      await t.app.media!.tools.run("video", await t.scopeOf(), { prompt: "산", resolution: "2160p" }),
+    ).toMatchObject({ ok: false, code: "media_bad_option" });
+  });
+
+  it("approved: pending → in_progress → completed; the cost settled, the MP4 stored and served inline, notified", async () => {
+    const t = await start();
+    const { jobId } = await t.card();
+    const res = await t.approve(jobId, 0);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json()).toMatchObject({ status: "pending", version: 2 });
+    // The submit: the card's options and the request policy — no sound flag, no callback, no frames.
+    const sent = t.server.posts()[0]!.body!;
+    expect(sent).toEqual({
+      model: "test/veo",
+      prompt: "노을 진 바다 위 작은 배",
+      duration: 8,
+      resolution: "720p",
+      aspect_ratio: "16:9",
+      provider: { data_collection: "deny" },
+    });
+    // The bound is held from the approval on.
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "video_job", e: VEO_8S_MICROS, p: null })]);
+    await t.video.tick();
+    await t.video.idle();
+    expect(t.job(jobId)).toMatchObject({ status: "pending" });
+    const done = await t.drive(jobId);
+    expect(done).toMatchObject({ status: "done", costMicros: 800_000, progress: 100 });
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "settled", p: 800_000 })]);
+    const view = (await t.api(t.f.cookies.owner, "GET", `/api/video-jobs/${jobId}`)).json() as VideoJob;
+    expect(view).toMatchObject({
+      status: "done",
+      costUsd: 0.8,
+      file: { name: expect.stringMatching(/^video-.*\.mp4$/) },
+    });
+    const file = t.app.files!.get(view.file!.fileId)!;
+    expect(file).toMatchObject({ kind: "mp4", messageId: view.messageId, bytes: fixtureMp4().length });
+    const inline = await t.api(t.f.cookies.owner, "GET", `/api/files/${file.id}/content?inline=1`);
+    expect(inline.statusCode).toBe(200);
+    expect(inline.headers["content-type"]).toBe("video/mp4");
+    expect(String(inline.headers["content-disposition"])).toMatch(/^inline/);
+    // The download folder is gone.
+    expect(fs.readdirSync(path.join(t.dataDir, "video-scratch"))).toEqual([]);
+    const notes = t.db.$client
+      .prepare("SELECT kind, body, url FROM notifications WHERE user_id = ?")
+      .all(t.f.users.owner.id) as { kind: string; body: string; url: string }[];
+    expect(notes).toEqual([
+      {
+        kind: "video_done",
+        body: "영상이 완성됐어요. 눌러서 대화에서 보세요.",
+        url: `/c/${view.conversationId}#m-${view.messageId}`,
+      },
+    ]);
+    // The SSE stream of an ended job: its state once, then closed.
+    const sse = await t.api(t.f.cookies.owner, "GET", `/api/video-jobs/${jobId}/events`);
+    expect(sse.body).toContain("event: job");
+  });
+
+  it("an uploaded MP4 is never inline — only a video job's checked result", async () => {
+    const t = await start();
+    const conv = t.app.conversations!.create(t.f.users.owner.id);
+    const up = await t.app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv.id}/files`,
+      headers: {
+        ...WRITE,
+        cookie: t.f.cookies.owner,
+        "content-type": "application/octet-stream",
+        "x-file-name": encodeURIComponent("clip.mp4"),
+        "x-upload-id": "6f1c2a4e-8a51-4c2e-9d0e-0d5f7c1a2b3c",
+      },
+      payload: fixtureMp4(),
+    });
+    expect(up.statusCode, up.body).toBe(201);
+    const id = (up.json() as { id: string }).id;
+    const res = await t.api(t.f.cookies.owner, "GET", `/api/files/${id}/content?inline=1`);
+    expect(String(res.headers["content-disposition"])).toMatch(/^attachment/);
+  });
+
+  it("double approval: the second (same version) is refused, one POST only; dismiss needs the version too", async () => {
+    const t = await start();
+    const { jobId } = await t.card();
+    const [a, b] = await Promise.all([t.approve(jobId, 0), t.approve(jobId, 0)]);
+    expect([a.statusCode, b.statusCode].sort()).toEqual([200, 409]);
+    expect([a, b].find((r) => r.statusCode === 409)!.json()).toMatchObject({ error: "video_job_changed" });
+    expect(t.server.posts()).toHaveLength(1);
+    expect(t.usage()).toHaveLength(1);
+    const other = await t.card();
+    expect(
+      (await t.api(t.f.cookies.owner, "POST", `/api/video-jobs/${other.jobId}/dismiss`, { version: 3 }))
+        .statusCode,
+    ).toBe(409);
+    const d = await t.api(t.f.cookies.owner, "POST", `/api/video-jobs/${other.jobId}/dismiss`, {
+      version: 0,
+    });
+    expect(d.json()).toMatchObject({ status: "dismissed" });
+    expect((await t.approve(other.jobId, 1)).json()).toMatchObject({ error: "video_job_changed" });
+    // Someone else cannot approve.
+    const third = await t.card();
+    expect((await t.approve(third.jobId, 0, t.f.cookies.stranger)).statusCode).toBe(403);
+  });
+
+  it("a card expires after 24 hours, or when the admin changes the settings, model or key", async () => {
+    const clock = { t: Date.UTC(2026, 10, 26, 3, 0, 0) };
+    const t = await start({ clock });
+    const { jobId } = await t.card();
+    clock.t += 24 * 3600_000;
+    const r = await t.approve(jobId, 0);
+    expect(r.statusCode).toBe(409);
+    expect(r.json()).toMatchObject({
+      error: "video_job_expired",
+      job: { status: "expired", errorCode: "video_card_expired" },
+    });
+    // The engine's pass expires waiting cards too.
+    const second = await t.card();
+    clock.t += 24 * 3600_000 + 1;
+    await t.video.tick();
+    expect(t.job(second.jobId)).toMatchObject({ status: "expired", errorCode: "video_card_expired" });
+    // A settings save (any field) while it waits.
+    const third = await t.card();
+    t.app.media!.settings.set(videoOn({ dailyCostLimitUsd: 40 }));
+    expect((await t.approve(third.jobId, 0)).json()).toMatchObject({
+      error: "video_job_expired",
+      job: { errorCode: "video_settings_changed" },
+    });
+    // The key (its mark): the admin saving one over `.env`'s (the same value — still a change of key).
+    const fourth = await t.card();
+    await t.app.media!.admin.registerKey(KEY, t.app.media!.admin.generation(), () => true);
+    expect((await t.approve(fourth.jobId, 0)).json()).toMatchObject({
+      job: { errorCode: "video_settings_changed" },
+    });
+    expect(t.server.posts()).toHaveLength(0);
+  });
+
+  it("dearer at approval: the card is re-priced (version + 1) and nothing is sent; approved again, it goes", async () => {
+    let price = "0.12";
+    const server = fakeServer({
+      catalog: () => [{ ...VEO, pricing_skus: { ...VEO.pricing_skus, duration_seconds_with_audio: price } }],
+    });
+    const t = await start({ server });
+    const { jobId } = await t.card();
+    price = "0.20";
+    const r = await t.approve(jobId, 0);
+    expect(r.statusCode).toBe(409);
+    expect(r.json()).toMatchObject({
+      error: "video_estimate_changed",
+      job: { version: 1, estimateUsd: 0.2 * 8 * 1.2 },
+    });
+    expect(t.server.posts()).toHaveLength(0);
+    expect(t.usage()).toHaveLength(0);
+    expect((await t.approve(jobId, 1)).json()).toMatchObject({ status: "pending" });
+    expect(t.usage()[0]!.e).toBe(1_920_000);
+  });
+
+  it("no longer offered at approval (its length gone): the card expires, nothing sent", async () => {
+    let durations = [4, 6, 8];
+    const server = fakeServer({ catalog: () => [{ ...VEO, supported_durations: durations }] });
+    const t = await start({ server });
+    const { jobId } = await t.card();
+    durations = [4, 6];
+    expect((await t.approve(jobId, 0)).json()).toMatchObject({
+      error: "video_job_expired",
+      job: { status: "expired", errorCode: "video_options_changed" },
+    });
+    expect(t.server.posts()).toHaveLength(0);
+  });
+
+  it("budget: a card dearer than what is left is not made; at approval the day is the approval's", async () => {
+    const clock = { t: Date.UTC(2026, 10, 26, 14, 59, 59) }; // 23:59:59 in Seoul
+    const t = await start({ clock });
+    t.app.media!.settings.set(videoOn({ dailyCostLimitUsd: 1 }));
+    expect(await t.app.media!.tools.run("video", await t.scopeOf(), { prompt: "산" })).toMatchObject({
+      ok: false,
+      code: "media_budget",
+    });
+    t.app.media!.settings.set(videoOn({ dailyCostLimitUsd: 2 }));
+    const { jobId } = await t.card();
+    // Another card's bound takes the rest of today (approved first).
+    const other = await t.card();
+    expect((await t.approve(other.jobId, 0)).statusCode).toBe(200);
+    const r = await t.approve(jobId, 0);
+    expect(r.json()).toMatchObject({ error: "video_budget" });
+    // After midnight, the new day's budget: the reservation is written with the approval's moment.
+    clock.t += 2_000;
+    expect((await t.approve(jobId, 0)).json()).toMatchObject({ status: "pending" });
+    const rows = t.usage().sort((a, b) => a.c - b.c);
+    expect(rows.map((x) => x.c)).toEqual([
+      Date.UTC(2026, 10, 26, 14, 59, 59),
+      Date.UTC(2026, 10, 26, 15, 0, 1),
+    ]);
+  });
+
+  it("slots: two jobs per user at once (DB-counted); a slot frees when a job ends", async () => {
+    const t = await start();
+    const cards = [await t.card(), await t.card(), await t.card()];
+    expect((await t.approve(cards[0]!.jobId, 0)).statusCode).toBe(200);
+    expect((await t.approve(cards[1]!.jobId, 0)).statusCode).toBe(200);
+    expect((await t.approve(cards[2]!.jobId, 0)).json()).toMatchObject({ error: "video_busy" });
+    await t.drive(cards[0]!.jobId);
+    expect((await t.approve(cards[2]!.jobId, 0)).statusCode).toBe(200);
+  });
+
+  it("the provider fails it (moderation): failed with a fixed code, the bound kept (unconfirmed), notified", async () => {
+    const server = fakeServer({
+      poll: (id, n) =>
+        n === 1
+          ? Response.json({ id, status: "pending" })
+          : Response.json({ id, status: "failed", error: "Generated video rejected by content moderation." }),
+    });
+    const t = await start({ server });
+    const { jobId } = await t.card({ prompt: "산 위의 구름" });
+    await t.approve(jobId, 0);
+    expect(await t.drive(jobId)).toMatchObject({
+      status: "failed",
+      errorCode: "video_moderated",
+      fileId: null,
+    });
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "unconfirmed", e: VEO_8S_MICROS, p: null })]);
+    const n = t.db.$client.prepare("SELECT kind, body FROM notifications").all() as {
+      kind: string;
+      body: string;
+    }[];
+    expect(n).toEqual([{ kind: "video_failed", body: "영상을 만들지 못했어요 — 내용 검사에서 거부됐어요" }]);
+    // Never the provider's words.
+    expect(
+      JSON.stringify((await t.api(t.f.cookies.owner, "GET", `/api/video-jobs/${jobId}`)).json()),
+    ).not.toContain("rejected by content moderation");
+  });
+
+  it("expired at OpenRouter, unknown there (404), and 429 backing off with Retry-After", async () => {
+    let mode: "expired" | "404" | "429" = "expired";
+    const server = fakeServer({
+      poll: (id) =>
+        mode === "expired"
+          ? Response.json({ id, status: "expired", error: "Job exceeded maximum time to live" })
+          : mode === "404"
+            ? Response.json({ error: { code: 404 } }, { status: 404 })
+            : Response.json({ error: { code: 429 } }, { status: 429, headers: { "retry-after": "90" } }),
+    });
+    const clock = { t: Date.UTC(2026, 10, 26, 3, 0, 0) };
+    const t = await start({ server, clock });
+    const a = await t.card();
+    await t.approve(a.jobId, 0);
+    expect(await t.drive(a.jobId)).toMatchObject({ status: "failed", errorCode: "video_remote_expired" });
+    mode = "404";
+    const b = await t.card();
+    await t.approve(b.jobId, 0);
+    expect(await t.drive(b.jobId)).toMatchObject({ status: "failed", errorCode: "video_lost" });
+    mode = "429";
+    const c = await t.card();
+    await t.approve(c.jobId, 0);
+    clock.t += 30_000;
+    await t.video.tick();
+    await t.video.idle();
+    const due = (t.video as unknown as { due: Map<string, { at: number; failures: number }> }).due.get(
+      c.jobId,
+    )!;
+    expect(due).toEqual({ at: clock.t + 90_000, failures: 1 });
+    expect(t.job(c.jobId).status).toBe("pending");
+  });
+
+  it("not finished within 60 minutes of the approval: video_timeout, the bound kept", async () => {
+    const server = fakeServer({ poll: (id) => Response.json({ id, status: "in_progress" }) });
+    const clock = { t: Date.UTC(2026, 10, 26, 3, 0, 0) };
+    const t = await start({ server, clock });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    expect(t.job(jobId).deadlineAt).toBe(clock.t + 3600_000);
+    clock.t += 3600_000;
+    await t.video.tick();
+    expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_timeout" });
+    expect(t.usage()[0]!.s).toBe("unconfirmed");
+  });
+
+  it("the submit: a 4xx releases the bound; a 5xx, no answer or an unreadable 202 keeps it — never resent", async () => {
+    let mode: "400" | "402" | "503" | "net" | "junk" = "400";
+    const server = fakeServer({
+      submit: () => {
+        if (mode === "net") throw new TypeError("fetch failed");
+        if (mode === "junk") return Response.json({ id: "not-a-job" }, { status: 202 });
+        return Response.json({ error: { code: Number(mode) } }, { status: Number(mode) });
+      },
+    });
+    const t = await start({ server });
+    const outcome = async () => {
+      const { jobId } = await t.card();
+      const r = await t.approve(jobId, 0);
+      expect(r.statusCode).toBe(200);
+      return r.json() as VideoJob;
+    };
+    expect(await outcome()).toMatchObject({ status: "failed", errorCode: "video_rejected" });
+    mode = "402";
+    expect(await outcome()).toMatchObject({ status: "failed", errorCode: "video_payment" });
+    expect(t.usage()).toHaveLength(0);
+    for (const m of ["503", "net", "junk"] as const) {
+      mode = m;
+      expect(await outcome()).toMatchObject({ status: "failed", errorCode: "video_unconfirmed" });
+    }
+    expect(t.usage().map((u) => u.s)).toEqual(["unconfirmed", "unconfirmed", "unconfirmed"]);
+    expect(t.server.posts()).toHaveLength(5);
+  });
+
+  it("restart: submitting is never resent (video_unconfirmed); pending is polled on and finishes", async () => {
+    const t = await start();
+    const a = await t.card();
+    const b = await t.card();
+    await t.approve(a.jobId, 0);
+    // b died between the reservation and the answer: as a previous process left it.
+    await t.approve(b.jobId, 0);
+    t.db.$client
+      .prepare("UPDATE video_jobs SET status = 'submitting', remote_id = NULL WHERE id = ?")
+      .run(b.jobId);
+    t.db.$client.prepare("UPDATE video_jobs SET notified_at = NULL").run();
+    await t.video.stop();
+    const next = new VideoJobs({
+      db: t.db,
+      files: () => t.app.files,
+      conversations: t.app.conversations!,
+      keys: t.app.media!.keys,
+      settings: t.app.media!.settings,
+      budget: t.app.media!.budget,
+      usage: t.app.usageStore,
+      users: t.app.users!,
+      notifications: () => t.app.notifications,
+      probe: () => fixtureVideoProbe(),
+      dataDir: t.dataDir,
+      fetchImpl: t.server.fetchImpl,
+      limits: { tickMs: 3_600_000 },
+    });
+    next.start();
+    closers.push(() => next.stop());
+    expect(next.get(b.jobId)).toMatchObject({ status: "failed", errorCode: "video_unconfirmed" });
+    await next.idle();
+    for (let i = 0; i < 5 && next.get(a.jobId)!.status !== "done"; i++) {
+      (next as unknown as { due: Map<string, { at: number }> }).due.forEach((d) => (d.at = 0));
+      await next.tick();
+      await next.idle();
+    }
+    expect(next.get(a.jobId)).toMatchObject({ status: "done" });
+    expect(t.server.posts()).toHaveLength(2);
+  });
+
+  it("a download over the disk guard, a redirect, or a file that is not an MP4: failed, the reported cost kept", async () => {
+    let mode: "big" | "redirect" | "png" = "big";
+    const server = fakeServer({
+      content: () =>
+        mode === "big"
+          ? new Response(new Uint8Array(4096), { headers: { "content-type": "video/mp4" } })
+          : mode === "redirect"
+            ? new Response(null, { status: 302, headers: { location: "https://cdn.example/v.mp4" } })
+            : new Response(new Uint8Array(Buffer.from("\x89PNG\r\n\x1a\n0000000000")), {
+                headers: { "content-type": "video/mp4" },
+              }),
+    });
+    const t = await start({ server, limits: { maxBytes: 1024 } });
+    for (const [m, code] of [
+      ["big", "video_too_large"],
+      ["redirect", "video_download_failed"],
+      ["png", "video_not_mp4"],
+    ] as const) {
+      mode = m;
+      const { jobId } = await t.card();
+      await t.approve(jobId, 0);
+      expect(await t.drive(jobId)).toMatchObject({ status: "failed", errorCode: code, costMicros: 800_000 });
+    }
+    expect(t.usage().map((u) => [u.s, u.p])).toEqual([
+      ["settled", 800_000],
+      ["settled", 800_000],
+      ["settled", 800_000],
+    ]);
+    expect(t.db.$client.prepare("SELECT count(*) n FROM files").get()).toEqual({ n: 0 });
+    expect(fs.readdirSync(path.join(t.dataDir, "video-scratch"))).toEqual([]);
+  });
+
+  it("a deleted conversation: its job's bound kept (unconfirmed), the job gone, its poll stopped", async () => {
+    const t = await start();
+    const { jobId, scope } = await t.card();
+    await t.approve(jobId, 0);
+    await t.app.inject({
+      method: "DELETE",
+      url: `/api/conversations/${scope.conversationId}`,
+      headers: { ...WRITE, cookie: t.f.cookies.owner },
+    });
+    expect(t.video.get(jobId)).toBeUndefined();
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "unconfirmed", e: VEO_8S_MICROS })]);
+    const polls = t.server.requests.length;
+    await t.video.tick();
+    await t.video.idle();
+    expect(t.server.requests.length).toBe(polls);
+  });
+
+  it("file places: an approved job holds one — an upload is refused at 19 files + 1 held; no place, no approval", async () => {
+    const t = await start();
+    const { jobId, scope } = await t.card();
+    const conv = scope.conversationId;
+    const insert = t.db.$client.prepare(
+      `INSERT INTO files (id, user_id, conversation_id, message_id, upload_id, name, kind, media_type, bytes, sha256, created_at)
+       VALUES (?, ?, ?, NULL, ?, 'f.txt', 'txt', 'text/plain', 1, 'x', 0)`,
+    );
+    for (let i = 0; i < FILE_LIMITS.perConversation - 1; i++)
+      insert.run(`f-${i}`, t.f.users.owner.id, conv, `u-${i}`);
+    expect((await t.approve(jobId, 0)).statusCode).toBe(200);
+    expect(t.app.files!.placesTaken(conv)).toBe(FILE_LIMITS.perConversation);
+    const up = await t.app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv}/files`,
+      headers: {
+        ...WRITE,
+        cookie: t.f.cookies.owner,
+        "content-type": "application/octet-stream",
+        "x-file-name": encodeURIComponent("a.txt"),
+        "x-upload-id": "7f1c2a4e-8a51-4c2e-9d0e-0d5f7c1a2b3c",
+      },
+      payload: "hello",
+    });
+    expect(up.json()).toMatchObject({ error: "too_many_files" });
+    // Its own file takes the place it held.
+    expect(await t.drive(jobId)).toMatchObject({ status: "done" });
+    expect(t.app.files!.count(conv)).toBe(FILE_LIMITS.perConversation);
+    const another = await t.card(undefined, conv);
+    expect((await t.approve(another.jobId, 0)).json()).toMatchObject({ error: "video_file_limit" });
+  });
+
+  it("nothing is approved without ffprobe, without the engine, or while the media recovery runs", async () => {
+    const t = await start({ probe: () => undefined });
+    const { jobId } = await t.card();
+    expect((await t.approve(jobId, 0)).json()).toMatchObject({ error: "video_probe_unavailable" });
+    const u = await start({ engine: false });
+    const c = await u.card();
+    expect((await u.approve(c.jobId, 0)).json()).toMatchObject({ error: "video_engine_unavailable" });
+    const v = await start();
+    const d = await v.card();
+    vi.spyOn(v.app.media!.recovery, "recovering").mockReturnValue(true);
+    expect((await v.approve(d.jobId, 0)).json()).toMatchObject({ error: "video_recovering" });
+    expect([...t.server.posts(), ...u.server.posts(), ...v.server.posts()]).toHaveLength(0);
+  });
+
+  it("a prompt carrying a known secret makes no card; one registered after the card ends it unsent", async () => {
+    const t = await start();
+    const secret = "sk-test-verysecretvalue-heron-basalt-cobalt";
+    const late = "late-registered-marker-pelican-quartz";
+    const { knownSecrets } = await import("../src/secrets/known.js");
+    const { jobId } = await t.card({ prompt: `바다 위 배 ${late}` });
+    knownSecrets.add(late, { fresh: true });
+    try {
+      const r = await t.approve(jobId, 0);
+      expect(r.json()).toMatchObject({ status: "failed", errorCode: "video_blocked" });
+      knownSecrets.add(secret, { fresh: true });
+      expect(
+        await t.app.media!.tools.run("video", await t.scopeOf(), { prompt: `배 ${secret}` }),
+      ).toMatchObject({
+        ok: false,
+        code: "media_secret_blocked",
+      });
+    } finally {
+      knownSecrets.remove(late);
+      knownSecrets.remove(secret);
+    }
+    expect(t.server.posts()).toHaveLength(0);
+  });
+
+  it("the admin: a token-priced video model is refused when chosen; a per-second one is saved", async () => {
+    const server = fakeServer({
+      catalog: () => [VEO, { ...VEO, id: "test/tokens", pricing_skus: { video_tokens: "0.000007" } }],
+    });
+    const t = await start({ server });
+    const admin = t.app.media!.admin;
+    const save = (model: string) =>
+      admin.saveSettings(
+        { ...videoOn(), kinds: { ...videoOn().kinds, video: { enabled: true, model } } },
+        t.app.media!.settings.revision(),
+        () => true,
+      );
+    await expect(save("test/tokens")).rejects.toMatchObject({
+      code: "media_model_video_token_priced",
+      kind: "video",
+    });
+    await expect(save("test/veo")).resolves.toMatchObject({
+      settings: { kinds: { video: { model: "test/veo" } } },
+    });
+  });
+
+  it("notifications: fixed words only, never the prompt", () => {
+    expect(compose({ kind: "video_done", url: "/c/x#m-y" })).toMatchObject({
+      title: "영상 생성",
+      body: "영상이 완성됐어요. 눌러서 대화에서 보세요.",
+    });
+    expect(compose({ kind: "video_failed", reason: "60분 안에 끝나지 않았어요", url: "/c/x" }).body).toBe(
+      "영상을 만들지 못했어요 — 60분 안에 끝나지 않았어요",
+    );
+  });
+});

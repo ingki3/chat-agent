@@ -3,12 +3,12 @@ import { MEDIA_TOOL_LIMITS } from "@agentlee/shared";
 import type { ServerToolInfo } from "./index.js";
 
 /**
- * 미디어 생성 stage 2 (#238): images and speech made by the OpenRouter model the admin chose. How a call runs — the
+ * 미디어 생성 stages 2–3 (#238): images, speech and (behind a confirmation card) video made by the OpenRouter model the admin chose. How a call runs — the
  * admin's switch and model, the per-run and daily limits, the request policy, the stored file — is the host's
  * business (apps/server/src/media/generate.ts). Offered only while the kind is on (관리자 → 미디어 생성), to every
  * active account — youth accounts too, with the provider's strictest moderation where the model has one.
  */
-export type MediaToolInfo = ServerToolInfo & { kind: "image" | "speech" };
+export type MediaToolInfo = ServerToolInfo & { kind: "image" | "speech" | "video" };
 
 /** The forbidden uses, the same for every account (#238 plan, user decision 2026-11-24). */
 const RULES =
@@ -72,4 +72,45 @@ export const SPEECH_GENERATE_TOOL: MediaToolInfo = {
   },
 };
 
-export const MEDIA_TOOLS: readonly MediaToolInfo[] = [IMAGE_GENERATE_TOOL, SPEECH_GENERATE_TOOL];
+/**
+ * Stage 3 (#238): a video is never made by the call itself — it makes a confirmation card, and only the conversation's
+ * owner approving it there submits the paid job (apps/server/src/media/video-jobs.ts).
+ */
+export const VIDEO_GENERATE_TOOL: MediaToolInfo = {
+  name: "video_generate",
+  kind: "video",
+  description: `Proposes one short video made with the video model the admin chose. It is NOT made yet: the user sees a confirmation card (model, length, resolution, aspect ratio, sound, the most it may cost) under your reply, and the video is generated only after they approve it there (it takes minutes; it then plays in that card). After calling, tell the user to check the card and approve it — never say the video was made. ${RULES} Leave durationSec, resolution and aspectRatio out unless the user asked for them (default: about 8 seconds, 720p). Returns jobId, model, durationSec, resolution, aspectRatio, audio (the model's default for sound: true, false or null) and estimateUsd (the most it may cost).`,
+  input: {
+    prompt: z
+      .string()
+      .trim()
+      .min(1)
+      .max(MEDIA_TOOL_LIMITS.videoPromptChars)
+      .describe("What the video shows, in the user's words (any language)."),
+    durationSec: z
+      .number()
+      .int()
+      .min(1)
+      .max(600)
+      .optional()
+      .describe(
+        "Length in seconds — only when the user asked for one; the model's nearest supported length is used.",
+      ),
+    resolution: z
+      .string()
+      .regex(/^\d{3,4}p$/)
+      .optional()
+      .describe('Such as "720p" or "1080p" (at most 1080p) — only when the user asked.'),
+    aspectRatio: z
+      .string()
+      .regex(/^\d{1,2}:\d{1,2}$/)
+      .optional()
+      .describe('Width:height such as "16:9" or "9:16" — only when the user asked for a shape.'),
+  },
+};
+
+export const MEDIA_TOOLS: readonly MediaToolInfo[] = [
+  IMAGE_GENERATE_TOOL,
+  SPEECH_GENERATE_TOOL,
+  VIDEO_GENERATE_TOOL,
+];

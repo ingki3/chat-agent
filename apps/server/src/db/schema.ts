@@ -403,6 +403,9 @@ export const notificationPrefs = sqliteTable("notification_prefs", {
   /** 깊이 조사 (#211): "완료" and "실패·중지" notifications — the user may turn each off. */
   researchDone: integer("research_done", { mode: "boolean" }).notNull().default(true),
   researchFailed: integer("research_failed", { mode: "boolean" }).notNull().default(true),
+  /** 영상 생성 (#238 stage 3): "완성" and "실패" notifications — the user may turn each off. */
+  videoDone: integer("video_done", { mode: "boolean" }).notNull().default(true),
+  videoFailed: integer("video_failed", { mode: "boolean" }).notNull().default(true),
   /** Revision (#188 review 9): +1 on every write; every response carries it. */
   rev: integer("rev").notNull().default(0),
   updatedAt: integer("updated_at").notNull(),
@@ -585,11 +588,13 @@ export const usageRecords = sqliteTable(
      * 미디어 생성 (#238): where the row's cost stands — `pending_send` (#248: a speech piece reserved, its request
      * not sent yet — never billed; released when the call stops, and by the start-up recovery), `reserved` (sent, no
      * answer yet), `awaiting_cost` (answered, the cost not reported yet: looked up again later), `settled`,
-     * `unconfirmed` (it can never be confirmed: no id, an unknown outcome, or the lookups gave up). NULL for every
-     * other purpose. A plain text column (no CHECK): a new state needs no migration.
+     * `unconfirmed` (it can never be confirmed: no id, an unknown outcome, or the lookups gave up), `video_job` (#238
+     * stage 3: an approved video job's bound — its job (`video_jobs.usage_key`) settles it or makes it `unconfirmed`;
+     * the start-up recovery and the late-cost settler leave it alone). NULL for every other purpose. A plain text
+     * column (no CHECK): a new state needs no migration.
      */
     mediaSettlement: text("media_settlement", {
-      enum: ["pending_send", "reserved", "awaiting_cost", "settled", "unconfirmed"],
+      enum: ["pending_send", "reserved", "awaiting_cost", "settled", "unconfirmed", "video_job"],
     }),
     /** Cost lookups after the call (the background settler's backoff). */
     mediaSettleTries: integer("media_settle_tries"),
@@ -1807,5 +1812,76 @@ export const researchJobs = sqliteTable(
   (t) => [
     index("research_jobs_conversation_idx").on(t.conversationId, t.createdAt),
     index("research_jobs_owner_status_idx").on(t.ownerId, t.status),
+  ],
+);
+
+/**
+ * 영상 생성 jobs (#238 stage 3, docs/decisions/media-generation.md §14): one per `video_generate` card of a
+ * conversation, owned by the conversation's owner. The row is the job's whole state — the card (the options and the
+ * bound shown), the approval (`version`), the remote job id, the deadline — so a restart resumes polling from here.
+ * `usage_key`: the usage row reserved at approval (`<runId>#media:<callId>`). `file_id`: the stored video, written in
+ * the same transaction as `done`.
+ */
+export const videoJobs = sqliteTable(
+  "video_jobs",
+  {
+    id: text("id").primaryKey(),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    ownerId: text("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** The reply of the run that called `video_generate` (the card is under its tool line; the file is linked to it). */
+    messageId: text("message_id").notNull(),
+    runId: text("run_id").notNull(),
+    status: text("status", {
+      enum: [
+        "awaiting_approval",
+        "submitting",
+        "pending",
+        "in_progress",
+        "downloading",
+        "done",
+        "failed",
+        "expired",
+        "dismissed",
+      ],
+    }).notNull(),
+    model: text("model").notNull(),
+    prompt: text("prompt").notNull(),
+    durationSec: integer("duration_sec").notNull(),
+    resolution: text("resolution").notNull(),
+    aspectRatio: text("aspect_ratio"),
+    /** The model's `generate_audio` default when the card was made (null: not stated). */
+    audio: integer("audio", { mode: "boolean" }),
+    /** The bound shown on the card and reserved at approval (integer micro-USD). */
+    estimateMicros: integer("estimate_micros").notNull(),
+    /** OpenRouter's reported cost (micro-USD), once settled. */
+    costMicros: integer("cost_micros"),
+    /** The media settings revision and the key mark (never the key) the card was made under. */
+    settingsRevision: text("settings_revision").notNull(),
+    keyMark: text("key_mark").notNull(),
+    usageKey: text("usage_key"),
+    /** OpenRouter's job id (`gen-vid-…`, validated). */
+    remoteId: text("remote_id"),
+    fileId: text("file_id").references(() => files.id, { onDelete: "set null" }),
+    errorCode: text("error_code"),
+    progress: integer("progress"),
+    /** +1 on every write (the card's approval names the version it showed). */
+    version: integer("version").notNull().default(0),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+    approvedAt: integer("approved_at"),
+    submittedAt: integer("submitted_at"),
+    deadlineAt: integer("deadline_at"),
+    endedAt: integer("ended_at"),
+    /** The end notification was published (a restart publishes only the missing ones). */
+    notifiedAt: integer("notified_at"),
+  },
+  (t) => [
+    index("video_jobs_conversation_idx").on(t.conversationId, t.createdAt),
+    index("video_jobs_status_idx").on(t.status),
   ],
 );

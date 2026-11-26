@@ -7,6 +7,7 @@ import {
   OPENROUTER_IMAGES_URL,
   OPENROUTER_KEY_URL,
   OPENROUTER_SPEECH_URL,
+  OPENROUTER_VIDEOS_URL,
   SPEECH_PRICING_URL,
 } from "./openrouter.js";
 import { makeSpeechWorkdir, type Measured, type SpeechAudio } from "./speech-audio.js";
@@ -156,7 +157,19 @@ const CATALOGS: Record<string, unknown> = {
         supported_durations: [4, 6, 8, 12],
         supported_resolutions: ["720p", "1080p"],
         supported_aspect_ratios: ["16:9", "9:16"],
-        pricing_skus: { "per-video-second": "0.50", "per-video-second-1080p": "0.75" },
+        generate_audio: true,
+        // Per second, by tier (the documented shape, `duration_seconds[_<tier>]`): 8 s at 720p ≤ $0.40 × 1.2.
+        pricing_skus: { duration_seconds: "0.05", duration_seconds_1080p: "0.08" },
+      },
+      {
+        // Priced in tokens (Seedance-like): no bound from a length — refused when chosen (#238 stage 3).
+        id: "fixture/video-tokens",
+        name: "Fixture Video Tokens",
+        supported_durations: [5, 10],
+        supported_resolutions: ["720p"],
+        supported_aspect_ratios: ["16:9"],
+        generate_audio: null,
+        pricing_skus: { video_tokens: "0.000007" },
       },
     ],
   },
@@ -198,7 +211,81 @@ export function silentMp3(frames = 20): Buffer {
   return Buffer.concat([id3, ...Array.from({ length: frames }, () => frame)]);
 }
 
+/** The fixture's video job cost (`usage.cost` of its completed poll). */
+export const FIXTURE_VIDEO_COST = 0.3;
+/** In a video prompt: the scripted job fails (`failed`, its error naming moderation). */
+export const FIXTURE_VIDEO_FAIL_MARK = "FIXTURE-VIDEO-FAIL";
+
+/**
+ * A tiny ISO BMFF file of the MP4 form (an `ftyp` of brand `isom`, an empty `moov` and `mdat`): what the scripted
+ * probe takes. It holds no frames — a browser may not play it (the card then offers the download).
+ */
+export function fixtureMp4(): Buffer {
+  const box = (type: string, body: Buffer) => {
+    const head = Buffer.alloc(8);
+    head.writeUInt32BE(8 + body.length, 0);
+    head.write(type, 4, "latin1");
+    return Buffer.concat([head, body]);
+  };
+  const ftyp = box(
+    "ftyp",
+    Buffer.concat([
+      Buffer.from("isom", "latin1"),
+      Buffer.from([0, 0, 2, 0]),
+      Buffer.from("isomiso2mp41", "latin1"),
+    ]),
+  );
+  return Buffer.concat([ftyp, box("moov", Buffer.alloc(0)), box("mdat", Buffer.alloc(16))]);
+}
+
+/**
+ * The scripted video jobs (#238 stage 3): `POST /videos` answers 202 with a `gen-vid-…` id; each poll moves the job on
+ * (`pending` → `in_progress` 40% → `completed` with `usage.cost`), or — a prompt with `FIXTURE_VIDEO_FAIL_MARK` —
+ * to `failed`; its content is `fixtureMp4()`.
+ */
+function videoJobs() {
+  const jobs = new Map<string, { polls: number; fail: boolean }>();
+  let n = 0;
+  return {
+    submit(body: Record<string, unknown>): Response {
+      n += 1;
+      // OpenRouter's shape: `gen-vid-<digits>-<20 letters or digits>`.
+      const rid = `gen-vid-${1_789_480_000 + n}-${`Fx${String(n).padStart(6, "0")}VideoJobAbcdefgh`.slice(0, 20)}`;
+      jobs.set(rid, { polls: 0, fail: String(body.prompt ?? "").includes(FIXTURE_VIDEO_FAIL_MARK) });
+      return Response.json(
+        { id: rid, polling_url: `${OPENROUTER_VIDEOS_URL}/${rid}`, status: "pending" },
+        { status: 202 },
+      );
+    },
+    poll(rid: string): Response {
+      const j = jobs.get(rid);
+      if (!j) return Response.json({ error: { code: 404 } }, { status: 404 });
+      j.polls += 1;
+      if (j.fail && j.polls >= 2)
+        return Response.json({
+          id: rid,
+          status: "failed",
+          error: "Generated video rejected by content moderation.",
+        });
+      if (j.polls === 1) return Response.json({ id: rid, status: "in_progress", progress: 40 });
+      return Response.json({
+        id: rid,
+        generation_id: rid,
+        status: "completed",
+        unsigned_urls: [`${OPENROUTER_VIDEOS_URL}/${rid}/content?index=0`],
+        usage: { cost: FIXTURE_VIDEO_COST, is_byok: false },
+      });
+    },
+    content(rid: string): Response {
+      const j = jobs.get(rid);
+      if (!j || j.polls < 2 || j.fail) return Response.json({ error: { code: 404 } }, { status: 404 });
+      return new Response(new Uint8Array(fixtureMp4()), { headers: { "content-type": "video/mp4" } });
+    },
+  };
+}
+
 export function fixtureOpenRouterFetch(): typeof fetch {
+  const video = videoJobs();
   return (async (input: string | URL | Request, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const auth = new Headers(init?.headers).get("authorization") ?? "";
@@ -216,6 +303,11 @@ export function fixtureOpenRouterFetch(): typeof fetch {
       return new Response(new Uint8Array(silentMp3()), {
         headers: { "content-type": "audio/mpeg", "x-generation-id": FIXTURE_GENERATION_ID },
       });
+    if (init?.method === "POST" && url === OPENROUTER_VIDEOS_URL)
+      return video.submit(JSON.parse(String(init.body ?? "{}")) as Record<string, unknown>);
+    const job =
+      /^https:\/\/openrouter\.ai\/api\/v1\/videos\/(gen-vid-[0-9A-Za-z-]+?)(\/content\?index=0)?$/.exec(url);
+    if (job) return job[2] ? video.content(job[1]!) : video.poll(job[1]!);
     const body = CATALOGS[url];
     if (body) return Response.json(body);
     return Response.json({ error: { code: 404 } }, { status: 404 });

@@ -39,7 +39,8 @@ export const FILE_CODES = ["file_ok", "file_aborted", "invalid_request", ...FILE
 /**
  * Kinds a browser may show in the page (`?inline=1`): raster images (PNG, JPG, WebP) and audio (M4A, MP3, WAV —
  * the chat's `<audio>` player, #238). Everything else — PDF, office files, text, video — is always a download;
- * active content (SVG, HTML, XML) is not even accepted (FILE_KINDS).
+ * active content (SVG, HTML, XML) is not even accepted (FILE_KINDS). The one exception (#238 stage 3): an MP4 that a
+ * video job checked and stored (`FileStore.isVerifiedVideo`) plays in the card's `<video>` — never an uploaded one.
  */
 export const INLINE_KINDS: ReadonlySet<FileKind> = new Set(["png", "jpg", "webp", "m4a", "mp3", "wav"]);
 /**
@@ -294,7 +295,7 @@ export function registerFileRoutes(
         const declared = Number(req.headers["content-length"] ?? NaN);
         if (Number.isFinite(declared) && declared > FILE_LIMITS.bytes) return refuse("file_too_large");
         // Early answer for the common case; the insert checks again (concurrent uploads).
-        if (store.count(conversationId) >= FILE_LIMITS.perConversation) return refuse("too_many_files");
+        if (store.placesTaken(conversationId) >= FILE_LIMITS.perConversation) return refuse("too_many_files");
         const body = req.body as Readable | undefined;
         if (!body || typeof body.on !== "function") return refuse("file_empty", false);
 
@@ -356,7 +357,10 @@ export function registerFileRoutes(
       const fd = store.open(f);
       if (fd === undefined)
         return reply.code(404).header("Cache-Control", "no-store").send({ error: "not_found" });
-      const inline = req.query.inline === "1" && INLINE_KINDS.has(f.kind);
+      // An MP4 only when it is a video job's checked result (#238 stage 3, review item 8): never an upload.
+      const inline =
+        req.query.inline === "1" &&
+        (INLINE_KINDS.has(f.kind) || (f.kind === "mp4" && store.isVerifiedVideo(f.id)));
       const { base, ext } = nameParts(toUploadedFile(f).name);
       const disposition = attachment(base, ext || f.kind);
       reply

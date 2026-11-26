@@ -117,6 +117,16 @@ export function cleanName(raw: string): string {
   return chars.slice(0, FILE_LIMITS.nameChars - Array.from(ext).length).join("") + ext;
 }
 
+/**
+ * A conversation's places held by approved video jobs (#238 stage 3, review item 3): a job submitted and not ended
+ * whose file is not stored yet holds one of the conversation's `FILE_LIMITS.perConversation` places, so an upload or
+ * another generated file cannot take the place its paid video will need. Every count check of a new file adds these
+ * (the job storing its own file excludes itself: the `?` after the conversation id, '' for everyone else).
+ */
+const VIDEO_HELD = `(SELECT count(*) FROM video_jobs WHERE conversation_id = ? AND file_id IS NULL AND id <> ?
+  AND status IN ('submitting', 'pending', 'in_progress', 'downloading'))`;
+const PLACES = `(SELECT count(*) FROM files WHERE conversation_id = ?) + ${VIDEO_HELD}`;
+
 export type FileStoreOptions = {
   now?: () => number;
   /** Tests: runs once the upload is checked, right before its row and file are committed. */
@@ -208,6 +218,25 @@ export class FileStore {
         .prepare("SELECT count(*) AS n FROM files WHERE conversation_id = ?")
         .get(conversationId) as { n: number }
     ).n;
+  }
+
+  /**
+   * The conversation's places taken (#238 stage 3): its files plus those held by approved video jobs (`VIDEO_HELD`;
+   * `exceptJob`: not that job's own).
+   */
+  placesTaken(conversationId: string, exceptJob = ""): number {
+    return (
+      this.db.$client.prepare(`SELECT ${PLACES} AS n`).get(conversationId, conversationId, exceptJob) as {
+        n: number;
+      }
+    ).n;
+  }
+
+  /** Whether this file is a video job's checked result (#238 stage 3: the only MP4s served inline). */
+  isVerifiedVideo(fileId: string): boolean {
+    return !!this.db.$client
+      .prepare("SELECT 1 FROM video_jobs WHERE file_id = ? AND status = 'done'")
+      .get(fileId);
   }
 
   /** Absolute path of a file's bytes (where it should be — reads and writes go through `storeDir`). */
@@ -326,7 +355,7 @@ export class FileStore {
               `INSERT INTO files (id, user_id, conversation_id, message_id, upload_id, name, kind, media_type, bytes,
                  sha256, created_at)
                SELECT ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?
-               WHERE (SELECT count(*) FROM files WHERE conversation_id = ?) < ?`,
+               WHERE ${PLACES} < ?`,
             )
             .run(
               row.id,
@@ -340,6 +369,8 @@ export class FileStore {
               row.sha256,
               row.createdAt,
               row.conversationId,
+              row.conversationId,
+              "",
               FILE_LIMITS.perConversation,
             ).changes === 1;
       } finally {
@@ -370,6 +401,12 @@ export class FileStore {
     sha256: string;
     tmp: string;
     guard?: () => boolean;
+    /**
+     * #238 stage 3: a video job's result — the place its job holds is its own (`jobId` is left out of the held count),
+     * and `commit` runs in the **same transaction** as the insert (the job's `file_id` and `done`): false (or a throw)
+     * rolls the row back and removes the file (`FileAddCancelledError`).
+     */
+    video?: { jobId: string; commit: (row: FileRow) => boolean };
   }): Promise<FileRow> {
     const row: FileRow = {
       id: crypto.randomUUID(),
@@ -402,32 +439,53 @@ export class FileStore {
       }
       fs.renameSync(input.tmp, path.join(dir, row.id));
       let added = false;
+      let refused = false;
       try {
-        added =
-          this.db.$client
-            .prepare(
-              `INSERT INTO files (id, user_id, conversation_id, message_id, upload_id, name, kind, media_type, bytes,
-                 sha256, created_at)
-               SELECT ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?
-               WHERE (SELECT count(*) FROM files WHERE conversation_id = ?) < ?`,
-            )
-            .run(
-              row.id,
-              row.userId,
-              row.conversationId,
-              row.messageId,
-              row.name,
-              row.kind,
-              row.mediaType,
-              row.bytes,
-              row.sha256,
-              row.createdAt,
-              row.conversationId,
-              FILE_LIMITS.perConversation,
-            ).changes === 1;
+        added = this.db.$client.transaction(() => {
+          const inserted =
+            this.db.$client
+              .prepare(
+                `INSERT INTO files (id, user_id, conversation_id, message_id, upload_id, name, kind, media_type, bytes,
+                   sha256, created_at)
+                 SELECT ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?
+                 WHERE ${PLACES} < ?`,
+              )
+              .run(
+                row.id,
+                row.userId,
+                row.conversationId,
+                row.messageId,
+                row.name,
+                row.kind,
+                row.mediaType,
+                row.bytes,
+                row.sha256,
+                row.createdAt,
+                row.conversationId,
+                row.conversationId,
+                input.video?.jobId ?? "",
+                FILE_LIMITS.perConversation,
+              ).changes === 1;
+          if (!inserted || !input.video) return inserted;
+          let ok: boolean;
+          try {
+            ok = input.video.commit(row);
+          } catch {
+            ok = false;
+          }
+          // Rolled back with the insert: nothing of it stays.
+          if (!ok) {
+            refused = true;
+            throw new FileAddCancelledError();
+          }
+          return true;
+        })();
+      } catch (e) {
+        if (!(e instanceof FileAddCancelledError)) throw e;
       } finally {
         if (!added) this.unlinkAndPrune(row);
       }
+      if (refused) throw new FileAddCancelledError();
       if (!added) throw new FileLimitError();
       return row;
     });
@@ -498,7 +556,7 @@ export class FileStore {
             `INSERT INTO files (id, user_id, conversation_id, message_id, upload_id, name, kind, media_type, bytes,
                sha256, created_at)
              SELECT ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?
-             WHERE (SELECT count(*) FROM files WHERE conversation_id = ?) < ?`,
+             WHERE ${PLACES} < ?`,
           )
           .run(
             row.id,
@@ -511,6 +569,8 @@ export class FileStore {
             row.sha256,
             row.createdAt,
             row.conversationId,
+            row.conversationId,
+            "",
             FILE_LIMITS.perConversation,
           ).changes === 1;
       if (!added) throw new FileLimitError();

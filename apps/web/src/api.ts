@@ -116,6 +116,8 @@ import {
   MEDIA_ERRORS,
   MediaAdmin,
   MediaCatalog,
+  VIDEO_JOB_ERRORS,
+  VideoJob,
   type MediaKind,
   type MediaSettings,
 } from "@agentlee/shared";
@@ -664,6 +666,16 @@ export const research = {
   stop: async (id: string) => parseResearchJob(await call("POST", `/api/research/${enc(id)}/stop`, {})),
 };
 
+/** 영상 생성 (#238 stage 3): the confirmation card of a `video_generate` call, and its job. */
+export const videoJobs = {
+  get: async (id: string) => VideoJob.parse(await call("GET", `/api/video-jobs/${enc(id)}`)),
+  eventsUrl: (id: string) => `/api/video-jobs/${enc(id)}/events`,
+  approve: async (id: string, version: number) =>
+    VideoJob.parse(await call("POST", `/api/video-jobs/${enc(id)}/approve`, { version })),
+  dismiss: async (id: string, version: number) =>
+    VideoJob.parse(await call("POST", `/api/video-jobs/${enc(id)}/dismiss`, { version })),
+};
+
 export const runs = {
   get: async (id: string) => Run.parse(await call("GET", `/api/runs/${enc(id)}`)),
   interrupt: async (id: string) => Run.parse(await call("POST", `/api/runs/${enc(id)}/interrupt`, {})),
@@ -754,6 +766,7 @@ const MESSAGES: Record<string, string> = {
   ...PUBLIC_LINK_ERRORS,
   // 미디어 생성 (#238)
   ...MEDIA_ERRORS,
+  ...VIDEO_JOB_ERRORS,
 };
 export const errorText = (e: unknown) =>
   e instanceof ApiError ? (MESSAGES[e.code] ?? `오류가 났어요 (${e.code})`) : "서버에 연결하지 못했어요.";

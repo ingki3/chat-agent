@@ -10,6 +10,7 @@ import {
   AUDIO_STT_ENGINES,
   YOUTUBE_CODES,
   MEDIA_TOOL_CODES,
+  VIDEO_JOB_CODES,
   NotificationKind,
   RuntimeId,
   SCHEDULE_PROPOSAL_CODES,
@@ -334,6 +335,8 @@ export const isDreamingStatus = member(set(DreamingRunStatus.options));
 export const isDreamingCode = member(set(Object.keys(DREAMING_CODE_LABEL)));
 /** 깊이 조사 (#211): a job's fixed failure code (or `stopped`) — never a question, a plan or a note. */
 export const isResearchCode = member(set([...ResearchErrorCode.options, "stopped"]));
+/** Why a video job ended other than with its video (#238 stage 3, shared `VIDEO_JOB_CODES`). */
+export const isVideoCode = member(set(VIDEO_JOB_CODES));
 /** Public artifact links (#204): what happened, from a fixed set — never the token, an IP or a title. */
 export const PUBLIC_LINK_CODES = set([
   "public_link_created",

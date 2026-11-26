@@ -224,7 +224,7 @@ describe("media: the OpenRouter reads (#238)", () => {
     const video = await get("video");
     expect(video.models[0]).toMatchObject({
       id: "fixture/video-one",
-      price: "$0.5/video-second, $0.75/video-second-1080p",
+      price: "$0.05/duration_seconds, $0.08/duration_seconds_1080p",
       maxDurationSec: 12,
     });
     expect(video.models[0]!.options).toContain("길이: 4·6·8·12초");

@@ -53,6 +53,7 @@ import {
   isDreamingCode,
   isPublicLinkCode,
   isResearchCode,
+  isVideoCode,
   isScheduleStatus,
   isScheduleStep,
   isScheduleTrigger,
@@ -116,6 +117,13 @@ export const LOG_EVENTS = [
   "media.recovered",
   // speech_generate working folders (#248, `speech-scratch/`) left from the last process could not all be removed.
   "media.sweep_failed",
+  // video_generate (#238 stage 3): a card made, a job submitted, done, failed, a card expired — the job's id, IDs and
+  // a fixed code only (never the prompt, the model's answer or the file).
+  "video.proposed",
+  "video.submitted",
+  "video.done",
+  "video.failed",
+  "video.expired",
   // python_run working folders left from the last process could not all be removed at start (#47; nothing else).
   "python.sweep_failed",
   // python_run account self-check (#47 round 2): the outcome only, no detail.
@@ -381,6 +389,9 @@ const FIELDS = new Map<string, Check>([
   /** 깊이 조사 (#211): the job's id and its fixed failure code. */
   ["researchId", isId],
   ["researchCode", isResearchCode],
+  /** 영상 생성 (#238 stage 3): the job's id and its fixed end code. */
+  ["videoJobId", isId],
+  ["videoCode", isVideoCode],
 ]);
 
 /** Every key that may ever appear in a written record (tests and docs refer to it). */
@@ -670,6 +681,8 @@ export type LogFields = {
   publicLinkCode?: string;
   researchId?: string;
   researchCode?: string;
+  videoJobId?: string;
+  videoCode?: string;
   /** A sandboxed worker kind (#122: extract, docgen, render), a failed self-check step, kinds not account-isolated. */
   workerKind?: string;
   workerStep?: string;

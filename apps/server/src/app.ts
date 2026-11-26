@@ -106,6 +106,9 @@ import { registerMediaRoutes } from "./media/routes.js";
 import { fixtureOpenRouterFetch, fixtureSpeechAudio } from "./media/fixture.js";
 import { MediaGenerator } from "./media/generate.js";
 import { MediaRecovery, MediaSettler } from "./media/settle.js";
+import { VideoJobs, type VideoJobsOptions } from "./media/video-jobs.js";
+import { fixtureVideoProbe, sandboxedVideoProbe, type VideoProbe } from "./media/video-probe.js";
+import { registerVideoRoutes } from "./media/video-routes.js";
 import { sandboxedSpeechAudio, sweepSpeechScratch, type SpeechAudio } from "./media/speech-audio.js";
 import type { SpeechSplitLimits } from "./media/speech-split.js";
 import { youtubeState, type YoutubeState } from "./youtube/packages.js";
@@ -224,6 +227,8 @@ declare module "fastify" {
           tools: MediaGenerator;
           settler: MediaSettler;
           recovery: MediaRecovery;
+          /** 영상 생성 (#238 stage 3): the cards and the job engine. */
+          video: VideoJobs;
         }
       | undefined;
     /**
@@ -382,6 +387,12 @@ export type BuildOptions = {
      */
     speechAudio?: () => SpeechAudio | undefined;
     split?: SpeechSplitLimits;
+    /**
+     * 영상 생성 (#238 stage 3). `start`: run the job engine as the lock-holding start does (`dataLock`) — tests drive
+     * it with `tick()`; `probe`: the MP4 check (default: the sandboxed ffprobe; in tests none, unless given);
+     * `limits`: shorter waits.
+     */
+    video?: { start?: boolean; probe?: () => VideoProbe | undefined; limits?: VideoJobsOptions["limits"] };
   };
   python?: {
     runner?: PythonRunner;
@@ -677,8 +688,11 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     });
     if (opts.dataLock || opts.media?.recoverAtStart) mediaRecovery.runAtStart();
     app.addHook("preClose", async () => mediaRecovery.stop());
+    // video_generate (#238 stage 3): its cards and jobs (made below; the generator asks for it per call).
+    const videoRef: { jobs?: VideoJobs } = {};
     // image_generate / speech_generate (#238 stage 2): offered while the kind is on (관리자 → 미디어 생성).
     const mediaTools = new MediaGenerator({
+      video: () => videoRef.jobs,
       db: opts.db!,
       files: () => app.files,
       keys: openRouterKeys,
@@ -705,6 +719,42 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       ...(opts.media?.split ? { split: opts.media.split } : {}),
       now: mediaNow,
     });
+    // 영상 생성 (#238 stage 3): confirmation cards, then — approved — jobs polled, downloaded, checked and stored by
+    // the engine, which only the lock-holding server runs (like the media recovery: no other server uses this
+    // database). Without the engine nothing is approved (`video_engine_unavailable`).
+    const videoProbe =
+      opts.media?.video?.probe ??
+      (config.env === "test"
+        ? () => undefined
+        : config.fakeRuntime
+          ? // The e2e server: a scripted probe beside its scripted OpenRouter (no program runs).
+            () => fixtureVideoProbe()
+          : () => sandboxedVideoProbe({ dataDir: config.dataDir, ffmpegPath: config.audioFfmpeg }));
+    const video = new VideoJobs({
+      db: opts.db!,
+      files: () => app.files,
+      conversations: app.conversations!,
+      keys: openRouterKeys,
+      settings: mediaSettings,
+      budget: mediaBudget,
+      usage,
+      users,
+      notifications: () => app.notifications,
+      recovering: () => mediaRecovery.recovering(),
+      filesPending: (conversationId) => mediaTools.filesPending(conversationId),
+      probe: videoProbe,
+      dataDir: config.dataDir,
+      fetchImpl: mediaFetchImpl,
+      secrets: config.skillSecrets,
+      log: app.log,
+      now: mediaNow,
+      // The e2e server's scripted jobs move on with every poll: a second apart, not thirty.
+      limits: { ...(config.fakeRuntime ? { pollMs: 1000, tickMs: 500 } : {}), ...opts.media?.video?.limits },
+    });
+    videoRef.jobs = video;
+    registerVideoRoutes(app, video, app.conversations!);
+    if (opts.dataLock || opts.media?.video?.start) app.addHook("onReady", async () => video.start());
+    app.addHook("preClose", async () => video.stop());
     // Late cost settlement (#238 review r2): generations still waiting for their cost are looked up again with a
     // backoff, also after a restart. Not in tests (they drive `runOnce`).
     const mediaSettler = new MediaSettler({
@@ -724,6 +774,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       tools: mediaTools,
       settler: mediaSettler,
       recovery: mediaRecovery,
+      video,
     });
     registerMediaRoutes(app, { users, media: mediaAdmin });
     // Web search and fetch (#50): results are stored as sources of the run's conversation.

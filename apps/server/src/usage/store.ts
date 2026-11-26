@@ -216,9 +216,11 @@ export class UsageStore {
     estimateMicros?: number;
     /**
      * #248: `pending_send` — a speech piece reserved ahead of its request (`sendingMedia` turns it `reserved` right
-     * before the request). Default `reserved` (the request follows at once).
+     * before the request). #238 stage 3: `video_job` — an approved video job's bound, settled or made `unconfirmed`
+     * by its job only (the start-up recovery and the late-cost settler never touch it). Default `reserved` (the
+     * request follows at once).
      */
-    state?: "pending_send" | "reserved";
+    state?: "pending_send" | "reserved" | "video_job";
     /**
      * The moment of the reservation — the one the caller checked the budget at (#251 r2: the row counts for the
      * day that was checked, even when midnight passes before the insert). Default: now.
@@ -325,6 +327,24 @@ export class UsageStore {
       .update(usageRecords)
       .set({ mediaSettlement: "unconfirmed", updatedAt: this.mediaNow() })
       .where(and(eq(usageRecords.runId, runKey), eq(usageRecords.purpose, "media")))
+      .run();
+  }
+
+  /**
+   * #238 stage 3: a video job's bound that will never be confirmed (the job failed, timed out, was not confirmed, or
+   * its conversation went) — only while it is still the job's (`video_job`): a cost already settled stays.
+   */
+  unconfirmVideoMedia(runKey: string): void {
+    this.db
+      .update(usageRecords)
+      .set({ mediaSettlement: "unconfirmed", updatedAt: this.mediaNow() })
+      .where(
+        and(
+          eq(usageRecords.runId, runKey),
+          eq(usageRecords.purpose, "media"),
+          eq(usageRecords.mediaSettlement, "video_job"),
+        ),
+      )
       .run();
   }
 

@@ -1726,6 +1726,36 @@ a.btnlink:focus-visible,
   }
 }
 
+/* 영상 생성 (#238 stage 3): the confirmation card under the tool line, then the player. */
+.video-card {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  background: var(--panel);
+  padding: 12px 14px;
+  margin: 8px 0;
+  display: grid;
+  gap: 8px;
+  max-width: 560px;
+  min-width: 0;
+}
+.video-prompt {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.video-player {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.video-el {
+  width: 100%;
+  max-height: 60vh;
+  border-radius: 8px;
+  background: #000;
+}
+
 /* 대화 중 기억해줘 (#145): the card under the reply. */
 .mem-card {
   border: 1px solid var(--line);

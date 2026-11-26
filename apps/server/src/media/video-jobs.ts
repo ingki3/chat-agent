@@ -1,0 +1,1194 @@
+import crypto from "node:crypto";
+import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import path from "node:path";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import { z } from "zod";
+import type { SkillResult, ToolScope } from "@agentlee/mcp-tools";
+import { VIDEO_GENERATE_TOOL } from "@agentlee/mcp-tools/media";
+import {
+  FILE_LIMITS,
+  MEDIA_TOOL_HINTS,
+  VIDEO_ACTIVE,
+  VIDEO_LIMITS,
+  type MediaToolCode,
+  type VideoJob,
+  type VideoJobCode,
+  type VideoJobStatus,
+} from "@agentlee/shared";
+import type { UserStore } from "../auth/users.js";
+import type { Db } from "../db/client.js";
+import { conversations, messages, runs, videoJobs } from "../db/schema.js";
+import type { ConversationStore } from "../conversations/store.js";
+import { FileAddCancelledError, type FileStore } from "../files/store.js";
+import { logEvent, type EventLogger } from "../logging.js";
+import type { PublishInput } from "../notifications/compose.js";
+import { carriesSecret } from "../secrets/egress.js";
+import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
+import { mediaRunKey, type UsageStore } from "../usage/store.js";
+import type { MediaBudget } from "./budget.js";
+import type { OpenRouterKeys } from "./keys.js";
+import {
+  MEDIA_CATALOG_URLS,
+  MediaHttpError,
+  OPENROUTER_VIDEOS_URL,
+  openRouterGet,
+  openRouterPost,
+  readBytes,
+  VIDEO_JOB_ID,
+  videoContentUrl,
+  videoGet,
+  videoStatusUrl,
+} from "./openrouter.js";
+import { withMediaPolicy } from "./policy.js";
+import type { MediaSettingsStore } from "./settings.js";
+import { makeVideoWorkdir, removeVideoWorkdir, sweepVideoScratch, type VideoProbe } from "./video-probe.js";
+import { isPlanError, planVideo, replanVideo, videoRecordOf, type VideoRecord } from "./video-plan.js";
+
+/**
+ * `video_generate` and its jobs (#238 stage 3 — docs/decisions/media-generation.md §14, the user's 확정 사항 and the
+ * plan review's 11 items). The tool only makes a **confirmation card** (a `video_jobs` row `awaiting_approval`) —
+ * nothing is reserved or sent. The conversation's owner approves it (`approve`, the card's version), and only then:
+ *
+ * 1. the card is still what was approved (version), not expired (24 h), made under the same settings revision, model
+ *    and key mark (else it expires — `video_settings_changed`); the media recovery is done; ffprobe is here;
+ * 2. the model's record is read again (async, before anything is written): the card's exact length, resolution and
+ *    aspect ratio are still offered (else it expires — `video_options_changed`) and the bound now is not above the
+ *    card's (else the card is re-priced, version + 1, and nothing is sent: `video_estimate_changed`);
+ * 3. what would be sent passes the egress check (registered and configured secrets: model, prompt, options, URL);
+ * 4. **one synchronous step, one write transaction** (review item 2): the row and every check above again, the slots
+ *    (2 per user, 4 in all — DB-counted), a file place (the conversation's files and the places held by other approved
+ *    jobs), the daily budget for the bound at the approval's moment (its day is the day the cost counts for), the
+ *    usage row (`video_job`, the bound) and `submitting` (version + 1, deadline = now + 60 min) — or none of it;
+ * 5. `POST /videos`: a 202 with a valid id is `pending`; a 4xx (not billed) releases the bound and fails the job; no
+ *    answer, a 5xx or an unreadable 202 keeps the bound (`video_unconfirmed`) — never sent again.
+ *
+ * Then the engine (only the lock-holding server runs it) polls every 30 s (429 and transient errors back off up to
+ * 5 min, never past the deadline), each job on its own. `completed`: its `usage.cost` is settled at once, the video
+ * is streamed into `video-scratch/<uuid>` (fixed host, validated id, no redirect, 1GB guard), checked by ffprobe
+ * (an MP4 with a video stream) and stored with `files.addGenerated` — the file row, `file_id` and `done` in one
+ * transaction (one file per job). `failed`/`cancelled`/`expired`, 404, the 60-minute deadline: the job fails and its
+ * bound stays (`unconfirmed`) unless a cost was settled. A deleted conversation: its jobs' bounds are fixed in the
+ * delete's own transaction, their requests stopped, their rows gone with it. A restart: `submitting` is
+ * `video_unconfirmed` (never resubmitted); `pending`/`in_progress`/`downloading` are polled again (a download starts
+ * over); the ends whose notification was not published get it now (`notified_at`, dedupe `video:<id>:end`).
+ */
+export type VideoJobRow = typeof videoJobs.$inferSelect;
+
+export class VideoError extends Error {
+  constructor(
+    readonly code: string,
+    readonly status: number,
+    readonly job?: VideoJobRow,
+  ) {
+    super(code);
+  }
+}
+
+class ToolError extends Error {
+  constructor(
+    readonly code: MediaToolCode,
+    readonly hint?: string,
+  ) {
+    super(code);
+  }
+}
+
+export type VideoNotify = {
+  publish(userId: string, input: PublishInput, opts?: { dedupeKey?: string }): string | undefined;
+  wants?(userId: string, kind: "video_done" | "video_failed"): boolean;
+};
+
+type Limits = {
+  cardTtlMs: number;
+  deadlineMs: number;
+  pollMs: number;
+  maxBackoffMs: number;
+  requestTimeoutMs: number;
+  downloadTimeoutMs: number;
+  maxBytes: number;
+  slots: { total: number; perUser: number };
+  /** How often the engine looks for due jobs and expired cards. */
+  tickMs: number;
+};
+
+export type VideoJobsOptions = {
+  db: Db;
+  files: () => FileStore | undefined;
+  conversations: Pick<ConversationStore, "onDelete" | "onDeleted">;
+  keys: Pick<OpenRouterKeys, "resolve" | "mark">;
+  settings: Pick<MediaSettingsStore, "get" | "revision">;
+  budget: Pick<MediaBudget, "allowsMicros">;
+  usage:
+    Pick<UsageStore, "reserveMedia" | "settleMedia" | "releaseMedia" | "unconfirmVideoMedia"> | undefined;
+  users: Pick<UserStore, "byId">;
+  notifications: () => VideoNotify | undefined;
+  /** While the previous process's media reservations are not taken up, nothing is approved (`video_recovering`). */
+  recovering?: () => boolean;
+  /** Files image/speech calls of this conversation are making right now (they take places too). */
+  filesPending?: (conversationId: string) => number;
+  /** ffprobe, resolved per approval and per check (undefined: not on this server — nothing is approved). */
+  probe: () => VideoProbe | undefined;
+  dataDir: string;
+  fetchImpl?: typeof fetch | undefined;
+  /** The `.env` skill secrets: the egress check knows them too. */
+  secrets?: Readonly<Record<string, string>> | undefined;
+  log?: EventLogger | undefined;
+  now?: () => number;
+  limits?: Partial<Limits>;
+};
+
+const DEFAULTS: Limits = {
+  cardTtlMs: VIDEO_LIMITS.cardTtlMs,
+  deadlineMs: VIDEO_LIMITS.deadlineMs,
+  pollMs: VIDEO_LIMITS.pollMs,
+  maxBackoffMs: VIDEO_LIMITS.maxBackoffMs,
+  requestTimeoutMs: VIDEO_LIMITS.requestTimeoutMs,
+  downloadTimeoutMs: VIDEO_LIMITS.downloadTimeoutMs,
+  maxBytes: VIDEO_LIMITS.maxBytes,
+  slots: VIDEO_LIMITS.slots,
+  tickMs: 5_000,
+};
+
+const ACTIVE = [...VIDEO_ACTIVE] as VideoJobStatus[];
+const POLLED: VideoJobStatus[] = ["pending", "in_progress", "downloading"];
+const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+/** A poll answer is small (ids, URLs, usage); anything bigger is not read. */
+const STATUS_MAX = 256 * 1024;
+const isObj = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+/** The provider's moderation, as OpenRouter's `error` strings say it — mapped to a fixed code, never stored. */
+const MODERATION = /moderat|content polic|safety|nsfw/i;
+
+/** `20261126-153012` (UTC) for a file name. */
+const stamp = (t: number) => new Date(t).toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+
+export class VideoJobs {
+  private readonly events = new EventEmitter();
+  private readonly now: () => number;
+  private readonly limits: Limits;
+  /** Per run, the calls of `video_generate` (the admin's per-run limit). */
+  private readonly calls = new Map<string, { n: number; at: number }>();
+  /** Jobs being handled now (a poll, a download) — never two at once for one job. */
+  private readonly busy = new Map<string, Promise<void>>();
+  /** Each running job's stop (its conversation deleted, the server stopping). */
+  private readonly stops = new Map<string, AbortController>();
+  /** When each polled job is due next, and its backoff. */
+  private readonly due = new Map<string, { at: number; failures: number }>();
+  private readonly streams = new Set<() => void>();
+  /** Job ids of conversations being deleted (between the delete's transaction and its end). */
+  private deleting: string[] = [];
+  private timer: NodeJS.Timeout | undefined;
+  private running = false;
+  private stopping = false;
+  /** This process (the card keeps the newest of two equal versions from different processes). */
+  readonly boot = crypto.randomBytes(6).toString("hex");
+
+  constructor(private readonly o: VideoJobsOptions) {
+    this.now = o.now ?? Date.now;
+    this.limits = { ...DEFAULTS, ...o.limits };
+    this.events.setMaxListeners(0);
+    // Review item 5: a deleted conversation's jobs — their bounds fixed in the delete's own transaction (a settled
+    // cost stays settled, an open bound becomes `unconfirmed`: kept for good), then their requests stopped.
+    o.conversations.onDelete((conversationId) => {
+      const rows = this.o.db
+        .select({ id: videoJobs.id, usageKey: videoJobs.usageKey, status: videoJobs.status })
+        .from(videoJobs)
+        .where(eq(videoJobs.conversationId, conversationId))
+        .all();
+      for (const r of rows) {
+        if (VIDEO_ACTIVE.has(r.status) && r.usageKey) this.o.usage?.unconfirmVideoMedia(r.usageKey);
+        this.deleting.push(r.id);
+      }
+    });
+    o.conversations.onDeleted(() => {
+      const ids = this.deleting.splice(0);
+      for (const id of ids) {
+        this.stops.get(id)?.abort();
+        this.due.delete(id);
+        this.changed(id);
+      }
+    });
+  }
+
+  // ---------------------------------------------------------------- reading
+
+  get(id: string): VideoJobRow | undefined {
+    return this.o.db.select().from(videoJobs).where(eq(videoJobs.id, id)).get();
+  }
+
+  /** The card as the API sends it (the stored video's name and size with it). */
+  view(row: VideoJobRow): VideoJob {
+    const f = row.fileId ? this.o.files()?.get(row.fileId) : undefined;
+    return scrubKnownDeep(
+      {
+        id: row.id,
+        conversationId: row.conversationId,
+        messageId: row.messageId,
+        status: row.status,
+        model: row.model,
+        prompt: row.prompt,
+        durationSec: row.durationSec,
+        resolution: row.resolution,
+        aspectRatio: row.aspectRatio,
+        audio: row.audio ?? null,
+        estimateUsd: row.estimateMicros / 1_000_000,
+        costUsd: row.costMicros === null ? null : row.costMicros / 1_000_000,
+        version: row.version,
+        createdAt: row.createdAt,
+        expiresAt: row.expiresAt,
+        approvedAt: row.approvedAt,
+        deadlineAt: row.deadlineAt,
+        endedAt: row.endedAt,
+        errorCode: (row.errorCode as VideoJobCode | null) ?? null,
+        progress: row.progress,
+        file: f && row.status === "done" ? { fileId: f.id, name: f.name, bytes: f.bytes } : null,
+        boot: this.boot,
+      },
+      { tail: false },
+    );
+  }
+
+  /** Called with the job's id after every change of it (the card's live progress). */
+  subscribe(id: string, fn: () => void): () => void {
+    const h = (jobId: string) => {
+      if (jobId !== id) return;
+      try {
+        fn();
+      } catch {
+        // a subscriber's own problem
+      }
+    };
+    this.events.on("change", h);
+    return () => void this.events.off("change", h);
+  }
+
+  /** A progress stream (routes): closed by `stop`. Returns the function that forgets it. */
+  addStream(close: () => void): () => void {
+    this.streams.add(close);
+    return () => void this.streams.delete(close);
+  }
+
+  private changed(id: string): void {
+    this.events.emit("change", id);
+  }
+
+  // ---------------------------------------------------------------- the tool: a card, nothing paid
+
+  private secret(texts: readonly string[]): boolean {
+    return carriesSecret(texts, { config: Object.values(this.o.secrets ?? {}) });
+  }
+
+  private takeCall(runId: string, limit: number): boolean {
+    const t = this.now();
+    const used = this.calls.get(runId)?.n ?? 0;
+    if (used >= limit) return false;
+    this.calls.set(runId, { n: used + 1, at: t });
+    if (this.calls.size > 500)
+      for (const [k, v] of this.calls) if (t - v.at > 6 * 3600_000) this.calls.delete(k);
+    return true;
+  }
+
+  /** The run's reply, when the run is this user's and still open. */
+  private replyOf(scope: ToolScope): string | undefined {
+    const r = this.o.db
+      .select({ ownerId: conversations.ownerId, messageId: runs.assistantMessageId, endedAt: runs.endedAt })
+      .from(runs)
+      .innerJoin(conversations, eq(conversations.id, runs.conversationId))
+      .innerJoin(messages, eq(messages.id, runs.assistantMessageId))
+      .where(and(eq(runs.id, scope.runId), eq(runs.conversationId, scope.conversationId)))
+      .get();
+    return r && r.ownerId === scope.userId && r.endedAt === null ? r.messageId : undefined;
+  }
+
+  /** The model's record in `/videos/models`, read now; undefined when the list has no such model. */
+  private async record(model: string, apiKey: string): Promise<VideoRecord | undefined> {
+    const answer = await openRouterGet(MEDIA_CATALOG_URLS.video, {
+      apiKey,
+      ...(this.o.fetchImpl ? { fetchImpl: this.o.fetchImpl } : {}),
+    });
+    if (!isObj(answer) || !Array.isArray(answer.data)) throw new Error("not a catalog");
+    return videoRecordOf(answer, model);
+  }
+
+  /** `video_generate` (the MCP tool): the card. Its result goes to the model, known secrets scrubbed. */
+  async propose(
+    scope: ToolScope,
+    input: Record<string, unknown>,
+    o: { alive?: (() => boolean) | undefined; signal?: AbortSignal | undefined } = {},
+  ): Promise<SkillResult> {
+    try {
+      return { ok: true, output: scrubKnownDeep(await this.card(scope, input, o), { tail: false }) };
+    } catch (e) {
+      if (e instanceof ToolError) {
+        const hint = e.hint ?? MEDIA_TOOL_HINTS[e.code];
+        return { ok: false, code: e.code, ...(hint ? { hint: scrubKnown(hint, { tail: false }) } : {}) };
+      }
+      throw e;
+    }
+  }
+
+  private async card(
+    scope: ToolScope,
+    raw: Record<string, unknown>,
+    o: { alive?: (() => boolean) | undefined; signal?: AbortSignal | undefined },
+  ) {
+    const parsed = z.strictObject(VIDEO_GENERATE_TOOL.input).safeParse(raw);
+    if (!parsed.success) throw new ToolError("media_bad_input");
+    const input = parsed.data as {
+      prompt: string;
+      durationSec?: number;
+      resolution?: string;
+      aspectRatio?: string;
+    };
+    const revision = this.o.settings.revision();
+    const settings = this.o.settings.get();
+    const k = settings.kinds.video;
+    if (!k.enabled || !k.model) throw new ToolError("media_disabled");
+    const model = k.model;
+    const key = this.o.keys.resolve();
+    const mark = this.o.keys.mark();
+    if (!key || !mark) throw new ToolError("media_no_key");
+    if (!this.o.users.byId(scope.userId)?.active) throw new ToolError("media_not_allowed");
+    if (!SAFE_ID.test(scope.userId) || !SAFE_ID.test(scope.conversationId))
+      throw new ToolError("media_not_allowed");
+    const messageId = this.replyOf(scope);
+    if (!messageId) throw new ToolError("media_not_allowed");
+    const alive = () => {
+      try {
+        return !!this.replyOf(scope) && (o.alive?.() ?? true) && !o.signal?.aborted;
+      } catch {
+        return false;
+      }
+    };
+    if (!alive()) throw new ToolError("media_cancelled");
+    // The user's own texts first — before any option check answers about them.
+    if (this.secret([input.prompt, input.resolution ?? "", input.aspectRatio ?? "", model]))
+      throw new ToolError("media_secret_blocked");
+    let record: VideoRecord | undefined;
+    try {
+      record = await this.record(model, key.key);
+    } catch {
+      throw new ToolError("media_lookup_failed");
+    }
+    if (!record) throw new ToolError("media_video_unsupported");
+    const plan = planVideo(record, input, settings.videoDefaultSec);
+    if (isPlanError(plan)) throw new ToolError(plan.code, "hint" in plan ? plan.hint : undefined);
+    // The admin may have changed something meanwhile.
+    const nowKind = this.o.settings.get().kinds.video;
+    if (
+      this.o.settings.revision() !== revision ||
+      this.o.keys.mark() !== mark ||
+      !nowKind.enabled ||
+      nowKind.model !== model
+    )
+      throw new ToolError("media_changed");
+    if (this.secret(this.sent(model, input.prompt, plan))) throw new ToolError("media_secret_blocked");
+    if (!this.takeCall(scope.runId, settings.perRunLimits.video)) throw new ToolError("media_quota");
+    if (!alive()) throw new ToolError("media_cancelled");
+    const at = this.now();
+    // A card whose bound does not fit what is left today is not made (it could never be approved today).
+    if (!this.o.budget.allowsMicros(scope.userId, plan.micros, at)) throw new ToolError("media_budget");
+    const id = this.createCard(
+      {
+        conversationId: scope.conversationId,
+        ownerId: scope.userId,
+        messageId,
+        runId: scope.runId,
+        model,
+        // Checked above; scrubbed like every stored user text (and again by the background rescrub).
+        prompt: scrubKnown(input.prompt),
+        durationSec: plan.durationSec,
+        resolution: plan.resolution,
+        aspectRatio: plan.aspectRatio,
+        audio: plan.audio,
+        estimateMicros: plan.micros,
+        settingsRevision: revision,
+        keyMark: mark,
+      },
+      at,
+    );
+    logEvent(this.o.log, "info", "video.proposed", {
+      userId: scope.userId,
+      conversationId: scope.conversationId,
+      runId: scope.runId,
+      videoJobId: id,
+    });
+    return {
+      status: "awaiting_approval",
+      jobId: id,
+      model,
+      durationSec: plan.durationSec,
+      resolution: plan.resolution,
+      aspectRatio: plan.aspectRatio,
+      audio: plan.audio,
+      estimateUsd: plan.micros / 1_000_000,
+      note: "Not made yet: a confirmation card is shown under your reply, and the video is generated only after the user approves it there. Tell the user to check the card; never say the video was made.",
+    };
+  }
+
+  /**
+   * A card's row (`awaiting_approval`, version 0, expiring after 24 hours): the tool's, once every check passed — and
+   * the permission tests' fixture. Its id.
+   */
+  createCard(
+    v: Omit<
+      typeof videoJobs.$inferInsert,
+      "id" | "status" | "version" | "createdAt" | "updatedAt" | "expiresAt"
+    >,
+    at: number = this.now(),
+  ): string {
+    const id = crypto.randomUUID();
+    this.o.db
+      .insert(videoJobs)
+      .values({
+        ...v,
+        id,
+        status: "awaiting_approval",
+        version: 0,
+        createdAt: at,
+        updatedAt: at,
+        expiresAt: at + this.limits.cardTtlMs,
+      })
+      .run();
+    return id;
+  }
+
+  /** Every text of the submit that leaves this server (the egress check). */
+  private sent(
+    model: string,
+    prompt: string,
+    c: { durationSec: number; resolution: string; aspectRatio: string | null },
+  ): string[] {
+    return [OPENROUTER_VIDEOS_URL, model, prompt, String(c.durationSec), c.resolution, c.aspectRatio ?? ""];
+  }
+
+  // ---------------------------------------------------------------- the card's actions
+
+  private owned(id: string, userId: string): VideoJobRow {
+    const row = this.get(id);
+    if (!row) throw new VideoError("not_found", 404);
+    if (row.ownerId !== userId) throw new VideoError("forbidden", 403);
+    return row;
+  }
+
+  /** One guarded write: only while the row is in one of `from` (and at `version`, when given). Null: it was not. */
+  private write(
+    id: string,
+    from: readonly VideoJobStatus[],
+    set: Partial<VideoJobRow>,
+    version?: number,
+  ): VideoJobRow | null {
+    const r = this.o.db
+      .update(videoJobs)
+      .set({ ...set, version: sql`${videoJobs.version} + 1`, updatedAt: this.now() })
+      .where(
+        and(
+          eq(videoJobs.id, id),
+          inArray(videoJobs.status, [...from]),
+          ...(version === undefined ? [] : [eq(videoJobs.version, version)]),
+        ),
+      )
+      .run();
+    if (r.changes !== 1) return null;
+    this.changed(id);
+    return this.get(id) ?? null;
+  }
+
+  /** A card that waited too long, or whose settings, model or key changed: expired (nothing was paid). */
+  private expire(row: VideoJobRow, code: VideoJobCode): VideoJobRow {
+    const r = this.write(row.id, ["awaiting_approval"], {
+      status: "expired",
+      errorCode: code,
+      endedAt: this.now(),
+    });
+    if (r)
+      logEvent(this.o.log, "info", "video.expired", {
+        userId: r.ownerId,
+        conversationId: r.conversationId,
+        videoJobId: r.id,
+        videoCode: code,
+      });
+    return r ?? this.get(row.id) ?? row;
+  }
+
+  /** Why the card no longer stands, or null: 24 hours passed, or the admin changed the settings, model or key. */
+  private stale(row: VideoJobRow, at: number): VideoJobCode | null {
+    if (at >= row.expiresAt) return "video_card_expired";
+    const k = this.o.settings.get().kinds.video;
+    if (
+      !k.enabled ||
+      k.model !== row.model ||
+      this.o.settings.revision() !== row.settingsRevision ||
+      this.o.keys.mark() !== row.keyMark
+    )
+      return "video_settings_changed";
+    return null;
+  }
+
+  dismiss(id: string, userId: string, version: number): VideoJobRow {
+    const row = this.owned(id, userId);
+    if (row.status !== "awaiting_approval" || row.version !== version)
+      throw new VideoError("video_job_changed", 409, row);
+    const r = this.write(id, ["awaiting_approval"], { status: "dismissed", endedAt: this.now() }, version);
+    if (!r) throw new VideoError("video_job_changed", 409, this.get(id));
+    return r;
+  }
+
+  /**
+   * The owner's approval (see the comment at the top): everything checked, the bound reserved and the job submitted —
+   * or nothing. `stillAllowed`: the request's session and the resource check again, inside the step that reserves.
+   * Returns the job after the submit's answer (pending, or failed with why).
+   */
+  async approve(
+    id: string,
+    userId: string,
+    version: number,
+    stillAllowed: () => boolean,
+  ): Promise<VideoJobRow | undefined> {
+    if (!this.running || this.stopping) throw new VideoError("video_engine_unavailable", 503);
+    let row = this.owned(id, userId);
+    if (row.status === "awaiting_approval") {
+      const stale = this.stale(row, this.now());
+      if (stale) row = this.expire(row, stale);
+    }
+    if (row.status === "expired") throw new VideoError("video_job_expired", 409, row);
+    if (row.status !== "awaiting_approval" || row.version !== version)
+      throw new VideoError("video_job_changed", 409, row);
+    if (this.o.recovering?.()) throw new VideoError("video_recovering", 503);
+    // Review item 8: ffprobe must be here before anything is paid (else a paid video could never be checked).
+    if (!this.o.probe()) throw new VideoError("video_probe_unavailable", 503);
+    const key = this.o.keys.resolve();
+    if (!key) throw new VideoError("video_job_expired", 409, this.expire(row, "video_settings_changed"));
+    let record: VideoRecord | undefined;
+    try {
+      record = await this.record(row.model, key.key);
+    } catch {
+      throw new VideoError("video_lookup_failed", 502);
+    }
+    row = this.owned(id, userId);
+    if (row.status !== "awaiting_approval" || row.version !== version)
+      throw new VideoError(row.status === "expired" ? "video_job_expired" : "video_job_changed", 409, row);
+    const plan = record ? replanVideo(record, row) : null;
+    if (!plan || isPlanError(plan))
+      throw new VideoError("video_job_expired", 409, this.expire(row, "video_options_changed"));
+    if (plan.micros > row.estimateMicros) {
+      // Dearer now: the card shows the new bound (version + 1) and is approved again — nothing is sent.
+      const r = this.write(
+        id,
+        ["awaiting_approval"],
+        { estimateMicros: plan.micros, audio: plan.audio },
+        version,
+      );
+      throw new VideoError(r ? "video_estimate_changed" : "video_job_changed", 409, r ?? this.get(id));
+    }
+    const body = withMediaPolicy({
+      model: row.model,
+      prompt: row.prompt,
+      duration: row.durationSec,
+      resolution: row.resolution,
+      ...(row.aspectRatio ? { aspect_ratio: row.aspectRatio } : {}),
+    });
+    // A secret registered since the card was made: nothing is sent, the card ends (nothing was paid).
+    if (this.secret(this.sent(row.model, row.prompt, row))) {
+      const r = this.write(
+        id,
+        ["awaiting_approval"],
+        { status: "failed", errorCode: "video_blocked", endedAt: this.now() },
+        version,
+      );
+      if (!r) throw new VideoError("video_job_changed", 409, this.get(id));
+      return r;
+    }
+    // ---- one synchronous step (review item 2): from here to the transaction's end nothing else runs here.
+    const at = this.now();
+    const fresh = this.owned(id, userId);
+    if (fresh.status !== "awaiting_approval" || fresh.version !== version)
+      throw new VideoError("video_job_changed", 409, fresh);
+    if (!stillAllowed() || !this.o.users.byId(userId)?.active) throw new VideoError("forbidden", 403);
+    const stale = this.stale(fresh, at);
+    if (stale) throw new VideoError("video_job_expired", 409, this.expire(fresh, stale));
+    if (this.o.recovering?.()) throw new VideoError("video_recovering", 503);
+    const usage = this.o.usage;
+    const files = this.o.files();
+    if (!usage || !files) throw new VideoError("video_engine_unavailable", 503);
+    const callId = crypto.randomUUID();
+    const usageKey = mediaRunKey(fresh.runId, callId);
+    const outcome = this.o.db.$client
+      .transaction((): VideoError | null => {
+        const active = this.o.db
+          .select({ ownerId: videoJobs.ownerId })
+          .from(videoJobs)
+          .where(inArray(videoJobs.status, ACTIVE))
+          .all();
+        if (
+          active.length >= this.limits.slots.total ||
+          active.filter((a) => a.ownerId === userId).length >= this.limits.slots.perUser
+        )
+          return new VideoError("video_busy", 409);
+        // Review item 3: its result's place — the conversation's files, the places other approved jobs hold, and
+        // the files image/speech calls are making now.
+        if (
+          files.placesTaken(fresh.conversationId) + (this.o.filesPending?.(fresh.conversationId) ?? 0) >=
+          FILE_LIMITS.perConversation
+        )
+          return new VideoError("video_file_limit", 409);
+        // The bound shown on the card, for the approval's day (user decision 3: the cost is the approval day's).
+        if (!this.o.budget.allowsMicros(userId, fresh.estimateMicros, at))
+          return new VideoError("video_budget", 409);
+        usage.reserveMedia({
+          userId,
+          conversationId: fresh.conversationId,
+          runId: fresh.runId,
+          callId,
+          model: fresh.model,
+          estimateMicros: fresh.estimateMicros,
+          state: "video_job",
+          at,
+        });
+        const done = this.o.db
+          .update(videoJobs)
+          .set({
+            status: "submitting",
+            usageKey,
+            approvedAt: at,
+            deadlineAt: at + this.limits.deadlineMs,
+            version: sql`${videoJobs.version} + 1`,
+            updatedAt: at,
+          })
+          .where(
+            and(
+              eq(videoJobs.id, id),
+              eq(videoJobs.status, "awaiting_approval"),
+              eq(videoJobs.version, version),
+            ),
+          )
+          .run();
+        if (done.changes !== 1) throw new VideoError("video_job_changed", 409);
+        return null;
+      })
+      .immediate();
+    if (outcome) throw new VideoError(outcome.code, outcome.status, this.get(id));
+    this.changed(id);
+    // ---- the paid request.
+    const stop = new AbortController();
+    this.stops.set(id, stop);
+    try {
+      return await this.submit(id, usageKey, key.key, body, stop.signal);
+    } finally {
+      this.stops.delete(id);
+    }
+  }
+
+  private async submit(
+    id: string,
+    usageKey: string,
+    apiKey: string,
+    body: Record<string, unknown>,
+    signal: AbortSignal,
+  ): Promise<VideoJobRow | undefined> {
+    let res: Response;
+    try {
+      res = await openRouterPost(OPENROUTER_VIDEOS_URL, body, {
+        apiKey,
+        fetchImpl: this.o.fetchImpl,
+        timeoutMs: this.limits.requestTimeoutMs,
+        signal,
+      });
+    } catch (e) {
+      const status = e instanceof MediaHttpError ? e.status : 0;
+      // Refused here before sending (-1), or by OpenRouter with a 4xx (not billed): the bound goes.
+      if (status === -1 || (status >= 400 && status < 500)) {
+        this.usageWrite(id, () => this.o.usage?.releaseMedia(usageKey));
+        const code: VideoJobCode =
+          status === 402 ? "video_payment" : status === 429 ? "video_rate_limited" : "video_rejected";
+        return this.fail(id, code, { released: true }) ?? this.get(id);
+      }
+      // No answer, a timeout or a 5xx: it may have started and may bill — never sent again, its bound stays.
+      return this.fail(id, "video_unconfirmed") ?? this.get(id);
+    }
+    let remote: string | null;
+    try {
+      const a = JSON.parse(new TextDecoder().decode(await readBytes(res, STATUS_MAX))) as unknown;
+      const rid = isObj(a) ? a.id : undefined;
+      remote = typeof rid === "string" && VIDEO_JOB_ID.test(rid) ? rid : null;
+    } catch {
+      remote = null;
+    }
+    if (!remote) return this.fail(id, "video_unconfirmed") ?? this.get(id);
+    const r = this.write(id, ["submitting"], {
+      status: "pending",
+      remoteId: remote,
+      submittedAt: this.now(),
+    });
+    if (r) {
+      this.due.set(id, { at: this.now() + this.limits.pollMs, failures: 0 });
+      logEvent(this.o.log, "info", "video.submitted", {
+        userId: r.ownerId,
+        conversationId: r.conversationId,
+        videoJobId: id,
+      });
+    }
+    return r ?? this.get(id);
+  }
+
+  // ---------------------------------------------------------------- the engine
+
+  /** Whether the engine runs here (only the lock-holding server's does; approvals need it). */
+  get started(): boolean {
+    return this.running && !this.stopping;
+  }
+
+  /**
+   * The engine's start (the lock-holding server, at onReady): the last process's download folders go, `submitting`
+   * jobs are `video_unconfirmed` (their outcome is unknown — never sent again), the polled ones are due at once, the
+   * ends without their notification get it.
+   */
+  start(): void {
+    if (this.running) return;
+    this.running = true;
+    if (!sweepVideoScratch(this.o.dataDir)) logEvent(this.o.log, "warn", "media.sweep_failed");
+    for (const r of this.o.db
+      .select({ id: videoJobs.id })
+      .from(videoJobs)
+      .where(eq(videoJobs.status, "submitting"))
+      .all())
+      this.fail(r.id, "video_unconfirmed");
+    for (const r of this.o.db
+      .select({ id: videoJobs.id })
+      .from(videoJobs)
+      .where(inArray(videoJobs.status, POLLED))
+      .all())
+      this.due.set(r.id, { at: this.now(), failures: 0 });
+    for (const r of this.o.db
+      .select()
+      .from(videoJobs)
+      .where(and(inArray(videoJobs.status, ["done", "failed"]), sql`${videoJobs.notifiedAt} IS NULL`))
+      .all())
+      if (r.approvedAt !== null) this.notify(r);
+    this.timer = setInterval(() => void this.tick(), this.limits.tickMs);
+    this.timer.unref();
+    void this.tick();
+  }
+
+  /** No new poll starts; the requests under way are stopped; open streams close. Waits for the jobs to let go. */
+  async stop(): Promise<void> {
+    this.stopping = true;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+    for (const s of this.stops.values()) s.abort();
+    for (const close of [...this.streams]) close();
+    await Promise.race([
+      Promise.all([...this.busy.values()]),
+      new Promise<void>((r) => setTimeout(r, 10_000).unref()),
+    ]);
+  }
+
+  /** One pass (tests call it directly): expired cards, deadlines, and the due jobs started — each on its own. */
+  tick(): Promise<void> {
+    if (!this.running || this.stopping) return Promise.resolve();
+    const at = this.now();
+    for (const r of this.o.db
+      .select()
+      .from(videoJobs)
+      .where(eq(videoJobs.status, "awaiting_approval"))
+      .all()) {
+      const stale = this.stale(r, at);
+      if (stale === "video_card_expired") this.expire(r, stale);
+    }
+    const started: Promise<void>[] = [];
+    for (const r of this.o.db.select().from(videoJobs).where(inArray(videoJobs.status, POLLED)).all()) {
+      if (this.busy.has(r.id)) continue;
+      if (r.deadlineAt !== null && at >= r.deadlineAt) {
+        this.fail(r.id, "video_timeout");
+        continue;
+      }
+      const d = this.due.get(r.id) ?? { at, failures: 0 };
+      if (!this.due.has(r.id)) this.due.set(r.id, d);
+      if (d.at > at) continue;
+      const p = this.advance(r).finally(() => this.busy.delete(r.id));
+      this.busy.set(r.id, p);
+      started.push(p);
+    }
+    return Promise.all(started).then(() => undefined);
+  }
+
+  /** Every job being handled now, finished (tests). */
+  async idle(): Promise<void> {
+    while (this.busy.size) await Promise.all([...this.busy.values()]);
+  }
+
+  /** The wait before the next poll after a 429 or a transient error: `Retry-After`, else 30 s · 2^n, at most 5 min. */
+  private backoff(row: VideoJobRow, retryAfter?: number): void {
+    const d = this.due.get(row.id) ?? { at: 0, failures: 0 };
+    const failures = d.failures + 1;
+    const wait = Math.min(this.limits.maxBackoffMs, retryAfter ?? this.limits.pollMs * 2 ** (failures - 1));
+    // Never past the deadline: the poll after it is the timeout.
+    const at = Math.min(this.now() + Math.max(wait, 0), row.deadlineAt ?? Infinity);
+    this.due.set(row.id, { at, failures });
+  }
+
+  private left(row: VideoJobRow): number {
+    return (row.deadlineAt ?? this.now() + this.limits.deadlineMs) - this.now();
+  }
+
+  /** One poll of one job, and what follows from its answer. Never throws. */
+  private async advance(row: VideoJobRow): Promise<void> {
+    const stop = new AbortController();
+    this.stops.set(row.id, stop);
+    try {
+      const url = row.remoteId ? videoStatusUrl(row.remoteId) : null;
+      if (!url) {
+        this.fail(row.id, "video_lost");
+        return;
+      }
+      const key = this.o.keys.resolve();
+      if (!key) return this.backoff(row);
+      let answer: unknown;
+      try {
+        const res = await videoGet(url, {
+          apiKey: key.key,
+          fetchImpl: this.o.fetchImpl,
+          timeoutMs: Math.max(1, Math.min(this.limits.requestTimeoutMs, this.left(row))),
+          signal: stop.signal,
+        });
+        answer = JSON.parse(new TextDecoder().decode(await readBytes(res, STATUS_MAX)));
+      } catch (e) {
+        if (stop.signal.aborted) return;
+        const status = e instanceof MediaHttpError ? e.status : 0;
+        if (status === 404 || status === -1 || status === -2) {
+          this.fail(row.id, "video_lost");
+          return;
+        }
+        // 429 (rate), 5xx, no answer, a body that is not JSON: tried again later.
+        return this.backoff(row, e instanceof MediaHttpError ? e.retryAfterMs : undefined);
+      }
+      if (stop.signal.aborted || !this.get(row.id)) return;
+      const a = isObj(answer) ? answer : {};
+      const status = a.status;
+      this.due.set(row.id, { at: this.now() + this.limits.pollMs, failures: 0 });
+      if (status === "pending" || status === "in_progress") {
+        const progress =
+          typeof a.progress === "number" && Number.isFinite(a.progress)
+            ? Math.max(0, Math.min(100, Math.round(a.progress)))
+            : null;
+        // `completed` may briefly read as in_progress again: a job already downloading stays so.
+        if (row.status === "downloading") return;
+        if (row.status !== status || row.progress !== progress)
+          this.write(row.id, ["pending", "in_progress"], { status, progress });
+        return;
+      }
+      if (status === "completed") return await this.complete(row, a, key.key, stop.signal);
+      if (status === "failed" || status === "cancelled") {
+        // The provider's words are never stored or shown: only whether they name its moderation.
+        const moderated = typeof a.error === "string" && MODERATION.test(a.error);
+        this.fail(row.id, moderated ? "video_moderated" : "video_failed");
+        return;
+      }
+      if (status === "expired") {
+        this.fail(row.id, "video_remote_expired");
+        return;
+      }
+      // Anything else: asked again later.
+    } catch (e) {
+      logEvent(this.o.log, "warn", "error", { videoJobId: row.id, err: e });
+      this.backoff(row);
+    } finally {
+      if (this.stops.get(row.id) === stop) this.stops.delete(row.id);
+    }
+  }
+
+  /**
+   * A `completed` job: its reported cost settled first (review item 4), then the video downloaded, checked and
+   * stored with the job's end in one transaction.
+   */
+  private async complete(
+    row: VideoJobRow,
+    a: Record<string, unknown>,
+    apiKey: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const usage = isObj(a.usage) ? a.usage : {};
+    const cost =
+      typeof usage.cost === "number" && Number.isFinite(usage.cost) && usage.cost >= 0 ? usage.cost : null;
+    // The cost and `downloading` together, before a byte is fetched (a restart then never loses the cost).
+    const settled = this.o.db.$client.transaction(() => {
+      const r = this.get(row.id);
+      if (!r || !POLLED.includes(r.status)) return null;
+      if (cost !== null && r.costMicros === null && r.usageKey) this.o.usage?.settleMedia(r.usageKey, cost);
+      this.o.db
+        .update(videoJobs)
+        .set({
+          status: "downloading",
+          ...(cost !== null && r.costMicros === null ? { costMicros: Math.round(cost * 1_000_000) } : {}),
+          version: sql`${videoJobs.version} + 1`,
+          updatedAt: this.now(),
+        })
+        .where(eq(videoJobs.id, row.id))
+        .run();
+      return this.get(row.id) ?? null;
+    })();
+    if (!settled) return;
+    this.changed(row.id);
+    const url = settled.remoteId ? videoContentUrl(settled.remoteId) : null;
+    if (!url) {
+      this.fail(row.id, "video_lost");
+      return;
+    }
+    let workdir: string | undefined;
+    try {
+      try {
+        workdir = makeVideoWorkdir(this.o.dataDir);
+      } catch {
+        this.fail(row.id, "video_store_failed");
+        return;
+      }
+      const file = path.join(workdir, "video.mp4");
+      const got = await this.download(settled, url, apiKey, file, signal);
+      if (signal.aborted || !this.get(row.id)) return;
+      if (got === "retry") return this.backoff(settled);
+      if (typeof got === "string") {
+        this.fail(row.id, got);
+        return;
+      }
+      const probe = this.o.probe();
+      const verdict = probe ? await probe.check(file, signal) : "failed";
+      if (signal.aborted || !this.get(row.id)) return;
+      if (verdict !== "ok") {
+        this.fail(row.id, verdict === "not_mp4" ? "video_not_mp4" : "video_store_failed");
+        return;
+      }
+      await this.store(settled, file, got);
+    } finally {
+      if (workdir) removeVideoWorkdir(workdir);
+    }
+  }
+
+  /**
+   * The video streamed into `file`: its size and hash, or why not — `retry` for what a later try may fix (OpenRouter
+   * says not ready yet: 409; 429; 5xx; no answer), a code for what it will not (another 4xx, a redirect, over 1GB,
+   * cut off). The request's time is what is left of the job's deadline, at most 15 minutes.
+   */
+  private async download(
+    row: VideoJobRow,
+    url: string,
+    apiKey: string,
+    file: string,
+    signal: AbortSignal,
+  ): Promise<{ bytes: number; sha256: string } | "retry" | VideoJobCode> {
+    let res: Response;
+    try {
+      res = await videoGet(url, {
+        apiKey,
+        fetchImpl: this.o.fetchImpl,
+        timeoutMs: Math.max(1, Math.min(this.limits.downloadTimeoutMs, this.left(row))),
+        signal,
+      });
+    } catch (e) {
+      const status = e instanceof MediaHttpError ? e.status : 0;
+      if (status === 409 || status === 429 || status >= 500 || status === 0) return "retry";
+      return "video_download_failed";
+    }
+    const max = this.limits.maxBytes;
+    const declared = Number(res.headers.get("content-length") ?? NaN);
+    if (Number.isFinite(declared) && declared > max) {
+      await res.body?.cancel().catch(() => {});
+      return "video_too_large";
+    }
+    if (!res.body) return "video_download_failed";
+    const hash = crypto.createHash("sha256");
+    let fd: number | undefined;
+    let total = 0;
+    const reader = res.body.getReader();
+    try {
+      fd = fs.openSync(file, "wx", 0o600);
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > max) {
+          await reader.cancel().catch(() => {});
+          return "video_too_large";
+        }
+        hash.update(value);
+        let at = 0;
+        while (at < value.byteLength) at += fs.writeSync(fd, value, at, value.byteLength - at);
+      }
+    } catch {
+      await reader.cancel().catch(() => {});
+      return "video_download_failed";
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
+    if (!total) return "video_download_failed";
+    return { bytes: total, sha256: hash.digest("hex") };
+  }
+
+  /** The checked video as a file of the conversation: the file row, `file_id` and `done` in one transaction. */
+  private async store(row: VideoJobRow, file: string, got: { bytes: number; sha256: string }): Promise<void> {
+    const files = this.o.files();
+    if (!files) {
+      this.fail(row.id, "video_store_failed");
+      return;
+    }
+    try {
+      await files.addGenerated({
+        userId: row.ownerId,
+        conversationId: row.conversationId,
+        messageId: row.messageId,
+        name: `video-${stamp(this.now())}.mp4`,
+        kind: "mp4",
+        bytes: got.bytes,
+        sha256: got.sha256,
+        tmp: file,
+        // Inside the file-write lock: the job is still this one, downloading, without a file.
+        guard: () => {
+          const r = this.get(row.id);
+          return !!r && r.status === "downloading" && r.fileId === null;
+        },
+        video: {
+          jobId: row.id,
+          commit: (f) => {
+            const r = this.get(row.id);
+            if (!r || r.status !== "downloading" || r.fileId !== null) return false;
+            // No cost was reported: the bound stays for good (a settled one is left as it is).
+            if (r.costMicros === null && r.usageKey) this.o.usage?.unconfirmVideoMedia(r.usageKey);
+            return (
+              this.o.db
+                .update(videoJobs)
+                .set({
+                  status: "done",
+                  fileId: f.id,
+                  progress: 100,
+                  endedAt: this.now(),
+                  version: sql`${videoJobs.version} + 1`,
+                  updatedAt: this.now(),
+                })
+                .where(and(eq(videoJobs.id, row.id), eq(videoJobs.status, "downloading")))
+                .run().changes === 1
+            );
+          },
+        },
+      });
+    } catch (e) {
+      // The job went (its conversation deleted) or changed under it: nothing is stored, nothing more to do.
+      if (e instanceof FileAddCancelledError && !this.get(row.id)) return;
+      if (e instanceof FileAddCancelledError && this.get(row.id)?.status !== "downloading") return;
+      this.fail(row.id, "video_store_failed");
+      return;
+    }
+    this.due.delete(row.id);
+    this.changed(row.id);
+    const done = this.get(row.id);
+    if (!done) return;
+    logEvent(this.o.log, "info", "video.done", {
+      userId: done.ownerId,
+      conversationId: done.conversationId,
+      videoJobId: done.id,
+    });
+    this.notify(done);
+  }
+
+  /**
+   * The job's end other than its video: failed with a fixed code; its bound stays (`unconfirmed`) unless a cost was
+   * settled or it was released (a refusal before it was billed). Null when the job had already ended or is gone.
+   */
+  private fail(id: string, code: VideoJobCode, o: { released?: boolean } = {}): VideoJobRow | null {
+    const r = this.o.db.$client.transaction(() => {
+      const row = this.get(id);
+      if (!row || !VIDEO_ACTIVE.has(row.status)) return null;
+      if (!o.released && row.usageKey && row.costMicros === null)
+        this.o.usage?.unconfirmVideoMedia(row.usageKey);
+      this.o.db
+        .update(videoJobs)
+        .set({
+          status: "failed",
+          errorCode: code,
+          endedAt: this.now(),
+          version: sql`${videoJobs.version} + 1`,
+          updatedAt: this.now(),
+        })
+        .where(eq(videoJobs.id, id))
+        .run();
+      return this.get(id) ?? null;
+    })();
+    if (!r) return null;
+    this.due.delete(id);
+    this.changed(id);
+    logEvent(this.o.log, "warn", "video.failed", {
+      userId: r.ownerId,
+      conversationId: r.conversationId,
+      videoJobId: id,
+      videoCode: code,
+    });
+    this.notify(r);
+    return r;
+  }
+
+  /** A usage write of a job (the bound's release): tried twice, then logged for the operator. */
+  private usageWrite(id: string, fn: () => void): void {
+    for (let i = 0; i < 2; i++) {
+      try {
+        fn();
+        return;
+      } catch {
+        // tried again
+      }
+    }
+    logEvent(this.o.log, "error", "media.usage_failed", {
+      videoJobId: id,
+      mediaCode: "media_usage_failed",
+      mediaStep: "release",
+    });
+  }
+
+  /** The owner's notification of a job's end (once: `notified_at`, dedupe `video:<id>:end`). */
+  private notify(row: VideoJobRow): void {
+    if (row.status !== "done" && row.status !== "failed") return;
+    const claimed =
+      this.o.db
+        .update(videoJobs)
+        .set({ notifiedAt: this.now() })
+        .where(and(eq(videoJobs.id, row.id), sql`${videoJobs.notifiedAt} IS NULL`))
+        .run().changes === 1;
+    if (!claimed) return;
+    const n = this.o.notifications();
+    const kind = row.status === "done" ? "video_done" : "video_failed";
+    if (!n || !(n.wants?.(row.ownerId, kind) ?? true)) return;
+    const url = `/c/${row.conversationId}#m-${row.messageId}`;
+    const ref = { kind: "conversation", id: row.conversationId };
+    try {
+      n.publish(
+        row.ownerId,
+        kind === "video_done"
+          ? { kind, url, ref }
+          : {
+              kind,
+              reason: VIDEO_FAILURE_SHORT[(row.errorCode as VideoJobCode | null) ?? "video_failed"] ?? "실패",
+              url,
+              ref,
+            },
+        { dedupeKey: `video:${row.id}:end` },
+      );
+    } catch {
+      // the notification is best effort; the card says the same
+    }
+  }
+}
+
+/** The failure's short reason on a lock screen (fixed words; the card has the full text, `VIDEO_JOB_CODE_TEXT`). */
+export const VIDEO_FAILURE_SHORT: Partial<Record<VideoJobCode, string>> = {
+  video_rejected: "요청이 거절됐어요",
+  video_payment: "OpenRouter 잔액·한도 부족",
+  video_rate_limited: "요청이 잠시 막혔어요",
+  video_unconfirmed: "제출 결과를 확인하지 못했어요",
+  video_failed: "제공자가 만들지 못했어요",
+  video_moderated: "내용 검사에서 거부됐어요",
+  video_remote_expired: "제공자 쪽 시간 초과",
+  video_timeout: "60분 안에 끝나지 않았어요",
+  video_lost: "작업을 찾지 못했어요",
+  video_download_failed: "영상을 받아 오지 못했어요",
+  video_too_large: "영상이 너무 커요",
+  video_not_mp4: "MP4 영상이 아니에요",
+  video_store_failed: "저장하지 못했어요",
+};

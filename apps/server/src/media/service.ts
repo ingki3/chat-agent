@@ -8,17 +8,24 @@ import {
   type MediaSettings,
 } from "@agentlee/shared";
 import type { SettingsStore } from "../db/settings-store.js";
-import { OPENROUTER_KEY_SETTING, OPENROUTER_KEY_STATUS_SETTING, type OpenRouterKeys } from "./keys.js";
+import {
+  OPENROUTER_KEY_REVISION_SETTING,
+  OPENROUTER_KEY_SETTING,
+  OPENROUTER_KEY_STATUS_SETTING,
+  type OpenRouterKeys,
+} from "./keys.js";
 import { speechPricing } from "./cost.js";
 import {
   checkKey,
   fetchCatalog,
+  MEDIA_CATALOG_URLS,
   modelEndpointsUrl,
   OpenRouterError,
   openRouterGet,
   type KeyStatus,
 } from "./openrouter.js";
 import { YOUTH_STRICT_MODERATION } from "./policy.js";
+import { videoModelVerdict, videoRecordOf } from "./video-plan.js";
 import type { MediaSettingsStore } from "./settings.js";
 
 export class MediaError extends Error {
@@ -170,6 +177,7 @@ export class MediaAdminService {
         this.expectGeneration(expectedGeneration);
         this.o.settings.setSecret(OPENROUTER_KEY_SETTING, key);
         this.o.settings.set(OPENROUTER_KEY_STATUS_SETTING, JSON.stringify(stored));
+        this.o.settings.set(OPENROUTER_KEY_REVISION_SETTING, crypto.randomUUID());
       });
       this.keyChanged();
       return this.view();
@@ -192,6 +200,7 @@ export class MediaAdminService {
       this.o.transaction(() => {
         this.expectGeneration(expectedGeneration);
         this.o.remove([OPENROUTER_KEY_SETTING, OPENROUTER_KEY_STATUS_SETTING]);
+        this.o.settings.set(OPENROUTER_KEY_REVISION_SETTING, crypto.randomUUID());
       });
       this.keyChanged();
       return this.view();
@@ -254,6 +263,36 @@ export class MediaAdminService {
       409,
       verdict.reason === "output_priced" ? "media_model_output_priced" : "media_model_no_price",
       "speech",
+    );
+  }
+
+  /**
+   * A video model judged as a card judges it (#238 stage 3, review item 1): its record in `/videos/models` read again
+   * now — lengths and a resolution ≤ 1080p listed (`media_model_video_unsupported`), priced per second with a readable
+   * bound (`media_model_video_token_priced` for `video_tokens`, `media_model_video_no_price` otherwise). A read that
+   * fails is `media_catalog_failed` (nothing is saved).
+   */
+  private async checkVideoModel(model: string): Promise<void> {
+    const resolved = this.o.keys.resolve();
+    if (!resolved) throw new MediaError(400, "media_no_key");
+    let answer: unknown;
+    try {
+      answer = await openRouterGet(MEDIA_CATALOG_URLS.video, { apiKey: resolved.key, ...this.fetchOpts() });
+    } catch {
+      throw new MediaError(502, "media_catalog_failed", "video");
+    }
+    const record = videoRecordOf(answer, model);
+    if (!record) throw new MediaError(409, "media_model_unknown", "video");
+    const v = videoModelVerdict(record);
+    if (v.ok) return;
+    throw new MediaError(
+      409,
+      v.reason === "unsupported"
+        ? "media_model_video_unsupported"
+        : v.reason === "token_priced"
+          ? "media_model_video_token_priced"
+          : "media_model_video_no_price",
+      "video",
     );
   }
 
@@ -325,6 +364,9 @@ export class MediaAdminService {
         if (kind === "image" && listed.vectorOnly) throw new MediaError(409, "media_model_unsupported", kind);
         // A speech model whose call cost has no bound — priced on its output, or no usable price (#251 r9–r10).
         if (kind === "speech") await this.checkSpeechPricing(n.model);
+        // A video model whose job cost has no bound (priced in tokens, or not per second) or that offers nothing this
+        // server asks for (#238 stage 3).
+        if (kind === "video") await this.checkVideoModel(n.model);
       }
       if (!authorize()) throw new MediaError(403, "forbidden");
       this.o.transaction(() => {

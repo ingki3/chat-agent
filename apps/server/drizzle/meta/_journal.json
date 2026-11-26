@@ -274,6 +274,13 @@
       "when": 1795528763417,
       "tag": "0038_media_estimate",
       "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "6",
+      "when": 1795657727271,
+      "tag": "0039_video_jobs",
+      "breakpoints": true
     }
   ]
 }

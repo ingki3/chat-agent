@@ -256,6 +256,31 @@ function researchJob(f: Family) {
   return id;
 }
 
+/**
+ * A video card (#238 stage 3) of `owner`'s conversation shared with `shared` — dismissed, so the owner's dismiss is
+ * refused by its state (video_job_changed) and its stream closes at once. The card is the owner's only: a shared
+ * viewer gets 403 like everyone else.
+ */
+function videoJob(f: Family) {
+  const fx = conversation(f);
+  const jobs = f.app.media!.video;
+  const id = jobs.createCard({
+    conversationId: fx.id,
+    ownerId: f.users.owner.id,
+    messageId: fx.params.assistantMessageId,
+    runId: "run-matrix",
+    model: "fixture/video-one",
+    prompt: "노을",
+    durationSec: 8,
+    resolution: "720p",
+    estimateMicros: 480_000,
+    settingsRevision: "initial",
+    keyMark: "env",
+  });
+  jobs.dismiss(id, f.users.owner.id, 0);
+  return id;
+}
+
 /** A live share (#29) of `owner`'s schedule-result conversation (#56) with `shared` — "새 결과 알림 받기" (#52). */
 function scheduleShare(f: Family) {
   const store = f.app.conversations!;
@@ -333,6 +358,30 @@ export const APP_MATRIX: MatrixRow[] = [
     fixture: researchJob,
     body: { answer: "이번 달" },
     errors: { owner: "research_state", shared: "forbidden", admin: "forbidden", stranger: "forbidden" },
+  },
+  // 영상 생성 (#238 stage 3): the card is the conversation owner's only (it names the prompt and the cost). The matrix
+  // app runs no job engine: the owner's approve is refused past the resource check (video_engine_unavailable); the
+  // fixture card was dismissed, so the owner's dismiss is refused by its state.
+  { route: "GET /api/video-jobs/:id", expect: OWNER_ONLY, fixture: videoJob },
+  { route: "GET /api/video-jobs/:id/events", expect: OWNER_ONLY, fixture: videoJob },
+  {
+    route: "POST /api/video-jobs/:id/approve",
+    expect: { ...OWNER_ONLY, owner: 503 },
+    fixture: videoJob,
+    body: { version: 1 },
+    errors: {
+      owner: "video_engine_unavailable",
+      shared: "forbidden",
+      admin: "forbidden",
+      stranger: "forbidden",
+    },
+  },
+  {
+    route: "POST /api/video-jobs/:id/dismiss",
+    expect: { ...OWNER_ONLY, owner: 409 },
+    fixture: videoJob,
+    body: { version: 1 },
+    errors: { owner: "video_job_changed", shared: "forbidden", admin: "forbidden", stranger: "forbidden" },
   },
   { route: "GET /api/conversations/:id", expect: READ, fixture: conversation },
   {

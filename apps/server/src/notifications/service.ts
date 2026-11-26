@@ -415,6 +415,8 @@ export class NotificationService {
           memoryFailed: row.memoryFailed,
           researchDone: row.researchDone,
           researchFailed: row.researchFailed,
+          videoDone: row.videoDone,
+          videoFailed: row.videoFailed,
           rev: row.rev,
         }
       : {
@@ -426,6 +428,8 @@ export class NotificationService {
           memoryFailed: true,
           researchDone: true,
           researchFailed: true,
+          videoDone: true,
+          videoFailed: true,
           rev: 0,
         };
   }
@@ -433,7 +437,14 @@ export class NotificationService {
   /** Whether the user wants this 기억 정리 notification (spec §8: the three user kinds can be turned off). */
   wants(
     userId: string,
-    kind: "memory_proposal" | "memory_applied" | "memory_failed" | "research_done" | "research_failed",
+    kind:
+      | "memory_proposal"
+      | "memory_applied"
+      | "memory_failed"
+      | "research_done"
+      | "research_failed"
+      | "video_done"
+      | "video_failed",
   ): boolean {
     const p = this.prefs(userId);
     if (kind === "memory_proposal") return p.memoryProposals !== false;
@@ -441,6 +452,9 @@ export class NotificationService {
     // 깊이 조사 (#211): "완료" and "실패·중지", each its own switch.
     if (kind === "research_done") return p.researchDone !== false;
     if (kind === "research_failed") return p.researchFailed !== false;
+    // 영상 생성 (#238 stage 3): "완성" and "실패", each its own switch.
+    if (kind === "video_done") return p.videoDone !== false;
+    if (kind === "video_failed") return p.videoFailed !== false;
     return p.memoryFailed !== false;
   }
 
@@ -456,6 +470,8 @@ export class NotificationService {
       memoryFailed: p.memoryFailed ?? before.memoryFailed ?? true,
       researchDone: p.researchDone ?? before.researchDone ?? true,
       researchFailed: p.researchFailed ?? before.researchFailed ?? true,
+      videoDone: p.videoDone ?? before.videoDone ?? true,
+      videoFailed: p.videoFailed ?? before.videoFailed ?? true,
       updatedAt: this.now(),
     };
     // The revision goes up with every write, in the same statement (#188 review 9).

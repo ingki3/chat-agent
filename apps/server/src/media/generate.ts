@@ -42,6 +42,7 @@ import {
 import { moderationFor, STRICTNESS, withMediaPolicy } from "./policy.js";
 import { mediaRunKey } from "../usage/store.js";
 import type { MediaSettingsStore } from "./settings.js";
+import type { VideoJobs } from "./video-jobs.js";
 import { imageSize, stripImage, textRuns } from "./strip.js";
 import { removeSpeechWorkdir, type Measured, type SpeechAudio } from "./speech-audio.js";
 import {
@@ -156,6 +157,8 @@ export type MediaGeneratorOptions = {
   speechAudio?: () => SpeechAudio | undefined;
   /** #248: the piece sizing and cut detection (tests use short pieces). */
   split?: SpeechSplitLimits;
+  /** #238 stage 3: `video_generate` makes a confirmation card there (`video-jobs.ts`); absent, it is not offered. */
+  video?: () => VideoJobs | undefined;
 };
 
 export const MEDIA_SLOTS = { total: 4, perUser: 2 } as const;
@@ -185,7 +188,7 @@ class MediaToolError extends Error {
   }
 }
 
-type Kind = "image" | "speech";
+type Kind = "image" | "speech" | "video";
 type Descriptor = { type?: unknown; values?: unknown };
 type Params = Map<string, Set<string> | null>;
 
@@ -250,10 +253,16 @@ export class MediaGenerator {
     this.split = o.split ?? SPEECH_SPLIT;
   }
 
-  /** Whether the kind is offered now: switched on, a model chosen, a key in place. */
+  /** Whether the kind is offered now: switched on, a model chosen, a key in place (video: with its job store). */
   offered(kind: Kind): boolean {
+    if (kind === "video" && !this.o.video?.()) return false;
     const k = this.o.settings.get().kinds[kind];
     return k.enabled && !!k.model && !!this.o.keys.resolve();
+  }
+
+  /** The files this conversation's image/speech calls are making now (#238 stage 3: an approval counts them). */
+  filesPending(conversationId: string): number {
+    return this.filesInFlight.get(conversationId) ?? 0;
   }
 
   async run(
@@ -262,6 +271,12 @@ export class MediaGenerator {
     input: Record<string, unknown>,
     o: { alive?: (() => boolean) | undefined; signal?: AbortSignal | undefined } = {},
   ): Promise<SkillResult> {
+    // Stage 3: a video is a confirmation card of its own store (nothing is paid by the call).
+    if (kind === "video") {
+      const video = this.o.video?.();
+      if (!video) return { ok: false, code: "media_disabled", hint: MEDIA_TOOL_HINTS.media_disabled! };
+      return video.propose(scope, input, o);
+    }
     try {
       // The result goes to the model: every known secret out of it (file names, voices, notes).
       return { ok: true, output: scrubKnownDeep(await this.execute(kind, scope, input, o), { tail: false }) };
@@ -306,7 +321,7 @@ export class MediaGenerator {
   }
 
   private async execute(
-    kind: Kind,
+    kind: "image" | "speech",
     scope: ToolScope,
     raw: Record<string, unknown>,
     o: { alive?: (() => boolean) | undefined; signal?: AbortSignal | undefined },
@@ -398,7 +413,7 @@ export class MediaGenerator {
       // A place among the conversation's files, counting the calls in flight — before anything is paid for, and
       // before the run's call is counted (a refusal here leaves the run its call).
       const inFlight = this.filesInFlight.get(scope.conversationId) ?? 0;
-      if (store.count(scope.conversationId) + inFlight >= FILE_LIMITS.perConversation)
+      if (store.placesTaken(scope.conversationId) + inFlight >= FILE_LIMITS.perConversation)
         throw new MediaToolError("media_file_limit");
       this.filesInFlight.set(scope.conversationId, inFlight + 1);
       holdsFile = true;
