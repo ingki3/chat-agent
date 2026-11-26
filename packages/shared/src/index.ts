@@ -32,6 +32,7 @@ export * from "./access.js";
 export * from "./public-links.js";
 export * from "./research.js";
 export * from "./media.js";
+export * from "./video.js";
 
 /** Response of `GET /api/health`. Shared by server and web so both sides agree on the shape. */
 export const HealthResponse = z.object({

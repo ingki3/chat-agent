@@ -71,8 +71,10 @@ export const SPEECH_AUDIO_LIMITS = {
  * `<resolved DATA_DIR>/speech-scratch`. `missing` when it does not exist; `bad` for anything else (a link, a file,
  * a folder that resolves elsewhere, an error reading it) — nothing below such a root is touched.
  */
-function scratchRoot(dataDir: string): { ok: string } | "missing" | "bad" {
-  const root = storagePaths(dataDir).speechScratch;
+function scratchRoot(
+  dataDir: string,
+  root: string = storagePaths(dataDir).speechScratch,
+): { ok: string } | "missing" | "bad" {
   let st: fs.Stats | undefined;
   try {
     st = fs.lstatSync(root, { throwIfNoEntry: false });
@@ -94,18 +96,27 @@ const WORKDIR_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 
 /** `speech-scratch/<uuid>` under the data folder (resolved, never a link), with `in/` and `out/`. */
 export function makeSpeechWorkdir(dataDir: string): string {
-  let root = scratchRoot(dataDir);
+  const real = makeScratchDir(dataDir, storagePaths(dataDir).speechScratch);
+  fs.mkdirSync(path.join(real, "in"), { mode: 0o700 });
+  fs.mkdirSync(path.join(real, "out"), { mode: 0o700 });
+  return real;
+}
+
+/**
+ * `<root>/<uuid>` (owner-only) under a scratch root of the data folder that is checked like `speech-scratch` (a real
+ * folder, never a link, resolving to exactly `<DATA_DIR>/<name>`) — also #238 stage 3's `video-scratch`.
+ */
+export function makeScratchDir(dataDir: string, rootPath: string): string {
+  let root = scratchRoot(dataDir, rootPath);
   if (root === "missing") {
-    fs.mkdirSync(storagePaths(dataDir).speechScratch, { recursive: true, mode: 0o700 });
-    root = scratchRoot(dataDir);
+    fs.mkdirSync(rootPath, { recursive: true, mode: 0o700 });
+    root = scratchRoot(dataDir, rootPath);
   }
-  if (typeof root === "string") throw new Error("speech-scratch is not a folder of DATA_DIR");
+  if (typeof root === "string") throw new Error("scratch root is not a folder of DATA_DIR");
   const dir = path.join(root.ok, crypto.randomUUID());
   fs.mkdirSync(dir, { mode: 0o700 });
   const real = fs.realpathSync.native(dir);
-  if (real !== dir) throw new Error("speech working folder moved");
-  fs.mkdirSync(path.join(real, "in"), { mode: 0o700 });
-  fs.mkdirSync(path.join(real, "out"), { mode: 0o700 });
+  if (real !== dir) throw new Error("working folder moved");
   return real;
 }
 
@@ -119,7 +130,17 @@ export const removeSpeechWorkdir = (dir: string): boolean => removeTree(dir);
  * followed. Never throws.
  */
 export function sweepSpeechScratch(dataDir: string): boolean {
-  const root = scratchRoot(dataDir);
+  return sweepScratch(dataDir, storagePaths(dataDir).speechScratch);
+}
+
+/** `sweepSpeechScratch`'s rules for any scratch root of the data folder (#238 stage 3: `video-scratch`). */
+export function sweepScratch(
+  dataDir: string,
+  rootPath: string,
+  /** Working folders left alone (in use now). */
+  keep: (name: string) => boolean = () => false,
+): boolean {
+  const root = scratchRoot(dataDir, rootPath);
   if (root === "missing") return true;
   if (root === "bad") return false;
   let names: string[];
@@ -132,6 +153,7 @@ export function sweepSpeechScratch(dataDir: string): boolean {
   for (const n of names) {
     const p = path.join(root.ok, n);
     try {
+      if (keep(n)) continue;
       const st = fs.lstatSync(p);
       if (st.isDirectory() && !st.isSymbolicLink() && WORKDIR_NAME.test(n)) {
         if (!removeTree(p)) ok = false;

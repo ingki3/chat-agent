@@ -105,17 +105,32 @@ export class NotificationService {
    * undefined when the user may not receive it (inactive, not an admin for an admin kind, resource not readable).
    */
   publish(userId: string, input: PublishInput, opts: { dedupeKey?: string } = {}): string | undefined {
+    const r = this.publishOutcome(userId, input, opts);
+    return r.status === "published" ? r.id : undefined;
+  }
+
+  /**
+   * `publish` with why nothing was stored (#238 stage 3, review r2): `refused` for good (no such user, an inactive
+   * one, a kind they may not get, a resource gone or no longer theirs to read, a dedupe key someone else's), `failed`
+   * when the check itself could not be made (a lookup error) — a caller may try that again with the same dedupe key.
+   */
+  publishOutcome(
+    userId: string,
+    input: PublishInput,
+    opts: { dedupeKey?: string } = {},
+  ): { status: "published"; id: string } | { status: "refused" | "failed" } {
     // The same publishing point again (#56: a schedule run's notification after a crash): the first one stands.
     if (opts.dedupeKey) {
       const prev = this.byDedupeKey(opts.dedupeKey);
-      if (prev) return prev.userId === userId ? prev.id : undefined;
+      if (prev) return prev.userId === userId ? { status: "published", id: prev.id } : { status: "refused" };
     }
     const c = compose(input);
     const ref = "ref" in input && input.ref ? input.ref : undefined;
     const user = this.users.byId(userId);
-    if (!user || !this.allowed(user, c.kind, ref?.kind ?? null, ref?.id ?? null)) {
+    const verdict = user ? this.check(user, c.kind, ref?.kind ?? null, ref?.id ?? null) : "no";
+    if (verdict !== "yes") {
       logEvent(this.log, "info", "push.cancelled", { userId, notificationKind: c.kind });
-      return undefined;
+      return { status: verdict === "error" ? "failed" : "refused" };
     }
     // A result the recipient sees only through a share: its content stays off the lock screen (FR-13.5).
     let body = c.body;
@@ -141,23 +156,33 @@ export class NotificationService {
     // A key already taken (by a publish between the look-up above and here): nothing is stored twice.
     if (!this.db.insert(notifications).values(row).onConflictDoNothing().run().changes) {
       const prev = opts.dedupeKey ? this.byDedupeKey(opts.dedupeKey) : undefined;
-      return prev?.userId === userId ? prev.id : undefined;
+      return prev?.userId === userId ? { status: "published", id: prev.id } : { status: "refused" };
     }
     if (row.pushState === "sending") this.track(this.push(userId, [row]));
     else if (row.pushState === "queued") this.track(this.deliver(userId));
-    return row.id;
+    return { status: "published", id: row.id };
   }
 
   /** Who may receive what — checked when publishing, right before pushing, and on every inbox read. */
   private allowed(user: UserRow, kind: string, refKind: string | null, refId: string | null): boolean {
-    if (!user.active) return false;
-    if (ADMIN_KINDS.has(kind as NotificationKind) && user.role !== "admin") return false;
-    if (refKind === null || refId === null) return true;
+    return this.check(user, kind, refKind, refId) === "yes";
+  }
+
+  /** `allowed`, telling a refusal (`no`) from a check that could not be made (`error` — still a refusal for `allowed`). */
+  private check(
+    user: UserRow,
+    kind: string,
+    refKind: string | null,
+    refId: string | null,
+  ): "yes" | "no" | "error" {
+    if (!user.active) return "no";
+    if (ADMIN_KINDS.has(kind as NotificationKind) && user.role !== "admin") return "no";
+    if (refKind === null || refId === null) return "yes";
     try {
       const r = this.resources.load(refKind, refId);
-      return !!r && can(user, "read", r);
+      return r && can(user, "read", r) ? "yes" : "no";
     } catch {
-      return false; // unknown resource kind: fail closed
+      return "error"; // unknown resource kind or a failed lookup: fail closed
     }
   }
 
@@ -415,6 +440,8 @@ export class NotificationService {
           memoryFailed: row.memoryFailed,
           researchDone: row.researchDone,
           researchFailed: row.researchFailed,
+          videoDone: row.videoDone,
+          videoFailed: row.videoFailed,
           rev: row.rev,
         }
       : {
@@ -426,6 +453,8 @@ export class NotificationService {
           memoryFailed: true,
           researchDone: true,
           researchFailed: true,
+          videoDone: true,
+          videoFailed: true,
           rev: 0,
         };
   }
@@ -433,7 +462,14 @@ export class NotificationService {
   /** Whether the user wants this 기억 정리 notification (spec §8: the three user kinds can be turned off). */
   wants(
     userId: string,
-    kind: "memory_proposal" | "memory_applied" | "memory_failed" | "research_done" | "research_failed",
+    kind:
+      | "memory_proposal"
+      | "memory_applied"
+      | "memory_failed"
+      | "research_done"
+      | "research_failed"
+      | "video_done"
+      | "video_failed",
   ): boolean {
     const p = this.prefs(userId);
     if (kind === "memory_proposal") return p.memoryProposals !== false;
@@ -441,6 +477,9 @@ export class NotificationService {
     // 깊이 조사 (#211): "완료" and "실패·중지", each its own switch.
     if (kind === "research_done") return p.researchDone !== false;
     if (kind === "research_failed") return p.researchFailed !== false;
+    // 영상 생성 (#238 stage 3): "완성" and "실패", each its own switch.
+    if (kind === "video_done") return p.videoDone !== false;
+    if (kind === "video_failed") return p.videoFailed !== false;
     return p.memoryFailed !== false;
   }
 
@@ -456,6 +495,8 @@ export class NotificationService {
       memoryFailed: p.memoryFailed ?? before.memoryFailed ?? true,
       researchDone: p.researchDone ?? before.researchDone ?? true,
       researchFailed: p.researchFailed ?? before.researchFailed ?? true,
+      videoDone: p.videoDone ?? before.videoDone ?? true,
+      videoFailed: p.videoFailed ?? before.videoFailed ?? true,
       updatedAt: this.now(),
     };
     // The revision goes up with every write, in the same statement (#188 review 9).

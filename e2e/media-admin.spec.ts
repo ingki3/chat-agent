@@ -393,3 +393,168 @@ test("stage 2: a generated image shows in the reply, generated speech plays in a
     ).status(),
   ).toBe(200);
 });
+
+/**
+ * 영상 생성 (#238 stage 3), in this file so it runs after the admin flow with the server-wide settings to itself: the
+ * fixture OpenRouter's scripted video jobs move one step a second (`fixture.ts`) and its scripted ffprobe checks the
+ * MP4 — nothing real is called.
+ */
+test("stage 3: a video card is approved, follows its job and plays the video in place; offline it waits", async ({
+  page,
+  browser,
+  baseURL,
+}, info) => {
+  test.skip(info.project.name !== "desktop", "server-wide settings: one project writes them");
+  const admin = await browser.newContext({ storageState: authFile(ADMIN), baseURL: baseURL! });
+  closeOther = () => admin.close();
+  const status = (await (await admin.request.get("/api/admin/media")).json()) as {
+    key: { generation: string };
+    settings: Record<string, unknown> & { kinds: Record<string, unknown> };
+  };
+  const put = await admin.request.put("/api/admin/media/key", {
+    headers: csrf(baseURL!),
+    data: {
+      key: "sk-or-v1-e2e-synthetic-video-00000000000000video",
+      expectedGeneration: status.key.generation,
+    },
+  });
+  expect(put.status()).toBe(200);
+  const now = (await put.json()) as { settingsRevision: string; settings: typeof status.settings };
+  const saved = await admin.request.put("/api/admin/media/settings", {
+    headers: csrf(baseURL!),
+    data: {
+      settings: {
+        ...now.settings,
+        kinds: { ...now.settings.kinds, video: { enabled: true, model: "fixture/video-one" } },
+      },
+      expectedRevision: now.settingsRevision,
+    },
+  });
+  expect(saved.status(), await saved.text()).toBe(200);
+
+  await signIn(page, baseURL!, await newMember(browser, baseURL!, "media-video"));
+  const conv = await newConversation(page.request, baseURL!, `영상 ${crypto.randomUUID().slice(0, 8)}`);
+  await page.goto(`/c/${conv.id}`);
+  await sendMessage(page, "/video 노을 진 바다 위 작은 배");
+  const reply = page.getByTestId("assistant").last();
+  await expect(reply).toHaveAttribute("data-status", "complete");
+  const card = reply.getByTestId("video-card");
+  // The card: what would be made and the most it may cost — nothing made yet.
+  await expect(card.getByTestId("video-card-status")).toHaveText("승인을 기다려요");
+  await expect(card.getByTestId("video-card-duration")).toHaveText("8초");
+  await expect(card.getByTestId("video-card-resolution")).toHaveText("720p");
+  await expect(card.getByTestId("video-card-cost")).toHaveText("최대 $0.48");
+  await expect(card).toContainText("승인한 뒤에는 취소할 수 없어요");
+  await expect(card).toContainText("켜짐 (모델 기본값)");
+
+  // Offline: 승인 waits for the connection.
+  await page.context().setOffline(true);
+  await expect(card.getByTestId("video-card-approve")).toBeDisabled();
+  await expect(card.getByTestId("video-card-offline")).toBeVisible();
+  await page.context().setOffline(false);
+  await expect(card.getByTestId("video-card-approve")).toBeEnabled();
+
+  await card.getByTestId("video-card-approve").click();
+  // The job follows live: submitted, made, downloaded and checked — then the player (or, where the browser cannot
+  // play MP4, the download).
+  await expect(card.getByTestId("video-card-status")).toHaveText("완성됐어요", { timeout: 30_000 });
+  await expect(card.getByTestId("video-card-cost")).toHaveText("$0.30");
+  const download = card.getByTestId("video-card-download");
+  await expect(download).toContainText(/video-.*\.mp4/);
+  // The player: the fixture's result is a real MP4 (1 s of VP9) — the browser reads its header from the inline route.
+  const player = card.getByTestId("video-card-video");
+  await expect(player).toHaveAttribute("controls", "");
+  expect(await player.getAttribute("src")).toMatch(/^\/api\/files\/[^/]+\/content\?inline=1$/);
+  await expect
+    .poll(() => player.evaluate((el: HTMLVideoElement) => (el.error ? -1 : el.readyState)), {
+      timeout: 10_000,
+    })
+    .toBeGreaterThanOrEqual(1);
+  // Served inline: only because a video job checked and stored it.
+  const href = (await download.getAttribute("href"))!;
+  const inline = await page.request.get(`${href}?inline=1`);
+  expect(inline.status()).toBe(200);
+  expect(inline.headers()["content-type"]).toBe("video/mp4");
+  expect(inline.headers()["content-disposition"]).toMatch(/^inline/);
+
+  // A second card is closed without approving it.
+  await sendMessage(page, "/video 눈 내리는 숲");
+  const second = page.getByTestId("assistant").last().getByTestId("video-card");
+  await expect(second.getByTestId("video-card-status")).toHaveText("승인을 기다려요");
+  await second.getByTestId("video-card-dismiss").click();
+  await expect(second.getByTestId("video-card-status")).toHaveText("닫았어요");
+
+  // Back off for the other specs: video off, key removed.
+  const after = (await (await admin.request.get("/api/admin/media")).json()) as {
+    key: { generation: string };
+    settingsRevision: string;
+    settings: typeof status.settings;
+  };
+  expect(
+    (
+      await admin.request.put("/api/admin/media/settings", {
+        headers: csrf(baseURL!),
+        data: {
+          settings: {
+            ...after.settings,
+            kinds: { ...after.settings.kinds, video: { enabled: false, model: "fixture/video-one" } },
+          },
+          expectedRevision: after.settingsRevision,
+        },
+      })
+    ).status(),
+  ).toBe(200);
+  expect(
+    (
+      await admin.request.delete("/api/admin/media/key", {
+        headers: csrf(baseURL!),
+        data: { expectedGeneration: after.key.generation },
+      })
+    ).status(),
+  ).toBe(200);
+});
+
+test("stage 3: the admin cannot choose a video model priced in tokens (no bound from a length)", async ({
+  page,
+  baseURL,
+}, info) => {
+  test.skip(info.project.name !== "desktop", "server-wide settings: one project writes them");
+  await useAccount(page, ADMIN);
+  const status = (await (await page.request.get("/api/admin/media")).json()) as {
+    key: { generation: string };
+  };
+  expect(
+    (
+      await page.request.put("/api/admin/media/key", {
+        headers: csrf(baseURL!),
+        data: {
+          key: "sk-or-v1-e2e-synthetic-tokens-0000000000000tokn",
+          expectedGeneration: status.key.generation,
+        },
+      })
+    ).status(),
+  ).toBe(200);
+  await page.goto("/admin?tab=media");
+  const form = page
+    .getByRole("region", { name: "미디어 생성" })
+    .getByRole("form", { name: "미디어 생성 설정" });
+  await form.getByLabel("영상 모델").selectOption("fixture/video-tokens");
+  await form.getByLabel("영상 생성 켜기").check();
+  await form.getByRole("button", { name: "확인하고 저장" }).click();
+  await expect(form.getByRole("alert")).toContainText(
+    "영상: 이 영상 모델은 토큰(video_tokens) 단위로 과금돼",
+  );
+  await page.reload();
+  await expect(form.getByLabel("영상 생성 켜기")).not.toBeChecked();
+  const after = (await (await page.request.get("/api/admin/media")).json()) as {
+    key: { generation: string };
+  };
+  expect(
+    (
+      await page.request.delete("/api/admin/media/key", {
+        headers: csrf(baseURL!),
+        data: { expectedGeneration: after.key.generation },
+      })
+    ).status(),
+  ).toBe(200);
+});

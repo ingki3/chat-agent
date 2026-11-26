@@ -205,6 +205,7 @@ export function NotificationSettings() {
       <QuietHours />
       <MemoryNotifications />
       <ResearchNotifications />
+      <VideoNotifications />
     </section>
   );
 }
@@ -309,7 +310,14 @@ function QuietHours() {
   );
 }
 
-type Toggle = "memoryProposals" | "memoryApplied" | "memoryFailed" | "researchDone" | "researchFailed";
+type Toggle =
+  | "memoryProposals"
+  | "memoryApplied"
+  | "memoryFailed"
+  | "researchDone"
+  | "researchFailed"
+  | "videoDone"
+  | "videoFailed";
 
 /** 기억 정리 notifications (#146, #188, spec §8): 제안 대기, 자동 반영, 실패 — each can be turned off. */
 function MemoryNotifications() {
@@ -338,6 +346,21 @@ function ResearchNotifications() {
         ["researchFailed", "깊이 조사가 실패하거나 중지됐을 때"],
       ]}
       note="알림에는 주제 앞부분 한 줄만 적혀요. 보고서 내용과 출처는 눌러서 대화에서 봐요."
+    />
+  );
+}
+
+/** 영상 생성 notifications (#238 stage 3): 완성, 실패 — each can be turned off. */
+function VideoNotifications() {
+  return (
+    <KindToggles
+      testId="video-notifications"
+      title="영상 생성 알림"
+      items={[
+        ["videoDone", "승인한 영상이 완성됐을 때"],
+        ["videoFailed", "승인한 영상을 만들지 못했을 때"],
+      ]}
+      note="알림에는 정해진 문구와 이유만 적혀요. 요청 내용과 영상은 눌러서 대화에서 봐요."
     />
   );
 }
