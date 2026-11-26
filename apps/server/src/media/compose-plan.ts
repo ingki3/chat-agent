@@ -86,6 +86,14 @@ export type InputInfo = {
   originSec?: number;
   /** Re-plan 2: an MP4/MOV picture track with an edit list ends here on the `-copyts` timeline (its media edit's end). */
   videoEndSec?: number | null;
+  /**
+   * Review r7: an edit list's mapping (the files are read with `-ignore_editlist`): a track's media time m is shown at
+   * m + shift (shift = lead − the edit's media time), and nothing of it before its lead (an empty edit: black, silent).
+   */
+  videoShiftSec?: number;
+  audioShiftSec?: number;
+  videoLeadSec?: number;
+  audioLeadSec?: number;
   hasVideo: boolean;
   hasAudio: boolean;
   width: number | null;
@@ -108,6 +116,9 @@ export type PlanClip = {
   origin?: number;
   /** Re-plan 2: where its picture's presentation ends, from that 0 (an edit list's media edit end) — nothing after. */
   pictureEnd?: number | null;
+  /** Review r7: its edit list's mapping (`InputInfo.videoShiftSec`, `videoLeadSec`). */
+  shift?: number;
+  lead?: number;
   /**
    * Review r1: frames at its end that only hold its last picture (the last clip, held for the narration) — a Ken
    * Burns move ends at the clip's own length, then holds.
@@ -347,6 +358,8 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
       hasAudio: info.hasAudio,
       origin: info.originSec ?? 0,
       pictureEnd: info.videoEndSec != null ? info.videoEndSec - (info.originSec ?? 0) : null,
+      shift: info.videoShiftSec ?? 0,
+      lead: info.videoLeadSec ?? 0,
       head: 0,
       tail: 0,
       transition: null,
@@ -575,6 +588,8 @@ export function toVtt(subs: readonly Cue[], totalSec?: number): string {
 // ---------------------------------------------------------------- ffmpeg argument lists
 
 const num = (n: number) => String(Math.round(n * 1e6) / 1e6);
+/** "+0.4" / "-2": an offset added to a timestamp expression. */
+const signed = (n: number) => (n < 0 ? `-${num(-n)}` : `+${num(n)}`);
 /** Every run: no stdin, quiet, local files and the progress pipe only, the filter threads bounded. */
 export const FF_COMMON = [
   "-nostdin",
@@ -594,7 +609,9 @@ export const FF_COMMON = [
  * sound; what lies before 0 (a negative preroll, AAC priming) is cut by the graph.
  */
 const input = (o: { demuxer: string; file: string }) => [
-  ...(o.demuxer === "mov" ? ["-copyts"] : []),
+  // Review r7: its edit list is not applied by the demuxer (that drops the sample already showing at an edit's start);
+  // this server maps it itself (`InputInfo.videoShiftSec`…), the same way for the ingest and every clip.
+  ...(o.demuxer === "mov" ? ["-copyts", "-ignore_editlist", "1"] : []),
   "-protocol_whitelist",
   "file,pipe",
   "-threads",
@@ -690,16 +707,21 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
     // The canvas starts at the trim's start (review r5): its first slot shows the source frame on screen at that very
     // moment (a frame that began before it), and every later slot samples the source at start + k/30.
     const own = Math.max(1, Math.round(c.useSec * FPS));
+    const leadIn = (c.lead ?? 0) - (c.origin ?? 0) - c.startSec;
     // The canvas is the output's size (no frame of the source is kept for its size — review r5: a reference branch
     // buffered every frame before the start); the picture is fitted to it first, its alpha kept for the overlay.
     picture =
       // Fine timebase first (re-plan 2: a 1 s MOV timescale would round the shift), then the shift; a picture with an
       // edit list stops at its presentation's end (its last frame then holds).
-      `[0:v]settb=AVTB,setpts=PTS-${num((c.origin ?? 0) + c.startSec)}/TB,` +
+      `[0:v]settb=AVTB,setpts=PTS${signed((c.shift ?? 0) - (c.origin ?? 0) - c.startSec)}/TB,` +
       `${c.pictureEnd != null ? `trim=end=${num(Math.max(1e-6, c.pictureEnd - c.startSec))},` : ""}` +
       `${square},${fit(W, H)},setsar=1,format=yuva420p[src];` +
       `color=c=black:s=${W}x${H}:r=${FPS},format=yuv420p[canvas];` +
-      `[canvas][src]overlay=eof_action=repeat:repeatlast=1,trim=end_frame=${own},setpts=N,` +
+      // Before a leading empty edit ends nothing is shown (review r7: the frame showing at the edit's start comes in at
+      // its lead, not before).
+      `[canvas][src]overlay=eof_action=repeat:repeatlast=1${
+        leadIn > 0 ? `:enable='gte(t,${num(leadIn)})'` : ""
+      },trim=end_frame=${own},setpts=N,` +
       `format=yuv420p,tpad=stop_mode=clone:stop=-1,${exact}`;
   }
   const outs: { label: string; from: number; to: number; args: string[] }[] = [];
@@ -774,10 +796,20 @@ export function ingestArgs(o: {
   soundEndSec?: number | null;
   /** Its presentation 0 on the `-copyts` timeline (`InputInfo.originSec`). */
   originSec?: number;
+  /** Review r7: the edit lists' mappings (`InputInfo.audioShiftSec`, `audioLeadSec`, `videoShiftSec`). */
+  soundShiftSec?: number;
+  soundLeadSec?: number;
+  pictureShiftSec?: number;
 }): string[] {
   const o0 = o.originSec ?? 0;
-  const shiftA = o0 > 0 ? `asettb=AVTB,asetpts=PTS-${num(o0)}/TB,` : "";
-  const shiftV = o0 > 0 ? `settb=AVTB,setpts=PTS-${num(o0)}/TB,` : "";
+  const sa = (o.soundShiftSec ?? 0) - o0;
+  const sv = (o.pictureShiftSec ?? 0) - o0;
+  const leadA = (o.soundLeadSec ?? 0) - o0;
+  // A sound before its lead (before its edit's media time — AAC priming) is not presented; from 0 to its lead, silence.
+  const shiftA =
+    (sa !== 0 ? `asettb=AVTB,asetpts=PTS${signed(sa)}/TB,` : "") +
+    (o.soundShiftSec ? `atrim=start=${num(Math.max(0, leadA))},` : "");
+  const shiftV = sv !== 0 ? `settb=AVTB,setpts=PTS${signed(sv)}/TB,` : "";
   const cap = num(Math.max(1, o.capSec));
   return [
     ...FF_COMMON,
@@ -839,7 +871,8 @@ export function audioArgs(plan: Plan, o: { narration: boolean; music: string | n
     ins.push("-protocol_whitelist", "file,pipe", ...RAW_FLOAT, "-i", "narration.pcm");
     const taps = 2 + (duckMusic ? 1 : 0);
     graph.push(`[${k}:a]asplit=${taps}[nar][scb]${duckMusic ? "[scm]" : ""}`);
-    graph.push(`[0:a][scb]${DUCK}[bed]`);
+    // Review r7: a compressor ends with the shorter of its two inputs — both are padded, its output cut at the target.
+    graph.push(`[0:a]apad[bedin];[scb]apad[bedsc];[bedin][bedsc]${DUCK},atrim=end_sample=${T}[bed]`);
     mix.push("[bed]", "[nar]");
     k++;
   } else {
@@ -864,10 +897,10 @@ export function audioArgs(plan: Plan, o: { narration: boolean; music: string | n
     graph.push(
       `[${k}:a]apad,atrim=end_sample=${T},volume=${num(m.volume)}${fades.map((f) => `,${f}`).join("")}${duckMusic ? "[m0]" : "[mus]"}`,
     );
-    if (duckMusic) graph.push(`[m0][scm]${DUCK}[mus]`);
+    if (duckMusic)
+      graph.push(`[m0]apad[musin];[scm]apad[mussc];[musin][mussc]${DUCK},atrim=end_sample=${T}[mus]`);
     mix.push("[mus]");
   }
-  // loudnorm needs 3 s to measure: a shorter (or silent) sound is padded first (else it gives NaN), then cut back.
   // Loudness normalisation needs 3 s to measure (`loudnorm` gives NaN on less, reviews r1 and r5): a result of 3 s or
   // more is normalised as it is (no padding — padding in front of `loudnorm` cut the end of the sound); a shorter one is
   // only kept from clipping (`alimiter` at −1.5 dBFS, its delay compensated).

@@ -2555,7 +2555,7 @@ describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", 
     });
     expect(mp4Timeline(m.noel)).toEqual({
       ok: true,
-      video: { edited: false, lead: 0, end: null },
+      video: { edited: false, lead: 0, mediaTime: 0, end: null },
       audio: null,
     });
     const t = await start({ composer: real });
@@ -2871,6 +2871,111 @@ describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", 
     expect(t.job(id).status).toBe("done");
     const vtt = (await t.api(t.f.cookies.owner, "GET", `/api/compose-jobs/${id}/subtitles.vtt`)).body;
     expect(vtt).toContain("\n영상 끝\n");
+  });
+
+  // ---- review r7, with the real ffmpeg
+  it("review r7: ducked clip sound and music keep their last 50 ms under a shorter narration (5 runs each)", async () => {
+    const dir = tmp();
+    const tone = path.join(dir, "tone1.mov");
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=30:d=1"],
+      ...["-f", "lavfi", "-i", "sine=f=440:r=48000:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p"],
+      ...["-c:a", "pcm_s16le", "-shortest", tone],
+    ]);
+    const half = path.join(dir, "silent-0.5.wav");
+    execFileSync(FFMPEG, [
+      ...[
+        "-hide_banner",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=r=48000:cl=stereo,atrim=duration=0.5",
+      ],
+      ...["-c:a", "pcm_s16le", half],
+    ]);
+    const toneWav = path.join(dir, "tone1.wav");
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "sine=f=440:r=48000:d=1"],
+      ...["-c:a", "pcm_s16le", toneWav],
+    ]);
+    const t = await start({ composer: real });
+    for (let k = 0; k < 5; k++) {
+      const s = await t.scopeOf();
+      const v = await t.putFile(s, tone, "mp4");
+      const n = await t.putFile(s, half, "wav");
+      const out = await composeOne(t, s, { clips: [{ fileId: v }], narration: [{ fileId: n, startSec: 0 }] });
+      expect(["clip", k, loudness(pcmOf(out), 0.95, 0.999) > 1000]).toEqual(["clip", k, true]);
+      const s2 = await t.scopeOf();
+      const img = await t.putFile(s2, inputs().png, "png");
+      const n2 = await t.putFile(s2, half, "wav");
+      const mus = await t.putFile(s2, toneWav, "wav");
+      const out2 = await composeOne(t, s2, {
+        clips: [{ fileId: img, durationSec: 1 }],
+        narration: [{ fileId: n2, startSec: 0 }],
+        music: { fileId: mus, volume: 1, loop: false, duck: true },
+      });
+      expect(["music", k, loudness(pcmOf(out2), 0.95, 0.999) > 1000]).toEqual(["music", k, true]);
+    }
+  }, 600_000);
+
+  it("review r7: a fragmented MP4 (delay_moov, empty_moov) plays through — its length and its four scenes", async () => {
+    const dir = tmp();
+    const scenes = path.join(dir, "scenes.png");
+    void scenes;
+    const t = await start({ composer: real });
+    for (const flags of ["delay_moov+frag_keyframe", "empty_moov+frag_keyframe"]) {
+      const file = path.join(dir, `${flags.split("+")[0]}.mp4`);
+      execFileSync(FFMPEG, [
+        ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i"],
+        "nullsrc=s=64x64:r=30:d=4,format=rgb24,geq=r='if(lt(T\\,1)+between(T\\,2\\,2.999)\\,255\\,0)':g='if(gte(T\\,2)\\,255\\,0)':b='if(between(T\\,1\\,2.999)\\,255\\,0)'",
+        ...["-c:v", "libx264", "-bf", "2", "-g", "30", "-pix_fmt", "yuv420p", "-movflags", flags, file],
+      ]);
+      const s = await t.scopeOf();
+      const f = await t.putFile(s, file, "mp4");
+      const out = await composeOne(t, s, { clips: [{ fileId: f }] });
+      const c = colours(out);
+      const runs = c.map((x) => (x.startsWith("other(25") ? "white" : x));
+      expect([flags, runs.length]).toEqual([flags, 120]);
+      expect([flags, runs[15], runs[45], runs[75], runs[105]]).toEqual([
+        flags,
+        "red",
+        "blue",
+        "white",
+        "green",
+      ]);
+    }
+  });
+
+  it("review r7: a media edit starting inside a sample (AVFoundation-style 0.4–1.5 s of a 1 fps MOV) keeps that sample — with and without a lead", async () => {
+    const dir = tmp();
+    const t = await start({ composer: real });
+    for (const lead of [0, 1]) {
+      const src = path.join(dir, `src-${lead}.mov`);
+      execFileSync(FFMPEG, [
+        ...["-hide_banner", "-v", "error", ...(lead ? ["-itsoffset", "1"] : []), "-f", "lavfi", "-i"],
+        "nullsrc=s=64x64:r=1:d=3,format=rgb24,geq=r='if(lt(T\\,1)\\,255\\,0)':g=0:b='if(gte(T\\,1)\\,255\\,0)'",
+        ...["-c:v", "libx264", "-bf", "0", "-pix_fmt", "yuv420p", "-video_track_timescale", "16384", src],
+      ]);
+      // The export's edit: media time 0.4 s (6554 / 16384), 1.1 s shown (the movie's timescale is 1000).
+      const edited = path.join(dir, `edited-${lead}.mov`);
+      rewriteElst(src, edited, (e) =>
+        e.map((x) => (x.media === -1 ? x : { ...x, media: 6554, duration: 1100 })),
+      );
+      expect(mp4Timeline(edited)).toMatchObject({
+        ok: true,
+        video: { edited: true, lead, mediaTime: expect.closeTo(0.4, 3), end: expect.closeTo(lead + 1.1, 3) },
+      });
+      const s = await t.scopeOf();
+      const f = await t.putFile(s, edited, "mp4");
+      const out = await composeOne(t, s, { clips: [{ fileId: f }] });
+      const c = colours(out);
+      expect([lead, c.length]).toEqual([lead, 30 * lead + 33]);
+      expect(c.slice(0, 30 * lead).every((x) => x === "black")).toBe(true);
+      expect(c.slice(30 * lead, 30 * lead + 18).every((x) => x === "red")).toBe(true);
+      expect(c.slice(30 * lead + 18).every((x) => x === "blue")).toBe(true);
+    }
   });
 
   it("readiness: a tiny composition checked in the same sandbox", async () => {

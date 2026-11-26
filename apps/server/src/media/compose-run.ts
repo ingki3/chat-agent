@@ -130,7 +130,14 @@ const Probe = z.object({
  * `end` — where its one media edit ends on the movie's timeline (lead + that edit's duration); both null-free only
  * with an edit list (`edited`). Without one the track's media timeline is its presentation (`lead` 0, `end` null).
  */
-export type TrackTimeline = { edited: boolean; lead: number; end: number | null };
+export type TrackTimeline = {
+  edited: boolean;
+  lead: number;
+  /** Review r7: where in the track's media its one media edit starts (seconds, the track's own `mdhd` timescale). */
+  mediaTime: number;
+  /** Where the presentation ends on the movie's timeline; null when not known (none, or a fragmented file's 0). */
+  end: number | null;
+};
 /** The first picture and sound tracks' timelines, or why the file is not one this server takes (`compose_input_edited`). */
 export type Mp4Timeline =
   | { ok: true; video: TrackTimeline | null; audio: TrackTimeline | null }
@@ -207,6 +214,8 @@ export function mp4Timeline(file: string): Mp4Timeline {
     const top = children(b, moov.hdr, b.length);
     if (!top) return bad;
     let scale = 0;
+    // Review r7: a fragmented file (`mvex`): its first `moov` may give a media edit of length 0 — "not known yet".
+    const fragmented = top.some((x) => x.type === "mvex");
     const found: { video: TrackTimeline | null; audio: TrackTimeline | null } = { video: null, audio: null };
     for (const box of top) {
       if (box.type === "mvhd") {
@@ -220,16 +229,22 @@ export function mp4Timeline(file: string): Mp4Timeline {
       const kids = children(b, box.start, box.end);
       if (!kids) return bad;
       let handler = "";
+      let mediaScale = 0;
       let elst: Box | undefined;
       for (const k of kids) {
         if (k.type === "mdia") {
           const m = children(b, k.start, k.end);
           if (!m) return bad;
-          for (const h of m)
+          for (const h of m) {
             if (h.type === "hdlr") {
               if (h.start + 12 > h.end) return bad;
               handler = b.toString("latin1", h.start + 8, h.start + 12);
             }
+            if (h.type === "mdhd") {
+              if (h.start + 24 > h.end) return bad;
+              mediaScale = b.readUInt32BE(h.start + (b[h.start] === 1 ? 20 : 12));
+            }
+          }
         }
         if (k.type === "edts") {
           const e = children(b, k.start, k.end);
@@ -240,9 +255,10 @@ export function mp4Timeline(file: string): Mp4Timeline {
       const kind = handler === "vide" ? "video" : handler === "soun" ? "audio" : null;
       if (!kind || found[kind]) continue;
       if (!elst) {
-        found[kind] = { edited: false, lead: 0, end: null };
+        found[kind] = { edited: false, lead: 0, mediaTime: 0, end: null };
         continue;
       }
+      if (!mediaScale) return bad;
       if (elst.start + 8 > elst.end) return bad;
       const v = b[elst.start]!;
       if (v > 1) return bad;
@@ -264,7 +280,14 @@ export function mp4Timeline(file: string): Mp4Timeline {
       if (media.length !== 1 || media[0]!.media < 0 || media[0]!.rate !== 1 || media[0]!.fraction !== 0)
         return { ok: false, reason: "unsupported" };
       const leadSec = (lead?.duration ?? 0) / scale;
-      found[kind] = { edited: true, lead: leadSec, end: leadSec + media[0]!.duration / scale };
+      // A media edit of length 0: in a fragmented file "to its end" (the decoded end decides); else nothing to show.
+      if (media[0]!.duration === 0 && !fragmented) return { ok: false, reason: "unsupported" };
+      found[kind] = {
+        edited: true,
+        lead: leadSec,
+        mediaTime: media[0]!.media / mediaScale,
+        end: media[0]!.duration === 0 ? null : leadSec + media[0]!.duration / scale,
+      };
     }
     return { ok: true, ...found };
   } catch {
@@ -345,14 +368,19 @@ export function judgeInput(
           ? (Number.isFinite(a.start_time) ? a.start_time! : 0) + a.duration!
           : null;
   const videoEndSec = mov && v && tv?.edited ? tv.end : null;
-  // Review r5: an MP4/MOV's presentation 0 on its `-copyts` timeline. A track with an edit list starts at the movie's 0
-  // (its lead stays, as nothing); one without starts at its first sample (a reorder delay without an edit list is no
-  // gap) — the earliest of them.
-  const firsts = [
-    ...(v ? [tv?.edited ? 0 : Number.isFinite(v.start_time) ? v.start_time! : 0] : []),
-    ...(a ? [ta?.edited ? 0 : Number.isFinite(a.start_time) ? a.start_time! : 0] : []),
-  ];
-  const originSec = mov && firsts.length ? Math.max(0, Math.min(...firsts)) : 0;
+  // Review r7: the files are read with their edit lists ignored (`-ignore_editlist`, so that no sample is dropped) and
+  // mapped here: a track's media time m is shown at lead + (m − its edit's media time).
+  const videoShiftSec = mov && tv?.edited ? tv.lead - tv.mediaTime : 0;
+  const audioShiftSec = mov && ta?.edited ? ta.lead - ta.mediaTime : 0;
+  const videoLeadSec = mov && tv?.edited ? tv.lead : 0;
+  const audioLeadSec = mov && ta?.edited ? ta.lead : 0;
+  // An MP4/MOV's presentation 0 on its `-copyts` timeline (reviews r5, r7). With an edit list on any of its tracks: the
+  // movie's 0 (each track mapped by its own edit). Without any: its first picture's time when it has one (a reorder
+  // delay without an edit list is no gap — sound before that first picture, at most that delay, is not presented),
+  // else its sound's first sample.
+  const anyEdited = !!tv?.edited || !!ta?.edited;
+  const first = (x: typeof v) => (x && Number.isFinite(x.start_time) ? x.start_time! : 0);
+  const originSec = !mov || anyEdited ? 0 : Math.max(0, v ? first(v) : a ? first(a) : 0);
 
   if (kind === "image") {
     if (!v || !side(v.width) || !side(v.height)) return { ok: false, reason: "unreadable" };
@@ -385,6 +413,10 @@ export function judgeInput(
         audioSec,
         audioEndSec,
         videoEndSec,
+        videoShiftSec,
+        audioShiftSec,
+        videoLeadSec,
+        audioLeadSec,
         originSec,
         width: v?.width ?? null,
         height: v?.height ?? null,
@@ -400,6 +432,8 @@ export function judgeInput(
       durationSec: duration,
       audioSec,
       audioEndSec,
+      audioShiftSec,
+      audioLeadSec,
       originSec,
       hasVideo: false,
       hasAudio: true,
@@ -698,6 +732,9 @@ export function sandboxedComposer(o: {
           capSec: u.cap,
           soundEndSec: info.audioEndSec ?? null,
           originSec: info.originSec ?? 0,
+          soundShiftSec: info.audioShiftSec ?? 0,
+          soundLeadSec: info.audioLeadSec ?? 0,
+          pictureShiftSec: info.videoShiftSec ?? 0,
         }),
         0,
         0,
