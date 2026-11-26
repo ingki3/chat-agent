@@ -889,11 +889,15 @@ export class VideoJobs {
       const held = refusalOf(e instanceof MediaHttpError ? e.status : 0);
       if (held?.kind === "refusal") {
         // Refused here before sending (-1), or by OpenRouter with a 4xx (not billed): recorded with its bound
-        // released — or, should the writes fail, held: this work's end hands it over (`handOver`).
+        // released — or, should the writes fail, held: this work's end hands it over (`handOver`). While the engine
+        // stops nothing is written here: the stop's flush does it within its budget.
         this.hold(id, held);
+        if (this.stopping) return undefined;
         return this.finish(id, held.code, { held }) ?? this.get(id);
       }
-      // No answer, a timeout or a 5xx: it may have started and may bill — never sent again, its bound stays.
+      // No answer, a timeout or a 5xx: it may have started and may bill — never sent again, its bound stays (while
+      // stopping, the next start's rule says the same: a `submitting` row not under way is `video_unconfirmed`).
+      if (this.stopping) return undefined;
       return this.finish(id, "video_unconfirmed") ?? this.get(id);
     }
     let remote: string | null;
@@ -904,10 +908,11 @@ export class VideoJobs {
     } catch {
       remote = null;
     }
-    if (!remote) return this.finish(id, "video_unconfirmed") ?? this.get(id);
+    if (!remote) return this.stopping ? undefined : (this.finish(id, "video_unconfirmed") ?? this.get(id));
     // The id is what lets the job be followed: held the moment it is read, then written — should that fail, this
-    // work's end hands it over (`handOver`: retried, or the stop's flush).
+    // work's end hands it over (`handOver`: retried, or the stop's flush). While stopping, only the flush writes.
     this.hold(id, { kind: "accepted", remoteId: remote });
+    if (this.stopping) return undefined;
     try {
       return this.accept(id, remote) ?? this.get(id);
     } catch {
@@ -1060,46 +1065,67 @@ export class VideoJobs {
     this.stopping = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
-    // One absolute budget for the whole stop (review r9): the wait for submits and the final flush both use it.
+    // One absolute budget for the whole stop: the wait for submits and the final flush both use it.
     const until = Date.now() + STOP_BUDGET_MS;
     const left = () => Math.max(0, until - Date.now());
-    // Polls, downloads and retry waits stop now; a submit under way finishes its answer's handling (an outcome it
-    // receives meanwhile is held, then handed over).
+    // Polls, downloads and retry waits stop now. A submit under way only finishes reading its answer: from here on it
+    // writes nothing (review r10) — an outcome it receives is held and handed over to the flush below.
     for (const w of this.inflight.values()) if (w.kind !== "submit") w.stop.abort();
-    // The last part of the budget is kept for the flush below.
     await Promise.race([
       Promise.all([...this.inflight.values()].map((w) => w.done)),
       new Promise<void>((r) => setTimeout(r, Math.max(0, left() - STOP_FLUSH_MS)).unref()),
     ]);
-    // The final flush: every held outcome — handed over by ended work, or still held — until the row reflects it, with
-    // short waits, within what is left of the budget; each write waits on a lock at most that long (busy timeout).
-    const held = new Map(this.handedOver);
-    for (const [id, w] of this.inflight) if (w.held) held.set(id, w.held);
+    // The final flush, until the budget ends: every outcome held — handed over by ended work, or still held by work
+    // under way — collected again on every round (one that arrived late included), written with the lock wait cut to
+    // the time left (that one write only), and let go only once its row reflects it.
+    const unrecorded = new Set<string>();
+    const round = () => {
+      const held = new Map(this.handedOver);
+      for (const [id, w] of this.inflight) if (w.held) held.set(id, w.held);
+      unrecorded.clear();
+      for (const [id, h] of held) {
+        if (left() <= 0) {
+          unrecorded.add(id);
+          continue;
+        }
+        let recorded: boolean;
+        try {
+          recorded = this.withLockWait(left(), () => this.recordHeld(id, h));
+        } catch {
+          recorded = false;
+        }
+        if (recorded) this.handedOver.delete(id);
+        else unrecorded.add(id);
+      }
+    };
+    const submitting = () => [...this.inflight.values()].some((w) => w.kind === "submit");
+    for (;;) {
+      round();
+      if (left() <= 0 || (!unrecorded.size && !submitting())) break;
+      await new Promise<void>((r) => setTimeout(r, Math.min(200, left())).unref());
+    }
+    // Still not recorded (the database not writable through the shutdown): the next start ends these jobs by the
+    // rows' own rule (bound kept) — said in the log (the job's id only).
+    for (const id of unrecorded) logEvent(this.o.log, "warn", "video.held_lost", { videoJobId: id });
+    for (const w of this.inflight.values()) w.stop.abort();
+    for (const close of [...this.streams]) close();
+  }
+
+  /**
+   * One synchronous write with SQLite's lock wait cut to `ms` (review r10): set right before it and put back in its
+   * own `finally` — never across an `await`, so other writers on the shared connection keep the usual wait.
+   */
+  private withLockWait<T>(ms: number, fn: () => T): T {
     const sqlite = this.o.db.$client;
     let busy: number | undefined;
     try {
       busy = Number(sqlite.pragma("busy_timeout", { simple: true })) || 0;
+      sqlite.pragma(`busy_timeout = ${Math.max(1, Math.min(busy || 5000, Math.ceil(ms)))}`);
     } catch {
       busy = undefined;
     }
     try {
-      while (held.size && left() > 0) {
-        for (const [id, h] of held) {
-          if (left() <= 0) break;
-          try {
-            if (busy !== undefined)
-              sqlite.pragma(`busy_timeout = ${Math.min(busy || 5000, Math.ceil(left()))}`);
-            if (this.recordHeld(id, h)) {
-              held.delete(id);
-              this.handedOver.delete(id);
-            }
-          } catch {
-            // tried again below
-          }
-        }
-        if (held.size && left() > 0)
-          await new Promise<void>((r) => setTimeout(r, Math.min(200, left())).unref());
-      }
+      return fn();
     } finally {
       if (busy !== undefined)
         try {
@@ -1108,11 +1134,6 @@ export class VideoJobs {
           // the database is going anyway
         }
     }
-    // Still not recorded (the database not writable through the shutdown): the next start ends these jobs by the
-    // rows' own rule (bound kept) — said in the log (the job's id only).
-    for (const id of held.keys()) logEvent(this.o.log, "warn", "video.held_lost", { videoJobId: id });
-    for (const w of this.inflight.values()) w.stop.abort();
-    for (const close of [...this.streams]) close();
   }
 
   /** Every job's work under way here, ended (tests). */

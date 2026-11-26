@@ -13,7 +13,7 @@ import {
 import { MEDIA_TOOLS, VIDEO_GENERATE_TOOL } from "@agentlee/mcp-tools/media";
 import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
-import { createTestDb } from "../src/db/client.js";
+import { createTestDb, openDb, runMigrations } from "../src/db/client.js";
 import { compose } from "../src/notifications/compose.js";
 import { videoCostBound, videoPricing } from "../src/media/cost.js";
 import { FIXTURE_OPENROUTER_KEY_PREFIX, fixtureMp4, fixtureOpenRouterFetch } from "../src/media/fixture.js";
@@ -158,12 +158,21 @@ async function start(
     engine?: boolean;
     limits?: ConstructorParameters<typeof VideoJobs>[0]["limits"];
     clock?: { t: number };
+    /** A database file (WAL) instead of the in-memory one — a second connection can then hold its lock. */
+    dbFile?: boolean;
   } = {},
 ) {
   const dataDir = path.join(tmp(), "data");
   const registry = new RuntimeRegistry();
   registry.register(new FakeRuntime({ runTools: true }));
-  const db = createTestDb();
+  const db = o.dbFile
+    ? (() => {
+        const d = openDb(path.join(tmp(), "state.sqlite"));
+        runMigrations(d);
+        closers.push(() => d.$client.close());
+        return d;
+      })()
+    : createTestDb();
   const server = o.server ?? fakeServer();
   const clock = o.clock;
   const app = await buildApp(
@@ -2662,8 +2671,7 @@ describe("video jobs — review r9 regressions (outcomes held at once; one stop 
     expect(server.posts()).toHaveLength(1);
   });
 
-  it("3: a stop under a held database lock returns within its one budget", async () => {
-    const DatabaseCtor = (await import("better-sqlite3")).default;
+  it("3 (memory): a stop with a submit still waiting returns within its one budget and records a held id", async () => {
     let unblock: ((r: Response) => void) | undefined;
     const server = fakeServer({
       submit: (_b, n) =>
@@ -2681,26 +2689,214 @@ describe("video jobs — review r9 regressions (outcomes held at once; one stop 
     );
     await t.approve(second.jobId, 0);
     t.db.$client.exec("DROP TRIGGER r9_once");
-    if (!t.db.$client.name || t.db.$client.memory) {
-      // An in-memory test database has no second connection to hold its lock: the budget is checked without it.
-      const before = Date.now();
-      await t.video.stop();
-      expect(Date.now() - before).toBeLessThan(11_500);
-    } else {
-      const writer = new DatabaseCtor(t.db.$client.name);
-      writer.exec("BEGIN IMMEDIATE");
-      try {
-        const before = Date.now();
-        await t.video.stop();
-        expect(Date.now() - before).toBeLessThan(11_500);
-      } finally {
-        writer.exec("ROLLBACK");
-        writer.close();
-      }
-    }
-    // The flush had its part of the budget: the second job's accepted id is recorded.
+    const before = Date.now();
+    await t.video.stop();
+    expect(Date.now() - before).toBeLessThan(11_500);
     expect(t.job(second.jobId)).toMatchObject({ status: "pending", remoteId: rid(2) });
     unblock!(new Response(null, { status: 503 }));
     await a;
   }, 30_000);
+});
+
+// ---------------------------------------------------------------- review round 10 (#255)
+
+describe("video jobs — review r10 regressions (a closed shutdown path)", () => {
+  const lockWith = async (t: Awaited<ReturnType<typeof start>>) => {
+    const DatabaseCtor = (await import("better-sqlite3")).default;
+    const writer = new DatabaseCtor(t.db.$client.name);
+    writer.exec("BEGIN IMMEDIATE");
+    let released = false;
+    return {
+      release: () => {
+        if (released) return;
+        released = true;
+        writer.exec("ROLLBACK");
+        writer.close();
+      },
+    };
+  };
+  const restart = (t: Awaited<ReturnType<typeof start>>) => {
+    const next = new VideoJobs({
+      db: t.db,
+      files: () => t.app.files,
+      conversations: t.app.conversations!,
+      keys: t.app.media!.keys,
+      settings: t.app.media!.settings,
+      budget: t.app.media!.budget,
+      usage: t.app.usageStore,
+      users: t.app.users!,
+      notifications: () => t.app.notifications,
+      probe: () => fixtureVideoProbe(),
+      dataDir: t.dataDir,
+      fetchImpl: t.server.fetchImpl,
+      limits: { tickMs: 3_600_000 },
+    });
+    next.start();
+    closers.push(() => next.stop());
+    return next;
+  };
+
+  it("1: an accepted id that arrives during the flush is collected again and recorded", async () => {
+    let sendLate!: (res: Response) => void;
+    const server = fakeServer({
+      submit: (_, n) =>
+        n === 1
+          ? Response.json({ id: rid(1) }, { status: 202 })
+          : new Promise<Response>((resolve) => (sendLate = resolve)),
+    });
+    const t = await start({ server, limits: { retryMs: 30_000 } });
+    const a = await t.card();
+    const b = await t.card();
+    let triesA = 0;
+    let triesB = 0;
+    t.db.$client.function("r10_fault", (id: unknown) => {
+      if (id === a.jobId) {
+        triesA++;
+        if (triesA === 2) queueMicrotask(() => sendLate(Response.json({ id: rid(2) }, { status: 202 })));
+        if (triesA <= 2) throw new Error("transient A");
+      }
+      if (id === b.jobId && ++triesB === 1) throw new Error("transient B");
+      return 0;
+    });
+    t.db.$client.exec(
+      "CREATE TRIGGER r10_few BEFORE UPDATE OF remote_id ON video_jobs BEGIN SELECT r10_fault(NEW.id); END",
+    );
+    await t.approve(a.jobId, 0);
+    const second = t.approve(b.jobId, 0);
+    await vi.waitFor(() => expect(sendLate).toBeDefined());
+    const before = t.db.$client.pragma("busy_timeout", { simple: true });
+    await Promise.all([t.video.stop(), second]);
+    t.db.$client.exec("DROP TRIGGER r10_few");
+    expect(t.job(a.jobId).remoteId).toBe(rid(1));
+    expect(t.job(b.jobId)).toMatchObject({ status: "pending", remoteId: rid(2) });
+    expect(triesB).toBeGreaterThanOrEqual(2);
+    expect(t.db.$client.pragma("busy_timeout", { simple: true })).toBe(before);
+  });
+
+  it("2: answers that arrive while stopping are written by the flush only — the budget holds under a held lock", async () => {
+    let sendA!: (r: Response) => void;
+    let sendB!: (r: Response) => void;
+    let n = 0;
+    const server = fakeServer({
+      submit: () => new Promise<Response>((r) => (++n === 1 ? (sendA = r) : (sendB = r))),
+    });
+    const t = await start({ server, dbFile: true, limits: { retryMs: 30_000 } });
+    const a = await t.card();
+    const b = await t.card();
+    const first = t.approve(a.jobId, 0);
+    await vi.waitFor(() => expect(sendA).toBeDefined());
+    const second = t.approve(b.jobId, 0);
+    await vi.waitFor(() => expect(sendB).toBeDefined());
+    const lock = await lockWith(t);
+    try {
+      const started = Date.now();
+      const stop = t.video.stop();
+      setTimeout(() => {
+        sendA(Response.json({ id: rid(1) }, { status: 202 }));
+        sendB(Response.json({ id: rid(2) }, { status: 202 }));
+      }, 6300);
+      await stop;
+      expect(Date.now() - started).toBeLessThan(11_500);
+    } finally {
+      lock.release();
+      await Promise.all([first, second]);
+    }
+  }, 30_000);
+
+  it("3: the shortened lock wait is put back after each write — never across the flush's waits", async () => {
+    const t = await start({ dbFile: true, limits: { retryMs: 30_000 } });
+    const { jobId } = await t.card();
+    t.db.$client.exec(
+      "CREATE TRIGGER r10_block BEFORE UPDATE OF remote_id ON video_jobs WHEN NEW.remote_id IS NOT NULL BEGIN SELECT RAISE(ABORT,'temporary'); END",
+    );
+    await t.approve(jobId, 0);
+    const original = t.db.$client.pragma("busy_timeout", { simple: true });
+    const seen: unknown[] = [];
+    const probe = setInterval(() => seen.push(t.db.$client.pragma("busy_timeout", { simple: true })), 150);
+    try {
+      await t.video.stop();
+    } finally {
+      clearInterval(probe);
+      t.db.$client.exec("DROP TRIGGER r10_block");
+    }
+    expect(seen.length).toBeGreaterThan(0);
+    expect(new Set(seen)).toEqual(new Set([original]));
+  }, 30_000);
+
+  it("4 (file): a lock released within the budget lets the flush record the held id", async () => {
+    let unblock: ((r: Response) => void) | undefined;
+    const server = fakeServer({
+      submit: (_b, n) =>
+        n === 1
+          ? new Promise<Response>((resolve) => (unblock = resolve))
+          : Response.json({ id: rid(n) }, { status: 202 }),
+    });
+    const t = await start({ server, dbFile: true, limits: { retryMs: 30_000 } });
+    const first = await t.card();
+    const second = await t.card();
+    const a = t.approve(first.jobId, 0);
+    await vi.waitFor(() => expect(unblock).toBeDefined());
+    t.db.$client.exec(
+      "CREATE TRIGGER r10_once BEFORE UPDATE OF remote_id ON video_jobs BEGIN SELECT RAISE(ABORT,'temporary'); END",
+    );
+    await t.approve(second.jobId, 0);
+    t.db.$client.exec("DROP TRIGGER r10_once");
+    const lock = await lockWith(t);
+    // Released within the budget, while the stop waits for the submit still under way (the lock's holder is in this
+    // process here: a synchronous write waiting on it would also hold up its release).
+    setTimeout(() => lock.release(), 4000);
+    try {
+      const before = Date.now();
+      await t.video.stop();
+      expect(Date.now() - before).toBeLessThan(11_500);
+      expect(t.job(second.jobId)).toMatchObject({ status: "pending", remoteId: rid(2) });
+    } finally {
+      lock.release();
+      unblock!(new Response(null, { status: 503 }));
+      await a;
+    }
+  }, 30_000);
+
+  it("4 (file): a lock held throughout: the stop keeps its budget, says so, and the next start ends the job (bound kept)", async () => {
+    let unblock: ((r: Response) => void) | undefined;
+    const server = fakeServer({
+      submit: (_b, n) =>
+        n === 1
+          ? new Promise<Response>((resolve) => (unblock = resolve))
+          : Response.json({ id: rid(n) }, { status: 202 }),
+    });
+    const t = await start({ server, dbFile: true, limits: { retryMs: 30_000 } });
+    const first = await t.card();
+    const second = await t.card();
+    const a = t.approve(first.jobId, 0);
+    await vi.waitFor(() => expect(unblock).toBeDefined());
+    t.db.$client.exec(
+      "CREATE TRIGGER r10_once BEFORE UPDATE OF remote_id ON video_jobs BEGIN SELECT RAISE(ABORT,'temporary'); END",
+    );
+    await t.approve(second.jobId, 0);
+    t.db.$client.exec("DROP TRIGGER r10_once");
+    const lines: unknown[] = [];
+    const log = vi
+      .spyOn(t.app.log, "warn")
+      .mockImplementation(((...x: unknown[]) => void lines.push(x)) as never);
+    const lock = await lockWith(t);
+    try {
+      const before = Date.now();
+      await t.video.stop();
+      expect(Date.now() - before).toBeLessThan(11_500);
+      expect(JSON.stringify(lines)).toContain("video.held_lost");
+    } finally {
+      log.mockRestore();
+      lock.release();
+      unblock!(new Response(null, { status: 503 }));
+      await a;
+    }
+    expect(t.job(second.jobId)).toMatchObject({ status: "submitting", remoteId: null });
+    const next = restart(t);
+    await next.tick();
+    expect(next.get(second.jobId)).toMatchObject({ status: "failed", errorCode: "video_unconfirmed" });
+    expect(t.usage().find((u) => u.run_id === t.job(second.jobId).usageKey)).toMatchObject({
+      s: "unconfirmed",
+    });
+  }, 40_000);
 });
