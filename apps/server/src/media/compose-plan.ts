@@ -84,6 +84,8 @@ export type InputInfo = {
    * there is nothing to take away; never negative (a preroll before 0 is cut).
    */
   originSec?: number;
+  /** Re-plan 2: an MP4/MOV picture track with an edit list ends here on the `-copyts` timeline (its media edit's end). */
+  videoEndSec?: number | null;
   hasVideo: boolean;
   hasAudio: boolean;
   width: number | null;
@@ -104,6 +106,8 @@ export type PlanClip = {
   hasAudio: boolean;
   /** Its input's presentation 0 on the `-copyts` timeline (`InputInfo.originSec`). */
   origin?: number;
+  /** Re-plan 2: where its picture's presentation ends, from that 0 (an edit list's media edit end) — nothing after. */
+  pictureEnd?: number | null;
   /**
    * Review r1: frames at its end that only hold its last picture (the last clip, held for the narration) — a Ken
    * Burns move ends at the clip's own length, then holds.
@@ -342,6 +346,7 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
       volume: c.volume ?? 1,
       hasAudio: info.hasAudio,
       origin: info.originSec ?? 0,
+      pictureEnd: info.videoEndSec != null ? info.videoEndSec - (info.originSec ?? 0) : null,
       head: 0,
       tail: 0,
       transition: null,
@@ -688,7 +693,11 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
     // The canvas is the output's size (no frame of the source is kept for its size — review r5: a reference branch
     // buffered every frame before the start); the picture is fitted to it first, its alpha kept for the overlay.
     picture =
-      `[0:v]setpts=PTS-${num((c.origin ?? 0) + c.startSec)}/TB,${square},${fit(W, H)},setsar=1,format=yuva420p[src];` +
+      // Fine timebase first (re-plan 2: a 1 s MOV timescale would round the shift), then the shift; a picture with an
+      // edit list stops at its presentation's end (its last frame then holds).
+      `[0:v]settb=AVTB,setpts=PTS-${num((c.origin ?? 0) + c.startSec)}/TB,` +
+      `${c.pictureEnd != null ? `trim=end=${num(Math.max(1e-6, c.pictureEnd - c.startSec))},` : ""}` +
+      `${square},${fit(W, H)},setsar=1,format=yuva420p[src];` +
       `color=c=black:s=${W}x${H}:r=${FPS},format=yuv420p[canvas];` +
       `[canvas][src]overlay=eof_action=repeat:repeatlast=1,trim=end_frame=${own},setpts=N,` +
       `format=yuv420p,tpad=stop_mode=clone:stop=-1,${exact}`;
@@ -767,8 +776,8 @@ export function ingestArgs(o: {
   originSec?: number;
 }): string[] {
   const o0 = o.originSec ?? 0;
-  const shiftA = o0 > 0 ? `asetpts=PTS-${num(o0)}/TB,` : "";
-  const shiftV = o0 > 0 ? `setpts=PTS-${num(o0)}/TB,` : "";
+  const shiftA = o0 > 0 ? `asettb=AVTB,asetpts=PTS-${num(o0)}/TB,` : "";
+  const shiftV = o0 > 0 ? `settb=AVTB,setpts=PTS-${num(o0)}/TB,` : "";
   const cap = num(Math.max(1, o.capSec));
   return [
     ...FF_COMMON,
@@ -870,7 +879,7 @@ export function audioArgs(plan: Plan, o: { narration: boolean; music: string | n
   graph.push(
     mix.length === 1
       ? `${mix[0]}${tail}`
-      : `${mix.join("")}amix=inputs=${mix.length}:normalize=0:duration=first:dropout_transition=0,${tail}`,
+      : `${mix.join("")}amix=inputs=${mix.length}:normalize=0:duration=longest:dropout_transition=0,${tail}`,
   );
   return [
     ...FF_COMMON,

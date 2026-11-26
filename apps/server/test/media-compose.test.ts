@@ -43,7 +43,7 @@ import {
   judgeInput,
   judgeResult,
   mixPcm,
-  mp4EmptyLeads,
+  mp4Timeline,
   sandboxedComposer,
   type Composer,
   type ComposeOutcome,
@@ -1546,7 +1546,7 @@ describe("review r2: the plan (pure)", () => {
     expect(a).not.toContain("-noaccurate_seek");
     const g = a[a.indexOf("-filter_complex") + 1]!;
     // The canvas starts at the trim's start (review r5): the source shifted by it, then 30 frames.
-    expect(g).toContain("[0:v]setpts=PTS-2/TB,");
+    expect(g).toContain("[0:v]settb=AVTB,setpts=PTS-2/TB,");
     expect(g).toContain("overlay=eof_action=repeat:repeatlast=1,trim=end_frame=30,");
     // The picture only: its sound is a slice of the input's decoded PCM.
     expect(g).not.toContain("[0:a");
@@ -1711,6 +1711,72 @@ function inputsOrFake() {
 }
 
 // ---------------------------------------------------------------- the real ffmpeg, in the sandbox
+
+/** Re-plan 2 test helpers: an MP4's boxes found and rewritten in place (the edit list of its first picture track). */
+function boxesOf(b: Buffer, from: number, to: number) {
+  const out: { type: string; at: number; start: number; end: number }[] = [];
+  for (let at = from; at + 8 <= to;) {
+    let len = b.readUInt32BE(at);
+    let hdr = 8;
+    if (len === 1) {
+      len = Number(b.readBigUInt64BE(at + 8));
+      hdr = 16;
+    } else if (len === 0) len = to - at;
+    out.push({ type: b.toString("latin1", at + 4, at + 8), at, start: at + hdr, end: at + len });
+    at += len;
+  }
+  return out;
+}
+/** Where the first picture track's `elst` entries start in `b` (version 0), and how many there are. */
+function videoElst(b: Buffer): { entries: number; count: number } {
+  const moov = boxesOf(b, 0, b.length).find((x) => x.type === "moov")!;
+  for (const trak of boxesOf(b, moov.start, moov.end).filter((x) => x.type === "trak")) {
+    const kids = boxesOf(b, trak.start, trak.end);
+    const mdia = kids.find((x) => x.type === "mdia")!;
+    const hdlr = boxesOf(b, mdia.start, mdia.end).find((x) => x.type === "hdlr")!;
+    if (b.toString("latin1", hdlr.start + 8, hdlr.start + 12) !== "vide") continue;
+    const edts = kids.find((x) => x.type === "edts")!;
+    const elst = boxesOf(b, edts.start, edts.end).find((x) => x.type === "elst")!;
+    if (b[elst.start] !== 0) throw new Error("elst version 1");
+    return { entries: elst.start + 8, count: b.readUInt32BE(elst.start + 4) };
+  }
+  throw new Error("no picture track");
+}
+/** A copy of `src` whose first picture track's edit list entries are rewritten by `edit` (same count). */
+function rewriteElst(
+  src: string,
+  out: string,
+  edit: (
+    e: { duration: number; media: number; rate: number }[],
+  ) => { duration: number; media: number; rate: number }[],
+) {
+  const b = Buffer.from(fs.readFileSync(src));
+  const { entries, count } = videoElst(b);
+  const now = Array.from({ length: count }, (_, k) => ({
+    duration: b.readUInt32BE(entries + k * 12),
+    media: b.readInt32BE(entries + k * 12 + 4),
+    rate: b.readInt16BE(entries + k * 12 + 8),
+  }));
+  const next = edit(now);
+  if (next.length !== count) throw new Error("same count only");
+  next.forEach((e, k) => {
+    b.writeUInt32BE(e.duration, entries + k * 12);
+    b.writeInt32BE(e.media, entries + k * 12 + 4);
+    b.writeInt16BE(e.rate, entries + k * 12 + 8);
+  });
+  fs.writeFileSync(out, b);
+}
+/** A copy of `src` (its `moov` last) whose `moov` header is the 16-byte (64-bit size) form. */
+function bigMoov(src: string, out: string) {
+  const b = fs.readFileSync(src);
+  const moov = boxesOf(b, 0, b.length).find((x) => x.type === "moov")!;
+  if (moov.end !== b.length || moov.start - moov.at !== 8) throw new Error("moov not last");
+  const head = Buffer.alloc(16);
+  head.writeUInt32BE(1, 0);
+  head.write("moov", 4, "latin1");
+  head.writeBigUInt64BE(BigInt(moov.end - moov.at + 8), 8);
+  fs.writeFileSync(out, Buffer.concat([b.subarray(0, moov.at), head, b.subarray(moov.start)]));
+}
 
 describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", () => {
   const real = (d: string) => sandboxedComposer({ dataDir: d, ffmpegPath: FFMPEG });
@@ -2481,9 +2547,17 @@ describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", 
   // ---- review r5, with the real ffmpeg
   it("review r5: one presentation timeline — a B-frame MP4 without an edit list starts at its first picture", async () => {
     const m = inputs();
-    // The explicit empty edit is read from the file's own boxes; a reorder delay has none.
-    expect(mp4EmptyLeads(m.edit)).toEqual({ video: 3.5, audio: expect.closeTo(3.478, 3) });
-    expect(mp4EmptyLeads(m.noel)).toEqual({ video: 0, audio: 0 });
+    // The explicit empty edit is read from the file's own boxes; a reorder delay without an edit list is none.
+    expect(mp4Timeline(m.edit)).toMatchObject({
+      ok: true,
+      video: { edited: true, lead: 3.5 },
+      audio: { edited: true, lead: expect.closeTo(3.478, 3) },
+    });
+    expect(mp4Timeline(m.noel)).toEqual({
+      ok: true,
+      video: { edited: false, lead: 0, end: null },
+      audio: null,
+    });
     const t = await start({ composer: real });
     const s1 = await t.scopeOf();
     const f = await t.putFile(s1, m.noel, "mp4");
@@ -2670,6 +2744,133 @@ describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", 
       code: "compose_input_animated",
       hint: MEDIA_TOOL_HINTS.compose_input_animated,
     });
+  });
+
+  // ---- re-plan 2 (review r6), with the real ffmpeg
+  it("re-plan 2: edit lists this server does not present are refused at the call (compose_input_edited)", async () => {
+    const dir = tmp();
+    const m = inputs();
+    // edit.mp4's picture track: [empty 3.5 s, media 2 s] — taken. Its variants are not.
+    expect(mp4Timeline(m.edit)).toMatchObject({ ok: true, video: { edited: true, lead: 3.5, end: 5.5 } });
+    expect(mp4Timeline(m.noel)).toMatchObject({ ok: true, video: { edited: false, end: null } });
+    const shapes: Record<string, (e: { duration: number; media: number; rate: number }[]) => typeof e> = {
+      // two media edits
+      twoMedia: (e) => [{ ...e[0]!, media: 0 }, e[1]!],
+      // an empty edit after the media
+      emptyAfter: (e) => [{ ...e[1]! }, { ...e[0]! }],
+      // played at rate 2
+      rate2: (e) => [e[0]!, { ...e[1]!, rate: 2 }],
+    };
+    const t = await start({ composer: real });
+    for (const [name, edit] of Object.entries(shapes)) {
+      const file = path.join(dir, `${name}.mp4`);
+      rewriteElst(m.edit, file, edit);
+      expect([name, mp4Timeline(file)]).toEqual([name, { ok: false, reason: "unsupported" }]);
+      const s = await t.scopeOf();
+      const f = await t.putFile(s, file, "mp4");
+      expect(await t.call(s, { clips: [{ fileId: f }] })).toMatchObject({
+        ok: false,
+        code: "compose_input_edited",
+        hint: MEDIA_TOOL_HINTS.compose_input_edited,
+      });
+    }
+    // A box that does not add up: unparsable, refused the same way.
+    const broken = path.join(dir, "broken.mp4");
+    const b = Buffer.from(fs.readFileSync(m.edit));
+    const { entries } = videoElst(b);
+    b.writeUInt32BE(0xffff, entries - 4); // the entry count, far past the box
+    fs.writeFileSync(broken, b);
+    expect(mp4Timeline(broken)).toEqual({ ok: false, reason: "unparsable" });
+  });
+
+  it("re-plan 2: a 64-bit moov header is read like the usual one (its empty edit kept: 5.5 s)", async () => {
+    const big = path.join(tmp(), "big.mp4");
+    bigMoov(inputs().edit, big);
+    expect(mp4Timeline(big)).toMatchObject({ ok: true, video: { lead: 3.5, end: 5.5 } });
+    const t = await start({ composer: real });
+    const s1 = await t.scopeOf();
+    const f = await t.putFile(s1, big, "mp4");
+    const out = await composeOne(t, s1, { clips: [{ fileId: f }] });
+    expect(Number(probeJson(out).streams.find((x) => x.codec_type === "video")!.nb_read_packets)).toBe(165);
+    const c = colours(out);
+    expect(c[100]).toBe("black");
+    expect(c[110]).not.toBe("black");
+  });
+
+  it("re-plan 2: a picture is cut at its media edit's end (1.0 s of a longer track) — 299 s + 1 s is exactly 5 minutes", async () => {
+    const dir = tmp();
+    const src = path.join(dir, "long-last.mp4");
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "color=c=red:s=64x64:r=30:d=1.1"],
+      ...["-c:v", "libx264", "-bf", "2", "-pix_fmt", "yuv420p", src],
+    ]);
+    // Its edit says 1.000 s are presented (the frames after it, and a last frame's own duration, are not).
+    const cut = path.join(dir, "cut.mp4");
+    rewriteElst(src, cut, (e) => e.map((x) => ({ ...x, duration: 1000 })));
+    expect(mp4Timeline(cut)).toMatchObject({ ok: true, video: { end: 1 } });
+    const t = await start({ composer: real });
+    const s1 = await t.scopeOf();
+    const f = await t.putFile(s1, cut, "mp4");
+    const out = await composeOne(t, s1, { clips: [{ fileId: f }] });
+    expect(Number(probeJson(out).streams.find((x) => x.codec_type === "video")!.nb_read_packets)).toBe(30);
+    // 299 s of a still and this 1 s: exactly 300 s, made.
+    const s2 = await t.scopeOf();
+    const img = await t.putFile(s2, inputs().png, "png");
+    const f2 = await t.putFile(s2, cut, "mp4");
+    const id = await t.queue(s2, {
+      clips: [...Array.from({ length: 10 }, () => ({ fileId: img, durationSec: 29.9 })), { fileId: f2 }],
+    });
+    await t.drive();
+    expect(t.job(id)).toMatchObject({ status: "done", durationMs: 300_000 });
+  }, 600_000);
+
+  it("re-plan 2: a 1 fps MOV with timescale 1 — a trim at 0.4 s changes picture exactly at output frame 18", async () => {
+    const mov = path.join(tmp(), "ts1.mov");
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i"],
+      "nullsrc=s=64x64:r=1:d=3,format=rgb24,geq=r='if(lt(T\\,1)\\,255\\,0)':g=0:b='if(gte(T\\,1)\\,255\\,0)'",
+      ...["-c:v", "libx264", "-pix_fmt", "yuv420p", "-video_track_timescale", "1", mov],
+    ]);
+    const t = await start({ composer: real });
+    const s1 = await t.scopeOf();
+    const f = await t.putFile(s1, mov, "mp4");
+    const out = await composeOne(t, s1, { clips: [{ fileId: f, trim: { startSec: 0.4, endSec: 1.5 } }] });
+    const c = colours(out);
+    expect(c.slice(0, 18).every((x) => x === "red")).toBe(true);
+    expect(c.slice(18).every((x) => x === "blue")).toBe(true);
+  });
+
+  it("re-plan 2: a short continuous narration keeps its last 100 ms (5 runs)", async () => {
+    const wav = path.join(tmp(), "tone29.wav");
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "sine=f=440:r=48000:d=2.9"],
+      ...["-c:a", "pcm_s16le", "-ac", "2", wav],
+    ]);
+    const t = await start({ composer: real });
+    for (let k = 0; k < 5; k++) {
+      const s = await t.scopeOf();
+      const img = await t.putFile(s, inputs().png, "png");
+      const nar = await t.putFile(s, wav, "wav");
+      const out = await composeOne(t, s, {
+        clips: [{ fileId: img, durationSec: 2.9 }],
+        narration: [{ fileId: nar, startSec: 0 }],
+      });
+      expect([k, loudness(pcmOf(out), 2.8, 2.89) > 1000]).toEqual([k, true]);
+    }
+  });
+
+  it("re-plan 2: the card's VTT keeps a cue in a 31-frame video's last fraction (its end from the frames)", async () => {
+    const t = await start({ composer: real });
+    const s1 = await t.scopeOf();
+    const img = await t.putFile(s1, inputs().png, "png");
+    const id = await t.queue(s1, {
+      clips: [{ fileId: img, durationSec: 31 / 30 }],
+      subtitles: [{ startSec: 1.0331, endSec: 1.0332, text: "영상 끝" }],
+    });
+    await t.drive();
+    expect(t.job(id).status).toBe("done");
+    const vtt = (await t.api(t.f.cookies.owner, "GET", `/api/compose-jobs/${id}/subtitles.vtt`)).body;
+    expect(vtt).toContain("\n영상 끝\n");
   });
 
   it("readiness: a tiny composition checked in the same sandbox", async () => {

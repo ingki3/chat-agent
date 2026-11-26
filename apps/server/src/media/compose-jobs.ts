@@ -292,7 +292,12 @@ export class ComposeJobs {
       const t = ComposeTimeline.safeParse(scrubKnownDeep(JSON.parse(row.timelineJson) as unknown));
       if (!t.success || !t.data.subtitles?.length) return undefined;
       // A finished job's real length cuts the cues the same way its MP4 track was cut (`timedCues`).
-      return toVtt(t.data.subtitles, row.status === "done" ? row.durationMs / 1000 : undefined);
+      // Its exact end from its whole frames (re-plan 2: durationMs is rounded to a millisecond — a cue in the last
+      // fraction of a 31-frame video is inside it).
+      return toVtt(
+        t.data.subtitles,
+        row.status === "done" ? Math.round((row.durationMs * FPS) / 1000) / FPS : undefined,
+      );
     } catch {
       return undefined;
     }
@@ -698,7 +703,9 @@ export class ComposeJobs {
           ? new ToolError("compose_input_kind")
           : p.reason === "animated"
             ? new ToolError("compose_input_animated")
-            : new ToolError("compose_input_unreadable", `${f.id}: could not be read (${p.reason})`);
+            : p.reason === "edited"
+              ? new ToolError("compose_input_edited")
+              : new ToolError("compose_input_unreadable", `${f.id}: could not be read (${p.reason})`);
       infos.set(f.id, { ...p.info, fileId: f.id, name });
     }
     if (!this.get(id)) return new ToolError("media_cancelled");

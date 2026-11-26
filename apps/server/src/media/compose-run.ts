@@ -49,7 +49,7 @@ export type ComposeOutcome =
   { ok: true; file: string; bytes: number; plan: Plan } | { ok: false; code: ComposeJobCode };
 export type ProbeOutcome =
   | { ok: true; info: Omit<InputInfo, "fileId" | "name"> }
-  | { ok: false; reason: "unreadable" | "kind" | "failed" | "animated" };
+  | { ok: false; reason: "unreadable" | "kind" | "failed" | "animated" | "edited" };
 
 export type Composer = {
   /** A fresh job folder with `in/`, `work/` and `out/` (its name is the job's id). */
@@ -125,92 +125,150 @@ const Probe = z.object({
     .optional(),
 });
 
-/** Leading empty edits of an MP4/MOV's first picture and sound tracks, in seconds (`mp4EmptyLeads`). */
-export type EmptyLeads = { video: number; audio: number };
+/**
+ * One track's presentation as its edit list gives it (re-plan 2): `lead` — an explicit leading empty edit (seconds),
+ * `end` — where its one media edit ends on the movie's timeline (lead + that edit's duration); both null-free only
+ * with an edit list (`edited`). Without one the track's media timeline is its presentation (`lead` 0, `end` null).
+ */
+export type TrackTimeline = { edited: boolean; lead: number; end: number | null };
+/** The first picture and sound tracks' timelines, or why the file is not one this server takes (`compose_input_edited`). */
+export type Mp4Timeline =
+  | { ok: true; video: TrackTimeline | null; audio: TrackTimeline | null }
+  | { ok: false; reason: "unsupported" | "unparsable" };
+
+/** The box of an MP4/MOV: its type and where its contents start and end (its own header — 8 or 16 bytes — skipped). */
+type Box = { type: string; start: number; end: number };
 
 /**
- * An MP4/MOV's explicit leading empty edits (review r5), read from its own boxes — `moov/mvhd` (the movie's timescale)
- * and each `trak`'s handler (`vide`/`soun`) and edit list (`edts/elst`: the entries at its start whose media time is
- * −1). Box headers only, the `moov` box read whole when it is at most 32 MB; anything unexpected is no empty edit
- * (0) — ffmpeg's own reading of the file then decides, as before. Exported for tests.
+ * The boxes in `b[from, to)` (re-plan 2, item D): a 32-bit size, or 1 and a 64-bit size after the type (a 16-byte
+ * header), or 0 for "to the end of the parent"; a size shorter than its header or past the parent's end makes the whole
+ * file unparsable (null).
  */
-export function mp4EmptyLeads(file: string): EmptyLeads {
-  const none = { video: 0, audio: 0 };
+function children(b: Buffer, from: number, to: number): Box[] | null {
+  const out: Box[] = [];
+  let at = from;
+  while (at < to) {
+    if (at + 8 > to) return null;
+    let len = b.readUInt32BE(at);
+    let hdr = 8;
+    if (len === 1) {
+      if (at + 16 > to) return null;
+      const big = b.readBigUInt64BE(at + 8);
+      if (big > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+      len = Number(big);
+      hdr = 16;
+    } else if (len === 0) len = to - at;
+    if (len < hdr || at + len > to) return null;
+    out.push({ type: b.toString("latin1", at + 4, at + 8), start: at + hdr, end: at + len });
+    at += len;
+  }
+  return out;
+}
+
+/**
+ * An MP4/MOV's presentation timeline, read from its own boxes (re-plans r5–2): `moov/mvhd` (the movie's timescale) and,
+ * for the first `vide` and the first `soun` track (`trak/mdia/hdlr`), its edit list (`trak/edts/elst`). Taken (re-plan 2,
+ * item A): no edit list, or at most one leading empty edit (media time −1) followed by exactly one media edit played at
+ * rate 1 — anything else (an empty edit inside, several media edits, another rate) is `unsupported`, a box that does not
+ * add up `unparsable`. Box headers only; the `moov` box is read whole when it is at most 32 MB (a bigger one is
+ * `unparsable`). Exported for tests.
+ */
+export function mp4Timeline(file: string): Mp4Timeline {
+  const bad = { ok: false as const, reason: "unparsable" as const };
   let fd: number | undefined;
   try {
     fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     const size = fs.fstatSync(fd).size;
     const head = Buffer.alloc(16);
     let off = 0;
-    let moov: Buffer | undefined;
-    for (let n = 0; off + 8 <= size && n < 1000; n++) {
+    let moov: { buf: Buffer; hdr: number } | undefined;
+    for (let n = 0; off < size && n < 1000; n++) {
+      if (off + 8 > size) return bad;
       fs.readSync(fd, head, 0, 16, off);
       let len = head.readUInt32BE(0);
-      const type = head.toString("latin1", 4, 8);
-      if (len === 1) len = Number(head.readBigUInt64BE(8));
-      else if (len === 0) len = size - off;
-      if (len < 8 || off + len > size) return none;
-      if (type === "moov") {
-        if (len > 32 * 1024 * 1024) return none;
-        moov = Buffer.alloc(len);
-        fs.readSync(fd, moov, 0, len, off);
+      let hdr = 8;
+      if (len === 1) {
+        if (off + 16 > size) return bad;
+        len = Number(head.readBigUInt64BE(8));
+        hdr = 16;
+      } else if (len === 0) len = size - off;
+      if (len < hdr || off + len > size) return bad;
+      if (head.toString("latin1", 4, 8) === "moov") {
+        if (len > 32 * 1024 * 1024) return bad;
+        const buf = Buffer.alloc(len);
+        fs.readSync(fd, buf, 0, len, off);
+        moov = { buf, hdr };
         break;
       }
       off += len;
     }
-    if (!moov) return none;
-    const kids = function* (b: Buffer, from: number, to: number) {
-      let at = from;
-      while (at + 8 <= to) {
-        let len = b.readUInt32BE(at);
-        let hdr = 8;
-        if (len === 1) {
-          if (at + 16 > to) return;
-          len = Number(b.readBigUInt64BE(at + 8));
-          hdr = 16;
-        } else if (len === 0) len = to - at;
-        if (len < hdr || at + len > to) return;
-        yield { type: b.toString("latin1", at + 4, at + 8), start: at + hdr, end: at + len };
-        at += len;
-      }
-    };
+    if (!moov) return bad;
+    const b = moov.buf;
+    const top = children(b, moov.hdr, b.length);
+    if (!top) return bad;
     let scale = 0;
-    const leads: EmptyLeads = { video: 0, audio: 0 };
-    const seen = { video: false, audio: false };
-    for (const box of kids(moov, 8, moov.length)) {
+    const found: { video: TrackTimeline | null; audio: TrackTimeline | null } = { video: null, audio: null };
+    for (const box of top) {
       if (box.type === "mvhd") {
-        const v = moov[box.start]!;
-        scale = moov.readUInt32BE(box.start + (v === 1 ? 20 : 12));
+        if (box.start + 24 > box.end) return bad;
+        scale = b.readUInt32BE(box.start + (b[box.start] === 1 ? 20 : 12));
       }
+    }
+    if (!scale) return bad;
+    for (const box of top) {
       if (box.type !== "trak") continue;
+      const kids = children(b, box.start, box.end);
+      if (!kids) return bad;
       let handler = "";
-      let empty = 0;
-      for (const t of kids(moov, box.start, box.end)) {
-        if (t.type === "mdia")
-          for (const m of kids(moov, t.start, t.end))
-            if (m.type === "hdlr") handler = moov.toString("latin1", m.start + 8, m.start + 12);
-        if (t.type === "edts")
-          for (const e of kids(moov, t.start, t.end)) {
-            if (e.type !== "elst") continue;
-            const v = moov[e.start]!;
-            const count = moov.readUInt32BE(e.start + 4);
-            const size1 = v === 1 ? 20 : 12;
-            for (let k = 0, at = e.start + 8; k < count && at + size1 <= e.end; k++, at += size1) {
-              const dur = v === 1 ? Number(moov.readBigUInt64BE(at)) : moov.readUInt32BE(at);
-              const media = v === 1 ? Number(moov.readBigInt64BE(at + 8)) : moov.readInt32BE(at + 4);
-              if (media !== -1) break;
-              empty += dur;
+      let elst: Box | undefined;
+      for (const k of kids) {
+        if (k.type === "mdia") {
+          const m = children(b, k.start, k.end);
+          if (!m) return bad;
+          for (const h of m)
+            if (h.type === "hdlr") {
+              if (h.start + 12 > h.end) return bad;
+              handler = b.toString("latin1", h.start + 8, h.start + 12);
             }
-          }
+        }
+        if (k.type === "edts") {
+          const e = children(b, k.start, k.end);
+          if (!e) return bad;
+          elst = e.find((x) => x.type === "elst");
+        }
       }
       const kind = handler === "vide" ? "video" : handler === "soun" ? "audio" : null;
-      if (!kind || seen[kind] || !scale) continue;
-      seen[kind] = true;
-      leads[kind] = empty / scale;
+      if (!kind || found[kind]) continue;
+      if (!elst) {
+        found[kind] = { edited: false, lead: 0, end: null };
+        continue;
+      }
+      if (elst.start + 8 > elst.end) return bad;
+      const v = b[elst.start]!;
+      if (v > 1) return bad;
+      const count = b.readUInt32BE(elst.start + 4);
+      const each = v === 1 ? 20 : 12;
+      if (elst.start + 8 + count * each > elst.end) return bad;
+      const entries = Array.from({ length: count }, (_, k) => {
+        const at = elst!.start + 8 + k * each;
+        return {
+          duration: v === 1 ? Number(b.readBigUInt64BE(at)) : b.readUInt32BE(at),
+          media: v === 1 ? Number(b.readBigInt64BE(at + 8)) : b.readInt32BE(at + 4),
+          rate: b.readInt16BE(at + (v === 1 ? 16 : 8)),
+          fraction: b.readInt16BE(at + (v === 1 ? 18 : 10)),
+        };
+      });
+      // At most one leading empty edit, then exactly one media edit at rate 1.
+      const lead = entries[0]?.media === -1 ? entries[0] : undefined;
+      const media = entries.slice(lead ? 1 : 0);
+      if (media.length !== 1 || media[0]!.media < 0 || media[0]!.rate !== 1 || media[0]!.fraction !== 0)
+        return { ok: false, reason: "unsupported" };
+      const leadSec = (lead?.duration ?? 0) / scale;
+      found[kind] = { edited: true, lead: leadSec, end: leadSec + media[0]!.duration / scale };
     }
-    return leads;
+    return { ok: true, ...found };
   } catch {
-    return none;
+    return bad;
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
   }
@@ -235,12 +293,16 @@ export function isAnimatedWebp(file: string): boolean {
   }
 }
 
-/** ffprobe's report of an input judged (exported for tests); `leads`: an MP4/MOV's explicit leading empty edits. */
+/**
+ * ffprobe's report of an input judged (exported for tests); `timeline`: an MP4/MOV's presentation timeline
+ * (`mp4Timeline`) — its lead and its end decide the picture's and the sound's presentation (re-plan 2).
+ */
 export function judgeInput(
   stdout: string,
   fileKind: FileKind,
-  leads: EmptyLeads = { video: 0, audio: 0 },
+  timeline: Mp4Timeline = { ok: true, video: null, audio: null },
 ): ProbeOutcome {
+  if (!timeline.ok) return { ok: false, reason: "edited" };
   const kind = inputKindOf(fileKind);
   if (!kind) return { ok: false, reason: "kind" };
   let r: z.infer<typeof Probe>;
@@ -269,17 +331,28 @@ export function judgeInput(
       : duration;
   // Review r4: an MP4/MOV's sound track ends where its presentation timeline says (its edit list — exact): an AAC's
   // last frame decodes past it (padding). Read on the same timeline the ingest uses (`-copyts`).
+  const mov = DEMUXER[fileKind] === "mov";
+  const tv = timeline.video;
+  const ta = timeline.audio;
+  // Re-plan 2: a track with an edit list is presented on [lead, end) of the movie's timeline — its picture and its sound
+  // are cut at that end (not at its last frame's duration or its codec's padding). Without one, review r4's track end.
   const audioEndSec =
-    DEMUXER[fileKind] === "mov" && a && Number.isFinite(a.duration) && a.duration! > 0
-      ? (Number.isFinite(a.start_time) ? a.start_time! : 0) + a.duration!
-      : null;
-  // Review r5: an MP4/MOV's presentation 0 on its `-copyts` timeline — the earliest first sample of its picture and
-  // sound, not counting an explicit leading empty edit (that stays); a reorder delay without an edit list is no gap.
+    !mov || !a
+      ? null
+      : ta?.edited
+        ? ta.end
+        : Number.isFinite(a.duration) && a.duration! > 0
+          ? (Number.isFinite(a.start_time) ? a.start_time! : 0) + a.duration!
+          : null;
+  const videoEndSec = mov && v && tv?.edited ? tv.end : null;
+  // Review r5: an MP4/MOV's presentation 0 on its `-copyts` timeline. A track with an edit list starts at the movie's 0
+  // (its lead stays, as nothing); one without starts at its first sample (a reorder delay without an edit list is no
+  // gap) — the earliest of them.
   const firsts = [
-    ...(v && Number.isFinite(v.start_time) ? [v.start_time! - leads.video] : []),
-    ...(a && Number.isFinite(a.start_time) ? [a.start_time! - leads.audio] : []),
+    ...(v ? [tv?.edited ? 0 : Number.isFinite(v.start_time) ? v.start_time! : 0] : []),
+    ...(a ? [ta?.edited ? 0 : Number.isFinite(a.start_time) ? a.start_time! : 0] : []),
   ];
-  const originSec = DEMUXER[fileKind] === "mov" && firsts.length ? Math.max(0, Math.min(...firsts)) : 0;
+  const originSec = mov && firsts.length ? Math.max(0, Math.min(...firsts)) : 0;
 
   if (kind === "image") {
     if (!v || !side(v.width) || !side(v.height)) return { ok: false, reason: "unreadable" };
@@ -311,6 +384,7 @@ export function judgeInput(
         hasAudio: audio.length > 0,
         audioSec,
         audioEndSec,
+        videoEndSec,
         originSec,
         width: v?.width ?? null,
         height: v?.height ?? null,
@@ -546,7 +620,7 @@ export function sandboxedComposer(o: {
     const v = decodeVerdict(r);
     if (v === "failed") return { ok: false, reason: "failed" };
     if (v !== "ok") return { ok: false, reason: "unreadable" };
-    return judgeInput(r!.stdout, fileKind, DEMUXER[fileKind] === "mov" ? mp4EmptyLeads(file) : undefined);
+    return judgeInput(r!.stdout, fileKind, DEMUXER[fileKind] === "mov" ? mp4Timeline(file) : undefined);
   };
 
   const compose: Composer["compose"] = async (job) => {
@@ -640,7 +714,12 @@ export function sandboxedComposer(o: {
         if (size === undefined || size % 4) return { ok: false, code: "compose_failed" };
         audioSec = size / 4 / RATE;
       }
-      const pictureSec = u.count && info.hasVideo ? (pictureFrames ?? 0) / FPS : null;
+      // Re-plan 2: a picture with an edit list lasts to its media edit's end — not to its last frame's own duration.
+      const pictureSec = !(u.count && info.hasVideo)
+        ? null
+        : info.videoEndSec != null
+          ? Math.max(0, info.videoEndSec - (info.originSec ?? 0))
+          : (pictureFrames ?? 0) / FPS;
       if (u.count && info.hasVideo && !pictureFrames) return { ok: false, code: "compose_failed" };
       truth.set(fileId, {
         ...info,
