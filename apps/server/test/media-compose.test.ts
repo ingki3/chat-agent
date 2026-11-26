@@ -1550,7 +1550,7 @@ describe("review r2: the plan (pure)", () => {
     expect(a).not.toContain("-noaccurate_seek");
     const g = a[a.indexOf("-filter_complex") + 1]!;
     // The canvas starts at the trim's start (review r5): the source shifted by it, then 30 frames.
-    expect(g).toContain("[0:v]settb=AVTB,setpts=PTS-2/TB,");
+    expect(g).toContain("[0:v]settb=1/3000000,setpts=PTS-6000000,");
     expect(g).toContain("overlay=eof_action=repeat:repeatlast=1,trim=end_frame=30,");
     // The picture only: its sound is a slice of the input's decoded PCM.
     expect(g).not.toContain("[0:a");
@@ -1747,11 +1747,13 @@ describe("review r8: one presentation per track (pure)", () => {
         const g = clipArgs(plan, 0, "/in");
         const graph = g[g.indexOf("-filter_complex") + 1]!;
         const head = graph.slice(0, graph.indexOf("[src]"));
-        const map = p.shift !== 0 ? `,setpts=PTS${p.shift < 0 ? "-" : "+"}` : "";
-        const cut = p.end != null ? `trim=end=${Math.round(p.end * 1e6) / 1e6},` : "";
-        const trim = startSec ? `setpts=PTS-${Math.round(startSec * 1e6) / 1e6}/TB,` : "";
+        // Review r9: whole ticks of 1/3 000 000 s, each rounded once.
+        const tk = (x: number) => Math.round(x * 3_000_000);
+        const map = tk(p.shift) !== 0 ? `,setpts=PTS${p.shift < 0 ? "-" : "+"}${Math.abs(tk(p.shift))}` : "";
+        const cut = p.end != null ? `,trim=end_pts=${tk(p.end)}` : "";
+        const trim = startSec ? `,setpts=PTS-${tk(startSec)},` : "";
         // Its end does not move with the trim; the trim's shift comes after it.
-        expect([c.name, startSec, head.startsWith(`[0:v]settb=AVTB${map}`)]).toEqual([
+        expect([c.name, startSec, head.startsWith(`[0:v]settb=1/3000000${map}`)]).toEqual([
           c.name,
           startSec,
           true,
@@ -1765,7 +1767,8 @@ describe("review r8: one presentation per track (pure)", () => {
         expect([c.name, startSec, head.includes(trim)]).toEqual([c.name, startSec, true]);
         const leadIn = p.start - startSec;
         expect([c.name, startSec, graph.includes(":enable='gte(t,")]).toEqual([c.name, startSec, leadIn > 0]);
-        expect(graph).not.toContain("trim=end=0.000001");
+        expect(graph).not.toContain("trim=end=");
+        expect(graph).not.toMatch(/setpts=PTS[-+][0-9.]*\.[0-9]/);
       }
     }
   });
@@ -3366,6 +3369,38 @@ describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", 
     expect(c.length).toBe(122);
     expect(Math.abs(sound - picture)).toBeLessThan(1 / 30);
   });
+
+  // ---- review r9, with the real ffmpeg
+  it("review r9: a red·green·blue frame cycle keeps every frame — trimmed at k/30, and untrimmed with 0, 1 or 2 B-frames", async () => {
+    const dir = tmp();
+    const t = await start({ composer: real });
+    for (const bf of [0, 1, 2]) {
+      const file = path.join(dir, `rgb-bf${bf}.mp4`);
+      execFileSync(FFMPEG, [
+        ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i"],
+        "nullsrc=s=64x64:r=30:d=2,format=rgb24,geq=r='if(eq(mod(N\\,3)\\,0)\\,255\\,0)':g='if(eq(mod(N\\,3)\\,1)\\,255\\,0)':b='if(eq(mod(N\\,3)\\,2)\\,255\\,0)'",
+        ...["-f", "lavfi", "-i", "sine=f=500:r=48000:d=2", "-c:v", "libx264", "-bf", String(bf)],
+        ...["-x264-params", "b-adapt=0", "-pix_fmt", "yuv420p", "-c:a", "aac", file],
+      ]);
+      // The source's own frames, in presentation order.
+      const src = colours(file);
+      expect([bf, src.length, new Set(src.slice(0, 3)).size]).toEqual([bf, 60, 3]);
+      const whole = await (async () => {
+        const s = await t.scopeOf();
+        const f = await t.putFile(s, file, "mp4");
+        return colours(await composeOne(t, s, { clips: [{ fileId: f }] }));
+      })();
+      expect([bf, "whole", whole]).toEqual([bf, "whole", src]);
+      for (const k of [1, 2, 3, 12, 31]) {
+        const s = await t.scopeOf();
+        const f = await t.putFile(s, file, "mp4");
+        const out = await composeOne(t, s, {
+          clips: [{ fileId: f, trim: { startSec: k / 30, endSec: k / 30 + 0.7 } }],
+        });
+        expect([bf, k, colours(out)]).toEqual([bf, k, src.slice(k, k + 21)]);
+      }
+    }
+  }, 600_000);
 
   it("readiness: a tiny composition checked in the same sandbox", async () => {
     const dataDir = path.join(tmp(), "data");

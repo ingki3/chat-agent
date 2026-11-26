@@ -606,6 +606,18 @@ export function toVtt(subs: readonly Cue[], totalSec?: number): string {
 const num = (n: number) => String(Math.round(n * 1e6) / 1e6);
 /** "+0.4" / "-2": an offset added to a timestamp expression. */
 const signed = (n: number) => (n < 0 ? `-${num(-n)}` : `+${num(n)}`);
+/**
+ * Review r9: the pictures' timebase — 1/3 000 000 s holds every 30 fps slot (k/30 = 100 000·k) and the frames of the
+ * usual track timescales (1/15360 at 30 fps, 1/90000, 1/600, 1/1000, 1/30000…) as whole ticks. Each shift and cut is a
+ * whole number of these ticks (one rounding each): rounded to microseconds instead, a frame at k/30 moved by 1/30
+ * could land 1 µs after its slot, and the canvas would show the frame before it.
+ */
+const PICTURE_TB = 3_000_000;
+const ticks = (sec: number) => Math.round(sec * PICTURE_TB);
+const tickShift = (sec: number) => {
+  const n = ticks(sec);
+  return n === 0 ? "" : `,setpts=PTS${n < 0 ? "-" : "+"}${Math.abs(n)}`;
+};
 /** Every run: no stdin, quiet, local files and the progress pipe only, the filter threads bounded. */
 export const FF_COMMON = [
   "-nostdin",
@@ -731,9 +743,10 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
       // Fine timebase first (re-plan 2: a 1 s MOV timescale would round the shift), then the track's presentation
       // (`presentTrack`): mapped to its input's timeline and cut at its end there — before the clip's trim (review r8:
       // a trim after that end shows the last frame allowed, held, never one the edit leaves out) — then the trim.
-      `[0:v]settb=AVTB${at.shift !== 0 ? `,setpts=PTS${signed(at.shift)}/TB` : ""},` +
-      `${at.end != null ? `trim=end=${num(Math.max(1e-6, at.end))},` : ""}` +
-      `${c.startSec !== 0 ? `setpts=PTS${signed(-c.startSec)}/TB,` : ""}` +
+      // Review r9: all of it in whole ticks of `PICTURE_TB`.
+      `[0:v]settb=1/${PICTURE_TB}${tickShift(at.shift)}` +
+      `${at.end != null ? `,trim=end_pts=${Math.max(1, ticks(at.end))}` : ""}` +
+      `${tickShift(-c.startSec)},` +
       `${square},${fit(W, H)},setsar=1,format=yuva420p[src];` +
       `color=c=black:s=${W}x${H}:r=${FPS},format=yuv420p[canvas];` +
       // Before a leading empty edit ends nothing is shown (review r7: the frame showing at the edit's start comes in at
@@ -824,7 +837,7 @@ export function ingestArgs(o: {
     (sa.shift !== 0 ? `asettb=AVTB,asetpts=PTS${signed(sa.shift)}/TB,` : "") +
     (sa.start > 0 ? `atrim=start=${num(sa.start)},` : "");
   const endA = sa.end != null ? `,atrim=end=${num(Math.max(1e-6, sa.end))}` : "";
-  const shiftV = pa.shift !== 0 ? `settb=AVTB,setpts=PTS${signed(pa.shift)}/TB,` : "";
+  const shiftV = ticks(pa.shift) !== 0 ? `settb=1/${PICTURE_TB}${tickShift(pa.shift)},` : "";
   // Review r8: a gap in the sound's timestamps is silence from 1 ms on (`min_hard_comp`; ffmpeg's own 0.1 s would
   // close a shorter one — an MP4 whose first AAC sample is stretched to fill 0.0667 s then plays 45 ms early).
   const cap = num(Math.max(1, o.capSec));
