@@ -174,6 +174,10 @@ const DEFAULTS: Limits = {
 
 const ACTIVE = [...VIDEO_ACTIVE] as VideoJobStatus[];
 const POLLED: VideoJobStatus[] = ["pending", "in_progress", "downloading"];
+/** How long a stop may take — waiting for submits under way and recording held outcomes. */
+const STOP_BUDGET_MS = 10_000;
+/** The part of it kept for recording held outcomes (submits are waited for at most the rest). */
+const STOP_FLUSH_MS = 3_000;
 /** How long a job's work may hold it (a poll, a download, its check, the file lock) before a pass picks it again. */
 const LEASE_MS = (l: { requestTimeoutMs: number; downloadTimeoutMs: number }) =>
   l.requestTimeoutMs + l.downloadTimeoutMs + 2 * 60_000;
@@ -859,6 +863,14 @@ export class VideoJobs {
     body: Record<string, unknown>,
     signal: AbortSignal,
   ): Promise<VideoJobRow | undefined> {
+    const refusalOf = (status: number): Held | undefined =>
+      status === -1 || (status >= 400 && status < 500)
+        ? {
+            kind: "refusal",
+            code: status === 402 ? "video_payment" : status === 429 ? "video_rate_limited" : "video_rejected",
+            usageKey,
+          }
+        : undefined;
     let res: Response;
     try {
       res = await openRouterPost(OPENROUTER_VIDEOS_URL, body, {
@@ -866,19 +878,20 @@ export class VideoJobs {
         fetchImpl: this.o.fetchImpl,
         timeoutMs: this.limits.requestTimeoutMs,
         signal,
+        // Review r9: a refusal is this work's held outcome the moment its headers came — before its body is let go —
+        // so a conversation delete meanwhile releases its bound.
+        onStatus: (status) => {
+          const held = refusalOf(status);
+          if (held) this.hold(id, held);
+        },
       });
     } catch (e) {
-      const status = e instanceof MediaHttpError ? e.status : 0;
-      // Refused here before sending (-1), or by OpenRouter with a 4xx (not billed): the bound goes.
-      if (status === -1 || (status >= 400 && status < 500)) {
-        const code: VideoJobCode =
-          status === 402 ? "video_payment" : status === 429 ? "video_rate_limited" : "video_rejected";
-        // Review r4: the refusal is known here — it is recorded (and its bound released) or, should the writes fail,
-        // kept trying while this job's work is still under way (a pass leaves it alone), until it is or the deadline.
-        return (
-          this.finish(id, code, { held: { kind: "refusal", code, usageKey } }) ??
-          this.retrying(id, { kind: "refusal", code, usageKey })
-        );
+      const held = refusalOf(e instanceof MediaHttpError ? e.status : 0);
+      if (held?.kind === "refusal") {
+        // Refused here before sending (-1), or by OpenRouter with a 4xx (not billed): recorded with its bound
+        // released — or, should the writes fail, held: this work's end hands it over (`handOver`).
+        this.hold(id, held);
+        return this.finish(id, held.code, { held }) ?? this.get(id);
       }
       // No answer, a timeout or a 5xx: it may have started and may bill — never sent again, its bound stays.
       return this.finish(id, "video_unconfirmed") ?? this.get(id);
@@ -892,15 +905,14 @@ export class VideoJobs {
       remote = null;
     }
     if (!remote) return this.finish(id, "video_unconfirmed") ?? this.get(id);
-    // The id is what lets the job be followed: written now or — the writes failing — kept trying while this job's
-    // work is under way (review r4), until it is written or the deadline.
+    // The id is what lets the job be followed: held the moment it is read, then written — should that fail, this
+    // work's end hands it over (`handOver`: retried, or the stop's flush).
+    this.hold(id, { kind: "accepted", remoteId: remote });
     try {
-      const r = this.accept(id, remote);
-      if (r) return r;
+      return this.accept(id, remote) ?? this.get(id);
     } catch {
-      // kept trying below
+      return undefined;
     }
-    return this.retrying(id, { kind: "accepted", remoteId: remote });
   }
 
   /** An accepted submit recorded: `pending` with its remote id, its lease cleared. Null: the row was not `submitting`. */
@@ -1048,24 +1060,57 @@ export class VideoJobs {
     this.stopping = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
-    // Polls, downloads and retry waits stop now; a submit under way finishes its answer's handling (review r8: an
-    // outcome it receives meanwhile is held, then handed over) — 10 s at most.
+    // One absolute budget for the whole stop (review r9): the wait for submits and the final flush both use it.
+    const until = Date.now() + STOP_BUDGET_MS;
+    const left = () => Math.max(0, until - Date.now());
+    // Polls, downloads and retry waits stop now; a submit under way finishes its answer's handling (an outcome it
+    // receives meanwhile is held, then handed over).
     for (const w of this.inflight.values()) if (w.kind !== "submit") w.stop.abort();
+    // The last part of the budget is kept for the flush below.
     await Promise.race([
       Promise.all([...this.inflight.values()].map((w) => w.done)),
-      new Promise<void>((r) => setTimeout(r, 10_000).unref()),
+      new Promise<void>((r) => setTimeout(r, Math.max(0, left() - STOP_FLUSH_MS)).unref()),
     ]);
-    // The final flush: every held outcome — handed over by ended work, or still held — one more try before the
-    // database goes (what still fails is the next start's by the rows' own rule: its bound kept).
+    // The final flush: every held outcome — handed over by ended work, or still held — until the row reflects it, with
+    // short waits, within what is left of the budget; each write waits on a lock at most that long (busy timeout).
     const held = new Map(this.handedOver);
     for (const [id, w] of this.inflight) if (w.held) held.set(id, w.held);
-    this.handedOver.clear();
-    for (const [id, h] of held)
-      try {
-        this.recordHeld(id, h);
-      } catch {
-        // the next start's
+    const sqlite = this.o.db.$client;
+    let busy: number | undefined;
+    try {
+      busy = Number(sqlite.pragma("busy_timeout", { simple: true })) || 0;
+    } catch {
+      busy = undefined;
+    }
+    try {
+      while (held.size && left() > 0) {
+        for (const [id, h] of held) {
+          if (left() <= 0) break;
+          try {
+            if (busy !== undefined)
+              sqlite.pragma(`busy_timeout = ${Math.min(busy || 5000, Math.ceil(left()))}`);
+            if (this.recordHeld(id, h)) {
+              held.delete(id);
+              this.handedOver.delete(id);
+            }
+          } catch {
+            // tried again below
+          }
+        }
+        if (held.size && left() > 0)
+          await new Promise<void>((r) => setTimeout(r, Math.min(200, left())).unref());
       }
+    } finally {
+      if (busy !== undefined)
+        try {
+          sqlite.pragma(`busy_timeout = ${busy}`);
+        } catch {
+          // the database is going anyway
+        }
+    }
+    // Still not recorded (the database not writable through the shutdown): the next start ends these jobs by the
+    // rows' own rule (bound kept) — said in the log (the job's id only).
+    for (const id of held.keys()) logEvent(this.o.log, "warn", "video.held_lost", { videoJobId: id });
     for (const w of this.inflight.values()) w.stop.abort();
     for (const close of [...this.streams]) close();
   }

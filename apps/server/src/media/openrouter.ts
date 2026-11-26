@@ -482,6 +482,11 @@ export async function openRouterPost(
     fetchImpl?: typeof fetch | undefined;
     timeoutMs: number;
     signal?: AbortSignal | undefined;
+    /**
+     * #238 stage 3 (review r9): told the answer's status as soon as its headers came — before a refusal's body is let
+     * go (which may take a while), so the caller knows the outcome at once.
+     */
+    onStatus?: (status: number) => void;
   },
 ): Promise<Response> {
   if (
@@ -502,6 +507,11 @@ export async function openRouterPost(
     });
   } catch {
     throw new MediaHttpError(0);
+  }
+  try {
+    o.onStatus?.(res.status);
+  } catch {
+    // the caller's own business
   }
   if (!res.ok) {
     await res.body?.cancel().catch(() => {});

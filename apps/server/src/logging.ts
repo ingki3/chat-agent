@@ -124,6 +124,9 @@ export const LOG_EVENTS = [
   "video.done",
   "video.failed",
   "video.expired",
+  // A received outcome (refusal, accepted id, cost) the shutdown could not record within its time budget (#238
+  // stage 3): the next start ends the job by the rows' own rule. The job's id only.
+  "video.held_lost",
   // python_run working folders left from the last process could not all be removed at start (#47; nothing else).
   "python.sweep_failed",
   // python_run account self-check (#47 round 2): the outcome only, no detail.

@@ -2558,3 +2558,149 @@ describe("video jobs — review r8 regressions (a held outcome is dropped only o
     expect(seen).toContain(0.8);
   });
 });
+
+// ---------------------------------------------------------------- review round 9 (#255)
+
+describe("video jobs — review r9 regressions (outcomes held at once; one stop budget)", () => {
+  const completed = (id: string, usd = 0.8) =>
+    Response.json({ id, status: "completed", usage: { cost: usd } });
+  const noWrite = () => {
+    throw new Error("temporary write");
+  };
+
+  it("1: the stop's flush keeps trying an outcome until the row reflects it (an accepted id)", async () => {
+    const t = await start({ limits: { retryMs: 30_000 } });
+    const { jobId } = await t.card();
+    let failed = 0;
+    t.db.$client.function("r9_fail", () => {
+      if (++failed <= 2) throw new Error("temporary");
+      return 0;
+    });
+    t.db.$client.exec(
+      "CREATE TRIGGER r9_accept BEFORE UPDATE OF remote_id ON video_jobs WHEN NEW.remote_id IS NOT NULL BEGIN SELECT r9_fail(); END",
+    );
+    await t.approve(jobId, 0);
+    expect(t.job(jobId)).toMatchObject({ status: "submitting", remoteId: null });
+    await t.video.stop();
+    expect(failed).toBeGreaterThanOrEqual(3);
+    expect(t.job(jobId)).toMatchObject({ status: "pending", remoteId: rid(1) });
+    t.db.$client.exec("DROP TRIGGER r9_accept");
+  });
+
+  it("1: … and a reported cost", async () => {
+    const t = await start({
+      server: fakeServer({ poll: (id) => completed(id) }),
+      limits: { retryMs: 30_000 },
+    });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    const settle = vi
+      .spyOn(t.app.usageStore!, "settleMedia")
+      .mockImplementationOnce(noWrite)
+      .mockImplementationOnce(noWrite);
+    t.dueNow();
+    await t.video.tick();
+    await t.video.stop();
+    settle.mockRestore();
+    expect(t.job(jobId).costMicros).toBe(800_000);
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "settled", p: 800_000 })]);
+  });
+
+  it("1: an outcome the database never takes within the budget is logged (video.held_lost) — the stop still returns", async () => {
+    const t = await start({ limits: { retryMs: 30_000 } });
+    const { jobId } = await t.card();
+    t.db.$client.exec(
+      "CREATE TRIGGER r9_never BEFORE UPDATE OF remote_id ON video_jobs WHEN NEW.remote_id IS NOT NULL BEGIN SELECT RAISE(ABORT,'unwritable'); END",
+    );
+    await t.approve(jobId, 0);
+    const lines: unknown[] = [];
+    const log = vi
+      .spyOn(t.app.log, "warn")
+      .mockImplementation(((...a: unknown[]) => void lines.push(a)) as never);
+    try {
+      const before = Date.now();
+      await t.video.stop();
+      expect(Date.now() - before).toBeLessThan(12_000);
+      expect(JSON.stringify(lines)).toContain("video.held_lost");
+    } finally {
+      log.mockRestore();
+      t.db.$client.exec("DROP TRIGGER r9_never");
+    }
+  }, 30_000);
+
+  it("2: a 402 is known the moment its headers come — a delete before its body is let go releases the bound", async () => {
+    let finishCancel: (() => void) | undefined;
+    const server = fakeServer({
+      submit: () =>
+        new Response(
+          new ReadableStream({
+            cancel() {
+              return new Promise<void>((resolve) => (finishCancel = resolve));
+            },
+          }),
+          { status: 402 },
+        ),
+    });
+    const t = await start({ server, limits: { retryMs: 5 } });
+    const { jobId, scope } = await t.card();
+    const approval = t.approve(jobId, 0);
+    await vi.waitFor(() => expect(finishCancel).toBeDefined());
+    try {
+      const del = await t.app.inject({
+        method: "DELETE",
+        url: `/api/conversations/${scope.conversationId}`,
+        headers: { ...WRITE, cookie: t.f.cookies.owner },
+      });
+      expect(del.statusCode).toBe(200);
+    } finally {
+      finishCancel!();
+    }
+    await approval;
+    await t.video.idle();
+    expect(t.video.get(jobId)).toBeUndefined();
+    expect(t.usage()).toEqual([]);
+    expect(server.posts()).toHaveLength(1);
+  });
+
+  it("3: a stop under a held database lock returns within its one budget", async () => {
+    const DatabaseCtor = (await import("better-sqlite3")).default;
+    let unblock: ((r: Response) => void) | undefined;
+    const server = fakeServer({
+      submit: (_b, n) =>
+        n === 1
+          ? new Promise<Response>((resolve) => (unblock = resolve))
+          : Response.json({ id: rid(n) }, { status: 202 }),
+    });
+    const t = await start({ server, limits: { retryMs: 30_000 } });
+    const first = await t.card();
+    const second = await t.card();
+    const a = t.approve(first.jobId, 0);
+    await vi.waitFor(() => expect(unblock).toBeDefined());
+    t.db.$client.exec(
+      "CREATE TRIGGER r9_once BEFORE UPDATE OF remote_id ON video_jobs BEGIN SELECT RAISE(ABORT,'temporary'); END",
+    );
+    await t.approve(second.jobId, 0);
+    t.db.$client.exec("DROP TRIGGER r9_once");
+    if (!t.db.$client.name || t.db.$client.memory) {
+      // An in-memory test database has no second connection to hold its lock: the budget is checked without it.
+      const before = Date.now();
+      await t.video.stop();
+      expect(Date.now() - before).toBeLessThan(11_500);
+    } else {
+      const writer = new DatabaseCtor(t.db.$client.name);
+      writer.exec("BEGIN IMMEDIATE");
+      try {
+        const before = Date.now();
+        await t.video.stop();
+        expect(Date.now() - before).toBeLessThan(11_500);
+      } finally {
+        writer.exec("ROLLBACK");
+        writer.close();
+      }
+    }
+    // The flush had its part of the budget: the second job's accepted id is recorded.
+    expect(t.job(second.jobId)).toMatchObject({ status: "pending", remoteId: rid(2) });
+    unblock!(new Response(null, { status: 503 }));
+    await a;
+  }, 30_000);
+});
