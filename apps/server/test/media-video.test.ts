@@ -2377,3 +2377,184 @@ describe("video jobs — review r7 regressions (held outcomes)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------- review round 8 (#255)
+
+describe("video jobs — review r8 regressions (a held outcome is dropped only once its row reflects it)", () => {
+  const completed = (id: string, usd = 0.8) =>
+    Response.json({ id, status: "completed", usage: { cost: usd } });
+  const noWrite = () => {
+    throw new Error("temporary write");
+  };
+  const restart = (t: Awaited<ReturnType<typeof start>>) => {
+    const next = new VideoJobs({
+      db: t.db,
+      files: () => t.app.files,
+      conversations: t.app.conversations!,
+      keys: t.app.media!.keys,
+      settings: t.app.media!.settings,
+      budget: t.app.media!.budget,
+      usage: t.app.usageStore,
+      users: t.app.users!,
+      notifications: () => t.app.notifications,
+      probe: () => fixtureVideoProbe(),
+      dataDir: t.dataDir,
+      fetchImpl: t.server.fetchImpl,
+      limits: { tickMs: 3_600_000 },
+    });
+    next.start();
+    closers.push(() => next.stop());
+    return next;
+  };
+
+  it("1: an accepted id whose commit's read-back failed is recorded — polling resumes", async () => {
+    const clock = { t: Date.now() };
+    const t = await start({ clock, limits: { retryMs: 10 } });
+    const { jobId } = await t.card();
+    const read = t.video.get.bind(t.video);
+    let injected = 0;
+    const spy = vi.spyOn(t.video, "get").mockImplementation((id) => {
+      const row = read(id);
+      if (row?.status === "pending" && injected === 0) {
+        injected++;
+        noWrite();
+      }
+      return row;
+    });
+    await t.approve(jobId, 0);
+    expect(injected).toBe(1);
+    spy.mockRestore();
+    await t.video.idle();
+    expect(await t.drive(jobId)).toMatchObject({ status: "done" });
+    expect(t.server.requests.filter((r) => r.url === videoStatusUrl(rid(1))).length).toBeGreaterThan(0);
+    expect(t.server.posts()).toHaveLength(1);
+  });
+
+  it("2: a conversation deleted while a reported cost is held: the delete settles it first", async () => {
+    const server = fakeServer({ poll: (id) => completed(id) });
+    const t = await start({ server, limits: { retryMs: 30_000 } });
+    const { jobId, scope } = await t.card();
+    await t.approve(jobId, 0);
+    const settle = vi.spyOn(t.app.usageStore!, "settleMedia").mockImplementationOnce(noWrite);
+    t.dueNow();
+    await t.video.tick();
+    settle.mockRestore();
+    expect(t.usage()[0]).toMatchObject({ s: "video_job", p: null });
+    const res = await t.app.inject({
+      method: "DELETE",
+      url: `/api/conversations/${scope.conversationId}`,
+      headers: { ...WRITE, cookie: t.f.cookies.owner },
+    });
+    expect(res.statusCode).toBeLessThan(300);
+    await t.video.idle();
+    expect(t.video.get(jobId)).toBeUndefined();
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "settled", p: 800_000 })]);
+  });
+
+  it("2: a delete whose settling of a held cost fails rolls back (the job and its cost stay)", async () => {
+    const server = fakeServer({ poll: (id) => completed(id) });
+    const t = await start({ server, limits: { retryMs: 30_000 } });
+    const { jobId, scope } = await t.card();
+    await t.approve(jobId, 0);
+    const settle = vi.spyOn(t.app.usageStore!, "settleMedia").mockImplementation(noWrite);
+    t.dueNow();
+    await t.video.tick();
+    expect(() => t.app.conversations!.delete(scope.conversationId)).toThrow();
+    settle.mockRestore();
+    expect(t.video.get(jobId)).toBeDefined();
+  });
+
+  it("3: a cost parsed from a completed answer is held before any further read", async () => {
+    const clock = { t: Date.now() };
+    let failNext = false;
+    const server = fakeServer({
+      poll: (id) => {
+        failNext = true;
+        return completed(id);
+      },
+    });
+    const t = await start({ clock, server, limits: { retryMs: 20 } });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    const deadline = t.job(jobId).deadlineAt!;
+    const read = t.video.get.bind(t.video);
+    const spy = vi.spyOn(t.video, "get").mockImplementation((id) => {
+      if (failNext) {
+        failNext = false;
+        noWrite();
+      }
+      return read(id);
+    });
+    clock.t = deadline - 25_000;
+    t.dueNow();
+    await t.video.tick();
+    spy.mockRestore();
+    await vi.waitFor(() => expect(t.job(jobId).costMicros).toBe(800_000), { timeout: 5000 });
+    expect(t.usage()[0]).toMatchObject({ s: "settled", p: 800_000 });
+    expect(server.requests.filter((r) => r.url === videoStatusUrl(rid(1)))).toHaveLength(1);
+  });
+
+  it("4: a stop waits for a submit's answer and records the refusal it got meanwhile", async () => {
+    let finishCancel: (() => void) | undefined;
+    const server = fakeServer({
+      submit: () =>
+        new Response(
+          new ReadableStream({
+            cancel() {
+              return new Promise<void>((resolve) => (finishCancel = resolve));
+            },
+          }),
+          { status: 402 },
+        ),
+    });
+    const t = await start({ server, limits: { retryMs: 15 } });
+    const { jobId } = await t.card();
+    const release = vi
+      .spyOn(t.app.usageStore!, "releaseVideoMedia")
+      .mockImplementationOnce(noWrite)
+      .mockImplementationOnce(noWrite);
+    const approval = t.approve(jobId, 0);
+    await vi.waitFor(() => expect(finishCancel).toBeDefined());
+    const stopped = t.video.stop();
+    finishCancel!();
+    await Promise.all([approval, stopped]);
+    release.mockRestore();
+    expect(t.job(jobId)).toMatchObject({ status: "failed", errorCode: "video_payment" });
+    expect(t.usage()).toEqual([]);
+    const next = restart(t);
+    await next.tick();
+    expect(next.get(jobId)).toMatchObject({ errorCode: "video_payment" });
+    expect(server.posts()).toHaveLength(1);
+  });
+
+  it("4: a retry's held cost is recorded by the stop's final flush", async () => {
+    const server = fakeServer({ poll: (id, n) => completed(id, n === 1 ? 0.8 : 0.99) });
+    const t = await start({ server, limits: { retryMs: 30_000 } });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    const settle = vi.spyOn(t.app.usageStore!, "settleMedia").mockImplementationOnce(noWrite);
+    t.dueNow();
+    await t.video.tick();
+    await t.video.stop();
+    settle.mockRestore();
+    expect(t.job(jobId).costMicros).toBe(800_000);
+    expect(t.usage()).toEqual([expect.objectContaining({ s: "settled", p: 800_000 })]);
+  });
+
+  it("5: a cost recorded by its retry is a new version the open card hears", async () => {
+    const t = await start({ server: fakeServer({ poll: (id) => completed(id) }), limits: { retryMs: 20 } });
+    const { jobId } = await t.card();
+    await t.approve(jobId, 0);
+    const seen: (number | null)[] = [];
+    const off = t.video.subscribe(jobId, () => seen.push(t.video.view(t.job(jobId)).costUsd));
+    const settle = vi.spyOn(t.app.usageStore!, "settleMedia").mockImplementationOnce(noWrite);
+    const before = t.job(jobId).version;
+    t.dueNow();
+    await t.video.tick();
+    settle.mockRestore();
+    await vi.waitFor(() => expect(t.job(jobId).costMicros).toBe(800_000), { timeout: 5000 });
+    off();
+    expect(t.job(jobId).version).toBeGreaterThan(before);
+    expect(seen).toContain(0.8);
+  });
+});
