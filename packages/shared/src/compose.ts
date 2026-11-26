@@ -11,6 +11,10 @@ import { z } from "zod";
 export const COMPOSE_LIMITS = {
   /** The whole result, transitions overlapped and a held last frame included (user decision 2). */
   maxSeconds: 300,
+  /** Where a trim may point in a source video (its own length decides; this only bounds the number). */
+  maxSourceSeconds: 24 * 3600,
+  /** The shortest an image is shown. */
+  minImageSeconds: 0.5,
   maxClips: 40,
   maxNarration: 40,
   maxSubtitles: 400,
@@ -47,6 +51,8 @@ export const COMPOSE_KEN_BURNS = ["in", "out", "left", "right"] as const;
 
 const FileId = z.string().trim().min(1).max(64);
 const Sec = z.number().finite().min(0).max(COMPOSE_LIMITS.maxSeconds);
+/** A point in a source video (review r1: checked against the source's own length, not the 5-minute output cap). */
+const SourceSec = z.number().finite().min(0).max(COMPOSE_LIMITS.maxSourceSeconds);
 
 export const ComposeClip = z
   .object({
@@ -56,14 +62,14 @@ export const ComposeClip = z
     durationSec: z
       .number()
       .finite()
-      .min(0.5)
+      .min(1 / COMPOSE_LIMITS.fps)
       .max(COMPOSE_LIMITS.maxSeconds)
       .optional()
       .describe(
-        "Seconds on screen: required for an image (0.5–30); for a video, default the trim or its whole length.",
+        "Seconds on screen: required for an image (0.5–30); for a video (at least one frame), default the trim or its whole length.",
       ),
     trim: z
-      .object({ startSec: Sec, endSec: Sec })
+      .object({ startSec: SourceSec, endSec: SourceSec })
       .strict()
       .optional()
       .describe("Video only: the part of the source to use."),

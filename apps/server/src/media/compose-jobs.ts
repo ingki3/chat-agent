@@ -190,10 +190,19 @@ export class ComposeJobs {
       const ids = this.deleting.get(c.id) ?? [];
       this.deleting.delete(c.id);
       for (const id of ids) {
-        this.work.get(id)?.stop.abort();
+        const w = this.work.get(id);
+        // Preparing or running: its work stops and removes its own folder. Waiting (queued) or ended: nothing works on
+        // it — its folder (the input copies) goes now, not at the next start (review r1).
+        if (w) w.stop.abort();
+        else removeComposeWorkdir(this.folderOf(id));
         this.changed(id);
       }
     });
+  }
+
+  /** A job's working folder (`compose-scratch/<id>`). */
+  private folderOf(id: string): string {
+    return path.join(storagePaths(this.o.dataDir).composeScratch, id);
   }
 
   // ---------------------------------------------------------------- reading
@@ -363,7 +372,10 @@ export class ComposeJobs {
         const hint = e.hint ?? MEDIA_TOOL_HINTS[e.code];
         return { ok: false, code: e.code, ...(hint ? { hint: scrubKnown(hint, { tail: false }) } : {}) };
       }
-      throw e;
+      // Review r1: anything else (a folder that could not be made, a write that failed) never reaches the model as
+      // its message — it could name a path of this server. A fixed code; the operator's log has the error.
+      logEvent(this.o.log, "warn", "error", { userId: scope.userId, runId: scope.runId, err: e });
+      return { ok: false, code: "media_failed", hint: MEDIA_TOOL_HINTS.media_failed! };
     }
   }
 
@@ -452,21 +464,29 @@ export class ComposeJobs {
         : outcome;
     }
     const { plan } = outcome;
-    const queued = this.o.db
-      .update(composeJobs)
-      .set({
-        status: "queued",
-        planJson: JSON.stringify(plan),
-        durationMs: Math.round((plan.frames / FPS) * 1000),
-        width: plan.width,
-        height: plan.height,
-        clips: plan.clips.length,
-        subtitles: (timeline.subtitles ?? []).some((s) => cueText(s.text)),
-        version: sql`${composeJobs.version} + 1`,
-        updatedAt: this.now(),
-      })
-      .where(and(eq(composeJobs.id, id), eq(composeJobs.status, "preparing")))
-      .run();
+    let queued: { changes: number };
+    try {
+      queued = this.o.db
+        .update(composeJobs)
+        .set({
+          status: "queued",
+          planJson: JSON.stringify(plan),
+          durationMs: Math.round((plan.frames / FPS) * 1000),
+          width: plan.width,
+          height: plan.height,
+          clips: plan.clips.length,
+          subtitles: (timeline.subtitles ?? []).some((s) => cueText(s.text)),
+          version: sql`${composeJobs.version} + 1`,
+          updatedAt: this.now(),
+        })
+        .where(and(eq(composeJobs.id, id), eq(composeJobs.status, "preparing")))
+        .run();
+    } catch (e) {
+      // Review r1: the write failed — the preparation's own clean-up (its row and folder; should that fail too, the
+      // engine's next pass reaps a `preparing` row no call of this process holds).
+      this.discard(id, dir);
+      throw e;
+    }
     if (queued.changes !== 1) {
       // Deleted (its conversation) or interrupted (the engine stopping) meanwhile.
       this.discard(id, dir);
@@ -651,7 +671,7 @@ export class ComposeJobs {
         .where(and(eq(composeJobs.id, id), eq(composeJobs.status, "preparing")))
         .run();
     } catch {
-      // a row left preparing is failed by the next start (interrupted)
+      // a row left preparing is reaped by the engine's next pass (or interrupted by the next start)
     }
     removeComposeWorkdir(dir);
     this.changed(id);
@@ -766,6 +786,7 @@ export class ComposeJobs {
     };
     if (!this.recovered) step(() => this.recover());
     else if (!this.swept) step(() => this.sweep());
+    step(() => this.reap());
     step(() => this.notifyDue());
     let started: Promise<unknown> | undefined;
     step(() => (started = this.startNext()));
@@ -773,6 +794,23 @@ export class ComposeJobs {
       () => undefined,
       () => undefined,
     );
+  }
+
+  /**
+   * Rows of this process that no work holds any more (review r1): a `preparing` row whose call's clean-up failed (its
+   * row and folder go — the slot and the file place free), a `running` row whose end could not be written
+   * (`compose_failed`). Never a row whose call or run is under way here.
+   */
+  private reap(): void {
+    for (const r of this.o.db
+      .select({ id: composeJobs.id, status: composeJobs.status })
+      .from(composeJobs)
+      .where(and(inArray(composeJobs.status, ["preparing", "running"]), eq(composeJobs.boot, this.boot)))
+      .all()) {
+      if (this.work.has(r.id)) continue;
+      if (r.status === "preparing") this.discard(r.id, this.folderOf(r.id));
+      else this.finish(r.id, "compose_failed");
+    }
   }
 
   /** The oldest queued job of this process, running — when none runs (one at a time in all). */
@@ -830,7 +868,7 @@ export class ComposeJobs {
       })
       .finally(() => {
         this.work.delete(next.id);
-        this.running = undefined;
+        if (this.running === next.id) this.running = undefined;
         if (!this.stopping) setImmediate(() => void this.tick());
       });
     this.work.set(next.id, { stop, done });
@@ -860,12 +898,26 @@ export class ComposeJobs {
       }
       const deadlineAt = this.now() + this.limits.timeoutMs;
       const deadline = new AbortController();
-      const timer = setTimeout(() => deadline.abort(), Math.max(1, deadlineAt - this.now()));
+      // Review r1: the deadline holds until the file is committed — its moment ends the job at once (the slot and the
+      // file place free, the engine goes on); the work stops, and a store still waiting for the file lock finds the
+      // job no longer running (nothing is committed late).
+      const timer = setTimeout(
+        () => {
+          deadline.abort();
+          try {
+            this.finish(id, "compose_timeout");
+          } catch {
+            // reaped by a later pass
+          }
+          if (this.running === id) this.running = undefined;
+          if (!this.stopping) setImmediate(() => void this.tick());
+        },
+        Math.max(1, deadlineAt - this.now()),
+      );
       const both = AbortSignal.any([signal, deadline.signal]);
       let lastWrite = 0;
-      let outcome;
       try {
-        outcome = await composer.compose({
+        const outcome = await composer.compose({
           dir: realDir,
           plan,
           srt,
@@ -878,13 +930,13 @@ export class ComposeJobs {
             this.progress(id, Math.min(99, Math.floor(f * 100)));
           },
         });
+        if (signal.aborted) return; // deleted, or the engine stopping (`stop` interrupts it)
+        if (deadline.signal.aborted) return void this.finish(id, "compose_timeout");
+        if (!outcome.ok) return void this.finish(id, outcome.code);
+        await this.store(id, outcome.file, outcome.bytes, deadline.signal);
       } finally {
         clearTimeout(timer);
       }
-      if (signal.aborted) return; // deleted, or the engine stopping (`stop` interrupts it)
-      if (deadline.signal.aborted && !outcome.ok) return void this.finish(id, "compose_timeout");
-      if (!outcome.ok) return void this.finish(id, outcome.code);
-      await this.store(id, outcome.file, outcome.bytes);
     } finally {
       removeComposeWorkdir(realDir);
     }
@@ -904,7 +956,7 @@ export class ComposeJobs {
   }
 
   /** The checked MP4 as a file of the conversation: the file row, `file_id` and `done` in one transaction. */
-  private async store(id: string, file: string, bytes: number): Promise<void> {
+  private async store(id: string, file: string, bytes: number, deadline: AbortSignal): Promise<void> {
     const row = this.get(id);
     const files = this.o.files();
     if (!row || row.status !== "running") return;
@@ -915,6 +967,7 @@ export class ComposeJobs {
     } catch {
       return void this.finish(id, "compose_store_failed");
     }
+    if (deadline.aborted) return void this.finish(id, "compose_timeout");
     try {
       await files.addGenerated({
         userId: row.ownerId,
@@ -927,6 +980,7 @@ export class ComposeJobs {
         tmp: file,
         // Inside the file-write lock: the job is still this one, running, without a file (review R8).
         guard: () => {
+          if (deadline.aborted) return false;
           const r = this.get(id);
           return !!r && r.status === "running" && r.fileId === null;
         },
@@ -948,8 +1002,19 @@ export class ComposeJobs {
         },
       });
     } catch (e) {
-      // Gone or no longer running (its conversation deleted, the engine stopping): nothing to record.
-      if (e instanceof FileAddCancelledError) return;
+      // A cancel is not always a delete (review r1, P1): the `done` write itself may have failed. The row says which —
+      // gone or ended (its conversation deleted, the deadline, the engine stopping): nothing more; still running: it
+      // ends here (the one running slot and its file place free). Should that write fail too, a later pass reaps it.
+      if (e instanceof FileAddCancelledError) {
+        let still: boolean;
+        try {
+          still = this.get(id)?.status === "running";
+        } catch {
+          return;
+        }
+        if (still) this.finish(id, deadline.aborted ? "compose_timeout" : "compose_store_failed");
+        return;
+      }
       return void this.finish(id, "compose_store_failed");
     }
     this.changed(id);

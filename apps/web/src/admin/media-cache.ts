@@ -342,3 +342,11 @@ export const expectedRevision = (editBase: string | null, serverRevision: string
 /** The base of the draft shown: the edit's, else a failed save's (its values are the draft), else none. */
 export const draftBase = (editBase: string | null, save: SettingsSave | null): string | null =>
   editBase ?? (save?.phase === "failed" ? save.base : null);
+
+/**
+ * #238 stage 4 (review r1): how often the media status is read again while the composition's readiness check has not
+ * answered yet (`ready: null` — the server checks in the background); not at all once it is known (or not reported).
+ */
+export function composeReadinessPollMs(compose: { ready: boolean | null } | undefined): number | false {
+  return compose && compose.ready === null ? 3000 : false;
+}

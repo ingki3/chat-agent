@@ -91,7 +91,11 @@ export const sweepComposeScratch = (
 
 const Probe = z.object({
   format: z
-    .object({ format_name: z.string().max(200).optional(), duration: z.coerce.number().optional() })
+    .object({
+      format_name: z.string().max(200).optional(),
+      duration: z.coerce.number().optional(),
+      start_time: z.coerce.number().optional(),
+    })
     .optional(),
   streams: z
     .array(
@@ -101,6 +105,7 @@ const Probe = z.object({
         width: z.number().int().optional(),
         height: z.number().int().optional(),
         duration: z.coerce.number().optional(),
+        start_time: z.coerce.number().optional(),
         disposition: z.object({ attached_pic: z.number().int() }).partial().optional(),
       }),
     )
@@ -127,6 +132,15 @@ export function judgeInput(stdout: string, fileKind: FileKind): ProbeOutcome {
   const side = (n: number | undefined) => n !== undefined && n > 0 && n <= COMPOSE_LIMITS.maxInputSide;
   const duration =
     Number.isFinite(r.format?.duration) && r.format!.duration! > 0 ? r.format!.duration! : null;
+  // Review r1: the first sound's end from the file's start — its own start and length (a video's sound may be shorter
+  // than its picture, or start later); the file's length when the stream does not say.
+  const a = audio[0];
+  const origin = Number.isFinite(r.format?.start_time) ? r.format!.start_time! : 0;
+  const audioSec = !a
+    ? null
+    : Number.isFinite(a.duration) && a.duration! > 0
+      ? Math.max(0, (Number.isFinite(a.start_time) ? a.start_time! : origin) - origin) + a.duration!
+      : duration;
   if (kind === "image") {
     if (!v || !side(v.width) || !side(v.height)) return { ok: false, reason: "unreadable" };
     return {
@@ -155,6 +169,7 @@ export function judgeInput(stdout: string, fileKind: FileKind): ProbeOutcome {
         durationSec: duration,
         hasVideo: !!v,
         hasAudio: audio.length > 0,
+        audioSec,
         width: v?.width ?? null,
         height: v?.height ?? null,
       },
@@ -167,6 +182,7 @@ export function judgeInput(stdout: string, fileKind: FileKind): ProbeOutcome {
       fileKind,
       kind,
       durationSec: duration,
+      audioSec,
       hasVideo: false,
       hasAudio: true,
       width: null,
@@ -414,7 +430,8 @@ export function sandboxedComposer(o: {
       const code = await step(clipArgs(plan, i, inDir), units.clips[i]!, c.frames / 30, local);
       if (code) return { ok: false, code };
       const p = pieces(i);
-      if (plainSize(path.join(work, p.body)) === undefined) return { ok: false, code: "compose_failed" };
+      if (c.frames - c.head - c.tail > 0 && plainSize(path.join(work, p.body)) === undefined)
+        return { ok: false, code: "compose_failed" };
       if (
         (c.head && plainSize(path.join(work, p.head)) === undefined) ||
         (c.tail && plainSize(path.join(work, p.tail)) === undefined)

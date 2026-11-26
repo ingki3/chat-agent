@@ -12,6 +12,7 @@ import { admin, ApiError, errorText } from "../api.js";
 import { usd } from "../usage-format.js";
 import {
   catalogView,
+  composeReadinessPollMs,
   anySavePaused,
   conflictNotice,
   draftBase,
@@ -597,6 +598,9 @@ export function MediaAdmin() {
       const shown = qc.getQueryData<Shown>(MEDIA_KEY);
       return reads.isLatest(ticket) || !shown ? { status, ticket } : shown;
     },
+    // #238 stage 4 (review r1): while the composition's readiness is still being checked here, ask again now and then
+    // (it settles within seconds) — never once it is known.
+    refetchInterval: (query) => composeReadinessPollMs(query.state.data?.status.compose),
   });
   // After a write (or a refused catalog): any status read in flight is cancelled — watched or not — and the status
   // is invalidated and read again even with no one watching it (the next visit then reads it anyway).

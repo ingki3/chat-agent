@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { composeReadinessPollMs } from "../src/admin/media-cache.js";
 import type { ComposeJob } from "@agentlee/shared";
 import {
   composeJobIds,
@@ -39,5 +40,12 @@ describe("compose card (#238 stage 4)", () => {
     expect(secondsText(2)).toBe("2초");
     expect(secondsText(80)).toBe("1분 20초");
     expect(secondsText(300)).toBe("5분");
+  });
+
+  it("review r1: the admin screen reads the status again while the composition's readiness is unknown", () => {
+    expect(composeReadinessPollMs({ ready: null })).toBe(3000);
+    expect(composeReadinessPollMs({ ready: true })).toBe(false);
+    expect(composeReadinessPollMs({ ready: false })).toBe(false);
+    expect(composeReadinessPollMs(undefined)).toBe(false);
   });
 });

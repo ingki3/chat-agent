@@ -26,6 +26,7 @@ import { knownSecrets } from "../src/secrets/known.js";
 import {
   checkTimeline,
   clipArgs,
+  concatList,
   cueText,
   isPlanError,
   planTimeline,
@@ -77,7 +78,23 @@ function tmp(): string {
 }
 
 /** Synthetic inputs, made once with the real ffmpeg (outside the server). */
-let media: Record<"png" | "wide" | "video" | "mute" | "mp3" | "wav" | "pdf", string> | undefined;
+let media:
+  | Record<
+      | "png"
+      | "wide"
+      | "video"
+      | "mute"
+      | "mp3"
+      | "wav"
+      | "pdf"
+      | "late"
+      | "shortSound"
+      | "anamorphic"
+      | "long"
+      | "n3",
+      string
+    >
+  | undefined;
 function inputs() {
   if (media) return media;
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-compose-in-")));
@@ -102,7 +119,66 @@ function inputs() {
   ff("-f", "lavfi", "-i", "sine=f=660:r=22050:d=2.3", "-c:a", "libmp3lame", path.join(dir, "n.mp3"));
   ff("-f", "lavfi", "-i", "sine=f=220:r=48000:d=1", "-c:a", "pcm_s16le", path.join(dir, "music.wav"));
   fs.writeFileSync(path.join(dir, "x.pdf"), "%PDF-1.4\n%synthetic\n");
+  // Review r1 inputs: a MOV whose sound starts 0.625 s after its picture; an MP4 with 4 s of picture and 1 s of sound;
+  // a 720×576 picture shown 16:9 (SAR 64:45); a 310 s video (1 fps, tiny); 3 s of narration.
+  ff(
+    ...[
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc2=s=96x64:r=25:d=2",
+      "-itsoffset",
+      "0.625",
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=f=440:r=44100:d=1",
+    ],
+    ...[
+      "-map",
+      "0:v",
+      "-map",
+      "1:a",
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "aac",
+      path.join(dir, "late.mov"),
+    ],
+  );
+  ff(
+    ...["-f", "lavfi", "-i", "testsrc2=s=96x64:r=25:d=4", "-f", "lavfi", "-i", "sine=f=440:r=44100:d=1"],
+    ...[
+      "-map",
+      "0:v",
+      "-map",
+      "1:a",
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "aac",
+      path.join(dir, "short.mp4"),
+    ],
+  );
+  ff(
+    ...["-f", "lavfi", "-i", "color=c=green:s=720x576:r=25:d=1,setsar=64/45"],
+    ...["-c:v", "libx264", "-pix_fmt", "yuv420p", path.join(dir, "ana.mp4")],
+  );
+  ff(
+    ...["-f", "lavfi", "-i", "testsrc2=s=32x32:r=1:d=310"],
+    ...["-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "10", path.join(dir, "long.mp4")],
+  );
+  ff("-f", "lavfi", "-i", "sine=f=330:r=48000:d=3", "-c:a", "libmp3lame", path.join(dir, "n3.mp3"));
   media = {
+    late: path.join(dir, "late.mov"),
+    shortSound: path.join(dir, "short.mp4"),
+    anamorphic: path.join(dir, "ana.mp4"),
+    long: path.join(dir, "long.mp4"),
+    n3: path.join(dir, "n3.mp3"),
     png: path.join(dir, "a.png"),
     wide: path.join(dir, "wide.png"),
     video: path.join(dir, "v.mp4"),
@@ -348,7 +424,7 @@ describe("the plan (review R1–R3)", () => {
     expect(bad({ clips: [{ fileId: "v", trim: { startSec: 1, endSec: 5 } }] })).toMatchObject({
       hint: expect.stringContaining("trim.endSec"),
     });
-    // A transition as long as a clip; two transitions eating a whole clip.
+    // A transition as long as a clip; two transitions together longer than the clip between them.
     expect(
       bad({
         clips: [
@@ -361,7 +437,7 @@ describe("the plan (review R1–R3)", () => {
       bad({
         clips: [
           { fileId: "a", durationSec: 2, transition: { type: "fade", durationSec: 1 } },
-          { fileId: "a", durationSec: 2, transition: { type: "fade", durationSec: 1 } },
+          { fileId: "a", durationSec: 2, transition: { type: "fade", durationSec: 1.5 } },
           { fileId: "a", durationSec: 2 },
         ],
       }),
@@ -403,6 +479,9 @@ describe("the plan (review R1–R3)", () => {
 
   it("subtitles: one text for both tracks — no tags, no override codes, no cue arrow; VTT escapes", () => {
     expect(cueText("  <b>안녕</b> {\\an8}세계\r\n\r\n둘째 --> 줄 \\N ")).toBe("안녕 세계\n둘째 → 줄 ＼N");
+    // Review r1: plain braces are text — only an override block (`{\…}`) is control syntax.
+    expect(cueText("집합 {1, 2}와 한국어")).toBe("집합 {1, 2}와 한국어");
+    expect(toVtt([{ startSec: 0, endSec: 1, text: "집합 {1, 2}" }])).toContain("\n집합 {1, 2}\n");
     const subs = [
       { startSec: 0.25, endSec: 1, text: "A & B < C" },
       { startSec: 61.5, endSec: 3725.004, text: "<i></i>" },
@@ -838,6 +917,215 @@ describe("compose_video: the call and the queue", () => {
   });
 });
 
+describe("review r1: the engine's state (fixture composer)", () => {
+  it("P1: a failed `done` write ends the job (compose_store_failed) and frees the one running slot", async () => {
+    const t = await start();
+    const a = await t.scopeOf("owner");
+    const b = await t.scopeOf("shared");
+    const ia = await t.putFile(a, inputsOrFake().png, "png");
+    const ib = await t.putFile(b, inputsOrFake().png, "png");
+    const files = t.app.files!;
+    const orig = files.addGenerated.bind(files);
+    // The first composition's `done` write fails once (the database, for now).
+    const spy = vi.spyOn(files, "addGenerated").mockImplementationOnce(async (input) =>
+      orig({
+        ...input,
+        video: {
+          ...input.video!,
+          commit: () => {
+            throw new Error("synthetic write failure");
+          },
+        },
+      }),
+    );
+    const ja = await t.queue(a, { clips: [{ fileId: ia, durationSec: 1 }] });
+    await t.jobs.idle();
+    const jb = await t.queue(b, { clips: [{ fileId: ib, durationSec: 1 }] });
+    for (let i = 0; i < 3; i++) await t.drive();
+    spy.mockRestore();
+    expect(t.job(ja)).toMatchObject({ status: "failed", errorCode: "compose_store_failed", fileId: null });
+    expect(t.job(jb).status).toBe("done");
+    expect(t.app.files!.placesTaken(a.conversationId)).toBe(1);
+  });
+
+  it("a job whose end could not be written at all is reaped by the next pass (never a stuck slot)", async () => {
+    const t = await start();
+    const a = await t.scopeOf();
+    const id = crypto.randomUUID();
+    t.db.$client
+      .prepare(
+        `INSERT INTO compose_jobs (id, conversation_id, owner_id, message_id, run_id, status, timeline_json, duration_ms,
+           width, height, clips, subtitles, boot, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'running', '{}', 1000, 1280, 720, 1, 0, ?, 1, 1)`,
+      )
+      .run(id, a.conversationId, a.userId, a.messageId, a.runId, t.jobs.boot);
+    await t.drive();
+    expect(t.job(id)).toMatchObject({ status: "failed", errorCode: "compose_failed" });
+  });
+
+  it("deleting a conversation whose job waits removes its input copies at once", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => (release = r));
+    const t = await start({
+      composer: (d) => {
+        const base = fixtureComposer(d, { stepMs: 1 });
+        return { ...base, compose: async (job) => (await gate, base.compose(job)) };
+      },
+    });
+    const a = await t.scopeOf("owner");
+    const b = await t.scopeOf("shared");
+    const ia = await t.putFile(a, inputsOrFake().png, "png");
+    const ib = await t.putFile(b, inputsOrFake().png, "png");
+    const ja = await t.queue(a, { clips: [{ fileId: ia, durationSec: 1 }] });
+    await new Promise((r) => setTimeout(r, 20));
+    const jb = await t.queue(b, { clips: [{ fileId: ib, durationSec: 1 }] });
+    expect([t.job(ja).status, t.job(jb).status]).toEqual(["running", "queued"]);
+    expect(t.scratch().sort()).toEqual([ja, jb].sort());
+    const del = await t.api(t.f.cookies.shared, "DELETE", `/api/conversations/${b.conversationId}`);
+    expect(del.statusCode).toBeLessThan(300);
+    expect(t.scratch()).toEqual([ja]);
+    release!();
+    await t.jobs.idle();
+    expect(t.job(ja).status).toBe("done");
+  });
+
+  it("a failed preparing→queued write: the call fails with a fixed code and the user is not left busy", async () => {
+    const t = await start();
+    const a = await t.scopeOf();
+    const img = await t.putFile(a, inputsOrFake().png, "png");
+    t.db.$client
+      .exec(`CREATE TRIGGER fail_queue BEFORE UPDATE OF status ON compose_jobs WHEN NEW.status = 'queued'
+      BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END;`);
+    expect(await t.call(a, { clips: [{ fileId: img, durationSec: 1 }] })).toMatchObject({
+      ok: false,
+      code: "media_failed",
+    });
+    t.db.$client.exec("DROP TRIGGER fail_queue");
+    expect(t.db.$client.prepare("SELECT count(*) n FROM compose_jobs").get()).toEqual({ n: 0 });
+    expect(t.scratch()).toEqual([]);
+    // Its clean-up failing too: the row is reaped by the engine's next pass.
+    t.db.$client
+      .exec(`CREATE TRIGGER fail_queue BEFORE UPDATE OF status ON compose_jobs WHEN NEW.status = 'queued'
+      BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END;
+      CREATE TRIGGER fail_delete BEFORE DELETE ON compose_jobs BEGIN SELECT RAISE(ABORT, 'synthetic'); END;`);
+    const b = await t.scopeOf();
+    const img2 = await t.putFile(b, inputsOrFake().png, "png");
+    expect(await t.call(b, { clips: [{ fileId: img2, durationSec: 1 }] })).toMatchObject({
+      code: "media_failed",
+    });
+    t.db.$client.exec("DROP TRIGGER fail_queue; DROP TRIGGER fail_delete;");
+    expect(t.db.$client.prepare("SELECT status FROM compose_jobs").all()).toEqual([{ status: "preparing" }]);
+    await t.drive();
+    expect(t.db.$client.prepare("SELECT count(*) n FROM compose_jobs").get()).toEqual({ n: 0 });
+    const c = await t.scopeOf();
+    const img3 = await t.putFile(c, inputsOrFake().png, "png");
+    expect((await t.call(c, { clips: [{ fileId: img3, durationSec: 1 }] })).ok).toBe(true);
+  });
+
+  it("the deadline holds through the store: a store waiting past it commits nothing and frees the slot at once", async () => {
+    const t = await start({ limits: { timeoutMs: 100 }, composer: (d) => fixtureComposer(d, { stepMs: 1 }) });
+    const a = await t.scopeOf();
+    const img = await t.putFile(a, inputsOrFake().png, "png");
+    const files = t.app.files!;
+    const orig = files.addGenerated.bind(files);
+    // The file lock is held (a backup, say) for 400 ms.
+    vi.spyOn(files, "addGenerated").mockImplementationOnce(async (input) => {
+      await new Promise((r) => setTimeout(r, 400));
+      return orig(input);
+    });
+    const id = await t.queue(a, { clips: [{ fileId: img, durationSec: 1 }] });
+    await new Promise((r) => setTimeout(r, 250));
+    expect(t.job(id)).toMatchObject({ status: "failed", errorCode: "compose_timeout" });
+    await t.jobs.idle();
+    expect(t.job(id)).toMatchObject({ status: "failed", errorCode: "compose_timeout", fileId: null });
+    expect(t.db.$client.prepare("SELECT count(*) n FROM files WHERE kind = 'mp4'").get()).toEqual({ n: 0 });
+    expect(t.scratch()).toEqual([]);
+  });
+
+  it("a filesystem error never reaches the model with its path: a fixed code", async () => {
+    const t = await start({
+      composer: (d) => ({
+        ...fixtureComposer(d),
+        workdir: () => {
+          throw new Error("EACCES: permission denied, mkdir '/synthetic/secret/compose-scratch/x'");
+        },
+      }),
+    });
+    const a = await t.scopeOf();
+    const img = await t.putFile(a, inputsOrFake().png, "png");
+    const r = await t.call(a, { clips: [{ fileId: img, durationSec: 1 }] });
+    expect(r).toMatchObject({ ok: false, code: "media_failed" });
+    expect(JSON.stringify(r)).not.toContain("/synthetic");
+  });
+});
+
+describe("review r1: the plan (pure)", () => {
+  it("trims point into the source by its own length; a short video clip is fine; 0.5 s is an image's minimum", () => {
+    const I = ins(
+      info("long", { kind: "video", durationSec: 310 }),
+      info("v", { kind: "video", durationSec: 2 }),
+      info("a", { kind: "image" }),
+    );
+    const p = planTimeline({ clips: [{ fileId: "long", trim: { startSec: 301, endSec: 302 } }] }, I) as Plan;
+    expect(isPlanError(p)).toBe(false);
+    expect([p.frames, p.clips[0]!.startSec]).toEqual([30, 301]);
+    const short = planTimeline({ clips: [{ fileId: "v", trim: { startSec: 0.1, endSec: 0.4 } }] }, I) as Plan;
+    expect(short.frames).toBe(9);
+    expect(planTimeline({ clips: [{ fileId: "a", durationSec: 0.3 }] }, I)).toMatchObject({
+      code: "compose_invalid_timeline",
+    });
+    expect(planTimeline({ clips: [{ fileId: "v", trim: { startSec: 300, endSec: 301 } }] }, I)).toMatchObject(
+      {
+        hint: expect.stringContaining("trim.startSec"),
+      },
+    );
+    // The tool's own schema takes such a trim (the 5-minute cap is the output's).
+    expect(
+      COMPOSE_VIDEO_TOOL.input.timeline.safeParse({
+        clips: [{ fileId: "x", trim: { startSec: 301, endSec: 302 } }],
+      }).success,
+    ).toBe(true);
+  });
+
+  it("a clip that is all transition (its two transitions meet) has no body of its own", () => {
+    const p = planTimeline(
+      {
+        clips: [
+          { fileId: "a", durationSec: 1, transition: { type: "fade", durationSec: 0.5 } },
+          { fileId: "a", durationSec: 1, transition: { type: "fade", durationSec: 0.5 } },
+          { fileId: "a", durationSec: 1 },
+        ],
+      },
+      ins(info("a", { kind: "image" })),
+    ) as Plan;
+    expect(isPlanError(p)).toBe(false);
+    expect(p.frames).toBe(60);
+    expect(concatList(p)).toBe(
+      "ffconcat version 1.0\nfile 'body-0.mp4'\nfile 'trans-0.mp4'\nfile 'trans-1.mp4'\nfile 'body-2.mp4'\n",
+    );
+    expect(clipArgs(p, 1, "/in")).not.toContain("body-1.mp4");
+  });
+
+  it("narration ends with its sound (not the video's picture); a held last image keeps still after its move", () => {
+    const p = planTimeline(
+      {
+        clips: [{ fileId: "a", durationSec: 1, kenBurns: "in" }],
+        narration: [{ fileId: "s", startSec: 0 }],
+      },
+      ins(info("a", { kind: "image" }), info("s", { kind: "video", durationSec: 4, audioSec: 1.02 })),
+    ) as Plan;
+    expect(p.frames).toBe(31);
+    const q = planTimeline(
+      { clips: [{ fileId: "a", durationSec: 1, kenBurns: "in" }], narration: [{ fileId: "n", startSec: 0 }] },
+      ins(info("a", { kind: "image" }), info("n", { kind: "audio", durationSec: 3, audioSec: 3 })),
+    ) as Plan;
+    expect(q.clips[0]).toMatchObject({ frames: 90, still: 60 });
+    const g = clipArgs(q, 0, "/in").join(" ");
+    expect(g).toContain(":d=30:");
+    expect(g).toContain("tpad=stop_mode=clone");
+  });
+});
+
 /** The real inputs when ffmpeg is here; else files of the right kinds (the fixture composer never reads them). */
 function inputsOrFake() {
   if (HAVE_FFMPEG) return inputs();
@@ -851,6 +1139,11 @@ function inputsOrFake() {
     mp3: w("n.mp3", "mp3"),
     wav: w("m.wav", "wav"),
     pdf: w("x.pdf", "%PDF"),
+    late: w("l.mp4", "mp4"),
+    shortSound: w("s.mp4", "mp4"),
+    anamorphic: w("an.mp4", "mp4"),
+    long: w("lo.mp4", "mp4"),
+    n3: w("n3.mp3", "mp3"),
   };
 }
 
@@ -980,6 +1273,148 @@ describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", 
     expect(peak).toBeGreaterThan(0);
     expect(peak).toBeLessThan(2 * 1024 ** 3);
   }, 600_000);
+
+  // ---- review r1, with the real ffmpeg
+  const frameAt = (file: string, sec: number) =>
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-ss", String(sec), "-i", file, "-frames:v", "1"],
+      ...["-vf", "scale=160:90", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+    ]);
+  const pcmOf = (file: string) => {
+    const b = execFileSync(
+      FFMPEG,
+      [
+        "-hide_banner",
+        "-v",
+        "error",
+        "-i",
+        file,
+        "-map",
+        "0:a:0",
+        "-ac",
+        "1",
+        "-ar",
+        "48000",
+        "-f",
+        "s16le",
+        "-",
+      ],
+      {
+        maxBuffer: 64 * 1024 * 1024,
+      },
+    );
+    return Array.from({ length: b.length / 2 }, (_, i) => b.readInt16LE(i * 2));
+  };
+  const composeOne = async (
+    t: Awaited<ReturnType<typeof start>>,
+    scope: { userId: string; conversationId: string; runId: string },
+    timeline: unknown,
+  ) => {
+    const id = await t.queue(scope, timeline);
+    await t.drive();
+    const done = t.job(id);
+    expect(done.status, String(done.errorCode)).toBe("done");
+    return t.app.files!.pathOf(t.app.files!.get(done.fileId!)!);
+  };
+
+  it("review r1: a MOV whose sound starts 0.625 s late keeps it late (one time origin, silence before)", async () => {
+    const t = await start({ composer: real });
+    const s1 = await t.scopeOf();
+    const mov = await t.putFile(s1, inputs().late, "mp4");
+    const out = await composeOne(t, s1, { clips: [{ fileId: mov }] });
+    const pcm = pcmOf(out);
+    const first = pcm.findIndex((v) => Math.abs(v) > 1000) / 48_000;
+    expect(first).toBeGreaterThan(0.55);
+    expect(first).toBeLessThan(0.7);
+  });
+
+  it("review r1: a held Ken Burns image stops moving at its own length; narration from a video ends with its sound", async () => {
+    const t = await start({ composer: real });
+    const s1 = await t.scopeOf();
+    const img = await t.putFile(s1, inputs().png, "png");
+    const n3 = await t.putFile(s1, inputs().n3, "mp3");
+    const out = await composeOne(t, s1, {
+      clips: [{ fileId: img, durationSec: 1, kenBurns: "in" }],
+      narration: [{ fileId: n3, startSec: 0 }],
+    });
+    const a = frameAt(out, 1.1);
+    const b = frameAt(out, 2.8);
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff += Math.abs(a[i]! - b[i]!);
+    expect(diff / a.length).toBeLessThan(1);
+    // 4 s of picture with 1 s of sound, as narration over a 1 s picture: about 1 s, not 4.
+    const s2 = await t.scopeOf();
+    const img2 = await t.putFile(s2, inputs().png, "png");
+    const vid = await t.putFile(s2, inputs().shortSound, "mp4");
+    const id = await t.queue(s2, {
+      clips: [{ fileId: img2, durationSec: 1 }],
+      narration: [{ fileId: vid, startSec: 0 }],
+    });
+    expect(t.job(id).durationMs).toBeLessThan(1200);
+    await t.drive();
+    expect(t.job(id).status).toBe("done");
+  });
+
+  it("review r1: non-square pixels shown by their aspect; plain braces in subtitles; short and far trims; all-transition clips", async () => {
+    const t = await start({ composer: real });
+    const s1 = await t.scopeOf();
+    const ana = await t.putFile(s1, inputs().anamorphic, "mp4");
+    const out = await composeOne(t, s1, {
+      clips: [{ fileId: ana }],
+      subtitles: [{ startSec: 0, endSec: 0.9, text: "집합 {1, 2}와 한국어" }],
+    });
+    // 720×576 at SAR 64:45 is 16:9: it fills the 1280×720 frame (no side bars) — the left edge is green.
+    const f = frameAt(out, 0.5);
+    const at = (x: number, y: number) => [
+      f[(y * 160 + x) * 3]!,
+      f[(y * 160 + x) * 3 + 1]!,
+      f[(y * 160 + x) * 3 + 2]!,
+    ];
+    expect(at(3, 45)[1]).toBeGreaterThan(80);
+    const srt = execFileSync(FFMPEG, [
+      "-hide_banner",
+      "-v",
+      "error",
+      "-i",
+      out,
+      "-map",
+      "0:s:0",
+      "-f",
+      "srt",
+      "-",
+    ]).toString();
+    expect(srt).toContain("집합 {1, 2}와 한국어");
+    const id = (
+      t.db.$client
+        .prepare("SELECT id FROM compose_jobs WHERE conversation_id = ?")
+        .get(s1.conversationId) as {
+        id: string;
+      }
+    ).id;
+    expect((await t.api(t.f.cookies.owner, "GET", `/api/compose-jobs/${id}/subtitles.vtt`)).body).toContain(
+      "집합 {1, 2}와 한국어",
+    );
+    // A far trim of a 310 s source, a 0.3 s trim, and a middle image that is all transition.
+    const s2 = await t.scopeOf();
+    const long = await t.putFile(s2, inputs().long, "mp4");
+    const vid = await t.putFile(s2, inputs().video, "mp4");
+    const img = await t.putFile(s2, inputs().png, "png");
+    const out2 = await composeOne(t, s2, {
+      clips: [
+        {
+          fileId: long,
+          trim: { startSec: 301, endSec: 302 },
+          transition: { type: "fade", durationSec: 0.5 },
+        },
+        { fileId: img, durationSec: 1, transition: { type: "dissolve", durationSec: 0.5 } },
+        { fileId: vid, trim: { startSec: 0.1, endSec: 0.8 } },
+        { fileId: vid, trim: { startSec: 0.1, endSec: 0.4 } },
+      ],
+    });
+    // 30 + 30 + 21 + 9 − 15 − 15 frames.
+    const v = probeJson(out2).streams.find((x) => x.codec_type === "video")!;
+    expect(Number(v.nb_read_packets)).toBe(60);
+  });
 
   it("readiness: a tiny composition checked in the same sandbox", async () => {
     const dataDir = path.join(tmp(), "data");

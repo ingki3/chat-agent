@@ -64,6 +64,11 @@ export type InputInfo = {
   name: string;
   /** Seconds (video, audio); null for an image. */
   durationSec: number | null;
+  /**
+   * Review r1: where its first sound stream ends, from the file's start (its own start and length — a video's sound
+   * may be shorter than its picture); null without sound.
+   */
+  audioSec?: number | null;
   hasVideo: boolean;
   hasAudio: boolean;
   width: number | null;
@@ -82,6 +87,11 @@ export type PlanClip = {
   kenBurns: "in" | "out" | "left" | "right" | null;
   volume: number;
   hasAudio: boolean;
+  /**
+   * Review r1: frames at its end that only hold its last picture (the last clip, held for the narration) — a Ken
+   * Burns move ends at the clip's own length, then holds.
+   */
+  still?: number;
   /** Frames overlapped with the clip before (its transition) and after (this clip's transition). */
   head: number;
   tail: number;
@@ -160,7 +170,7 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
     if (info.kind === "image") {
       if (c.durationSec === undefined)
         return err("compose_invalid_timeline", `${where}.durationSec: required for an image`);
-      if (c.durationSec > 30)
+      if (c.durationSec > 30 || c.durationSec < COMPOSE_LIMITS.minImageSeconds)
         return err("compose_invalid_timeline", `${where}.durationSec: an image shows 0.5–30 s`);
       if (c.trim) return err("compose_invalid_timeline", `${where}.trim: only for a video`);
       if (c.volume !== undefined)
@@ -205,7 +215,8 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
     const source = end - start;
     const dur = c.durationSec ?? source;
     const n = frames(dur);
-    if (n < frames(0.5)) return err("compose_invalid_timeline", `${where}: a clip is at least 0.5 s`);
+    // A video clip may be short (review r1): one frame at least — the 0.5 s minimum is an image's.
+    if (n < 1) return err("compose_invalid_timeline", `${where}: a clip is at least one frame (1/30 s)`);
     clips.push({
       input: info.name,
       fileKind: info.fileKind,
@@ -223,7 +234,8 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
       at: 0,
     });
   }
-  // Transitions (review R1): a whole number of frames, shorter than both clips, each clip keeping a frame of its own.
+  // Transitions (review R1): a whole number of frames, shorter than both clips. A clip between two transitions may be
+  // all transition (review r1: its own part is then empty and left out).
   for (const [i, c] of t.clips.entries()) {
     if (!c.transition) continue;
     const d = frames(c.transition.durationSec);
@@ -239,10 +251,10 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
     b.head = d;
   }
   for (const [i, c] of clips.entries())
-    if (c.frames - c.head - c.tail < 1)
+    if (c.frames - c.head - c.tail < 0)
       return err(
         "compose_invalid_timeline",
-        `clips[${i}]: its transitions in and out together must be shorter than the clip`,
+        `clips[${i}]: its transitions in and out together must not be longer than the clip`,
       );
   let total = 0;
   for (const c of clips) {
@@ -264,7 +276,9 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
       startSample,
       maxSamples: COMPOSE_LIMITS.maxSeconds * RATE - startSample,
     });
-    needed = Math.max(needed, Math.ceil((n.startSec + (info.durationSec ?? 0)) * FPS - 1e-6));
+    // Review r1: the sound's own end (a video's sound can be shorter than its picture).
+    const sound = info.audioSec ?? info.durationSec ?? 0;
+    needed = Math.max(needed, Math.ceil((n.startSec + sound) * FPS - 1e-6));
   }
   const max = COMPOSE_LIMITS.maxSeconds * FPS;
   if (needed > max || total > max)
@@ -273,7 +287,11 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
       `the video would be ${(Math.max(needed, total) / FPS).toFixed(1)} s (at most ${COMPOSE_LIMITS.maxSeconds})`,
     );
   const held = needed - total;
-  if (held > 0) clips[clips.length - 1]!.frames += held;
+  if (held > 0) {
+    const last = clips[clips.length - 1]!;
+    last.frames += held;
+    last.still = held;
+  }
   total = needed;
   for (const n of narration) n.maxSamples = Math.max(0, total * SPF - n.startSample);
   let music: PlanMusic | null = null;
@@ -325,7 +343,8 @@ export function cueText(raw: string): string {
       // eslint-disable-next-line no-control-regex -- control characters are not part of a cue
       .replace(/[\0-\x09\x0b-\x1f\x7f-\x9f]/g, "")
       .replace(/<[^>]*>/g, "")
-      .replace(/\{[^}]*\}/g, "")
+      // Only an override block (`{\an8}`, `{\i1}`) is control syntax; plain braces are text (review r1).
+      .replace(/\{\\[^}]*\}/g, "")
       .replace(/\\/g, "＼")
       .replace(/-->/g, "→")
       .split("\n")
@@ -443,6 +462,8 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
   const N = c.frames;
   const p = pieces(i);
   const file = path.join(inDir, c.input);
+  // Square pixels first (review r1: a 720×576 picture with SAR 64:45 is 16:9 on screen), then letterbox or crop.
+  const square = "scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1";
   const fit = (w: number, h: number) =>
     c.fit === "crop"
       ? `scale=${w}:${h}:force_original_aspect_ratio=increase:force_divisible_by=2,crop=${w}:${h}`
@@ -450,7 +471,10 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
   const exact = `trim=end_frame=${N},settb=1/${FPS},setpts=N,fps=${FPS}`;
   let picture: string;
   if (c.kind === "image") {
-    const last = Math.max(1, N - 1);
+    // A Ken Burns move takes the clip's own frames; frames held for the narration repeat its last one (review r1).
+    const still = c.still ?? 0;
+    const moving = N - still;
+    const last = Math.max(1, moving - 1);
     const kb: Record<NonNullable<PlanClip["kenBurns"]>, string> = {
       in: `z='1+0.15*on/${last}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'`,
       out: `z='1.15-0.15*on/${last}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'`,
@@ -458,14 +482,18 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
       right: `z='1.15':x='(iw-iw/zoom)*on/${last}':y='ih/2-(ih/zoom/2)'`,
     };
     picture = c.kenBurns
-      ? `[0:v]trim=end_frame=1,${fit(W * 2, H * 2)},setsar=1,format=yuv420p,zoompan=${kb[c.kenBurns]}:d=${N}:s=${W}x${H}:fps=${FPS},${exact}`
-      : `[0:v]trim=end_frame=1,${fit(W, H)},setsar=1,format=yuv420p,loop=loop=${N - 1}:size=1:start=0,${exact}`;
+      ? `[0:v]trim=end_frame=1,${square},${fit(W * 2, H * 2)},setsar=1,format=yuv420p,zoompan=${kb[c.kenBurns]}:d=${moving}:s=${W}x${H}:fps=${FPS},tpad=stop_mode=clone:stop=-1,${exact}`
+      : `[0:v]trim=end_frame=1,${square},${fit(W, H)},setsar=1,format=yuv420p,loop=loop=${N - 1}:size=1:start=0,${exact}`;
   } else {
-    picture = `[0:v]setpts=PTS-STARTPTS,fps=${FPS},${fit(W, H)},setsar=1,format=yuv420p,tpad=stop_mode=clone:stop=-1,${exact}`;
+    // One time origin for picture and sound (review r1): the seek point is 0 for both — a picture that starts late
+    // repeats its first frame from 0 (`fps` `start_time`), a sound that starts late is preceded by silence.
+    picture = `[0:v]fps=${FPS}:start_time=0,${square},${fit(W, H)},setsar=1,format=yuv420p,tpad=stop_mode=clone:stop=-1,${exact}`;
   }
   const outs: { label: string; from: number; to: number; args: string[] }[] = [];
   if (c.head) outs.push({ label: "hv", from: 0, to: c.head, args: [...LOSSLESS, p.head] });
-  outs.push({ label: "bv", from: c.head, to: N - c.tail, args: [...H264, p.body] });
+  // A clip that is all transition (review r1) has no body of its own.
+  if (N - c.head - c.tail > 0)
+    outs.push({ label: "bv", from: c.head, to: N - c.tail, args: [...H264, p.body] });
   if (c.tail) outs.push({ label: "tv", from: N - c.tail, to: N, args: [...LOSSLESS, p.tail] });
   const graph = [
     outs.length === 1
@@ -473,7 +501,7 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
       : `${picture},split=${outs.length}${outs.map((_, k) => `[s${k}]`).join("")}`,
     ...outs.map((o, k) => `[s${k}]trim=start_frame=${o.from}:end_frame=${o.to},setpts=N[${o.label}]`),
     c.kind === "video" && c.hasAudio
-      ? `[0:a:0]asetpts=PTS-STARTPTS,aresample=${RATE},aformat=sample_fmts=s16:channel_layouts=stereo,volume=${num(c.volume)},apad,atrim=end_sample=${N * SPF}[a]`
+      ? `[0:a:0]aresample=${RATE}:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,volume=${num(c.volume)},apad,atrim=end_sample=${N * SPF}[a]`
       : `anullsrc=r=${RATE}:cl=stereo,atrim=end_sample=${N * SPF},aformat=sample_fmts=s16[a]`,
   ].join(";");
   const seek = c.kind === "video" ? ["-ss", num(c.startSec), "-t", num(Math.max(c.useSec, 1 / FPS))] : [];
@@ -514,7 +542,7 @@ export function transitionArgs(plan: Plan, i: number): string[] {
 export function concatList(plan: Plan): string {
   const names: string[] = [];
   for (const [i, c] of plan.clips.entries()) {
-    names.push(pieces(i).body);
+    if (c.frames - c.head - c.tail > 0) names.push(pieces(i).body);
     if (c.tail) names.push(`trans-${i}.mp4`);
   }
   return `ffconcat version 1.0\n${names.map((n) => `file '${n}'`).join("\n")}\n`;
@@ -534,7 +562,7 @@ export function decodeArgs(o: {
     "-map",
     "0:a:0",
     "-af",
-    `asetpts=PTS-STARTPTS,aresample=${RATE},aformat=sample_fmts=s16:channel_layouts=stereo,atrim=end_sample=${Math.max(1, o.maxSamples)}`,
+    `aresample=${RATE}:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,atrim=end_sample=${Math.max(1, o.maxSamples)}`,
     ...PCM,
     o.out,
   ];
@@ -674,7 +702,7 @@ export function probeArgs(file: string, fileKind: FileKind): string[] {
     "-f",
     DEMUXER[fileKind]!,
     "-show_entries",
-    "format=format_name,duration:stream=codec_type,codec_name,width,height,duration:stream_disposition=attached_pic",
+    "format=format_name,duration,start_time:stream=codec_type,codec_name,width,height,duration,start_time:stream_disposition=attached_pic",
     "-of",
     "json",
     file,
