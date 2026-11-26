@@ -1120,7 +1120,8 @@ export class VideoJobs {
       await new Promise<void>((r) => setTimeout(r, 0).unref());
     }
     // The budget's end: one last try of what is still unrecorded (anything handed over at its very end included),
-    // each write waiting on a lock at most STOP_LAST_WRITE_MS — past the budget by at most that much per outcome.
+    // each SQLite write call waiting on a lock at most STOP_LAST_WRITE_MS. One outcome may take several write calls, so
+    // under contention the waits add up: the stop may run past the budget by that much (~10.12 s measured, one outcome).
     if (left() <= 0 || unrecorded.size) round(STOP_LAST_WRITE_MS);
     // Still not recorded (the database not writable through the shutdown): the next start ends these jobs by the
     // rows' own rule (bound kept) — said in the log (the job's id only).

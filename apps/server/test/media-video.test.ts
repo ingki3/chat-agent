@@ -3016,32 +3016,47 @@ describe("video jobs — review r13 regressions (a hand-over wakes the stop's fl
     const card = await t.card();
     const approval = t.approve(card.jobId, 0);
     await vi.waitFor(() => expect(deliver).toBeDefined());
-    const begin = Date.now();
-    let deliveredAt = -1;
+    // A controlled clock for the stop (the engine's own clock is unaffected): frozen at the stop's start, then moved
+    // to 127 ms before the budget's end — the flush's next wait is then exactly 127 ms, its final wait. The 402 is
+    // delivered once that wait is entered (a hook on its timer, not a real-time window), and that timer is stretched
+    // to 5 s: only the hand-over's wake can end it early — no event-loop delay can skip or pass the moment.
+    const T = Date.now();
+    let clock = T;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => clock);
     const timer = globalThis.setTimeout;
+    let finalWait = false;
+    let finalWaitFired = false;
+    let recordedBeforeEnd: boolean;
     const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
       fn: (...args: unknown[]) => void,
       ms: number,
       ...args: unknown[]
     ) => {
-      const h = timer(fn, ms, ...args);
-      if (Date.now() - begin > 9600 && ms > 3 && ms < 200 && deliveredAt < 0)
-        timer(
-          () => {
-            deliveredAt = Date.now() - begin;
-            deliver(new Response(null, { status: 402 }));
-          },
-          Math.max(1, Math.floor(ms / 4)),
-        );
-      return h;
+      if (finalWait || ms !== 127 || clock !== T + 9_873) return timer(fn, ms, ...args);
+      finalWait = true;
+      setImmediate(() => deliver(new Response(null, { status: 402 })));
+      return timer(
+        (...a: unknown[]) => {
+          finalWaitFired = true;
+          clock = T + 10_000;
+          fn(...a);
+        },
+        5_000,
+        ...args,
+      );
     }) as typeof setTimeout);
     try {
-      await Promise.all([approval, t.video.stop()]);
+      const stopping = t.video.stop();
+      clock = T + 9_873;
+      await Promise.all([approval, stopping]);
+      recordedBeforeEnd = clock < T + 10_000;
     } finally {
       spy.mockRestore();
+      nowSpy.mockRestore();
     }
-    expect(deliveredAt).toBeGreaterThan(0);
-    expect(deliveredAt).toBeLessThan(10_000);
+    expect(finalWait).toBe(true);
+    expect(finalWaitFired).toBe(false);
+    expect(recordedBeforeEnd).toBe(true);
     expect(t.job(card.jobId)).toMatchObject({ status: "failed", errorCode: "video_payment" });
     expect(t.usage()).toHaveLength(0);
     expect(server.posts()).toHaveLength(1);
