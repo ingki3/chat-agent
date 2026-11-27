@@ -1837,9 +1837,9 @@ describe("review r8: one presentation per track (pure)", () => {
       soundAt: eq,
     });
     expect(a[a.indexOf("-af") + 1]).toMatch(
-      /^asettb=1\/3000000,aresample=48000,atrim=start_pts=12000,aresample=48000:async=1:/,
+      /^asettb=1\/3000000,aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,atrim=start_pts=12000,aresample=48000:async=1:/,
     );
-    expect(a[a.indexOf("-af") + 1]).toContain(",atrim=end_sample=84000,");
+    expect(a[a.indexOf("-af") + 1]).toMatch(/,atrim=end_sample=84000$/);
   });
 });
 
@@ -1915,6 +1915,128 @@ describe("review r10: no time in a graph is a decimal of seconds (pure)", () => 
       "afade=t=in:st=0:d=0.35",
     ])
       expect([old, decimalTimes(old).length > 0]).toEqual([old, true]);
+  });
+});
+
+describe("review r11: samples counted at 48 kHz, pieces of their planned length, fades in samples (pure)", () => {
+  const PIN = /aresample=48000,aformat=sample_fmts=(?:fltp|s16):sample_rates=48000:channel_layouts=stereo,$/;
+  // Every filter that counts samples, and what stands right before it.
+  const unpinned = (g: string) => {
+    const bad: string[] = [];
+    for (const m of g.matchAll(
+      /\b(?:atrim=[^,;[]*\b(?:start_pts|end_pts|start_sample|end_sample)=|afade=[^,;[]*\b(?:ss|ns)=|apad=[^,;[]*whole_len)/g,
+    ))
+      if (!PIN.test(g.slice(0, m.index))) bad.push(g.slice(Math.max(0, m.index - 60), m.index + 30));
+    return bad;
+  };
+  it("every sample-counting filter of the sound and the ingest has 48 kHz stereo pinned right before it", () => {
+    const I = ins(
+      info("a", { kind: "image" }),
+      info("v", {
+        kind: "video",
+        durationSec: 9,
+        audioTrack: { edited: true, lead: q(1, 4), mediaTime: q(1, 4), end: q(7, 4) },
+        origin: q(0),
+      }),
+      info("m", { kind: "audio", durationSec: 9, audioSec: 9 }),
+    );
+    const graphs: string[] = [];
+    for (const sec of [1, 2.9, 3, 3.8, 4])
+      for (const duck of [true, false])
+        for (const narration of [true, false]) {
+          const plan = planTimeline(
+            {
+              clips: [{ fileId: "a", durationSec: sec }],
+              music: { fileId: "m", duck, fadeInSec: 0.3, fadeOutSec: 0.2 },
+            },
+            I,
+          ) as Plan;
+          const au = audioArgs(plan, { narration, music: "m.pcm" });
+          graphs.push(au[au.indexOf("-filter_complex") + 1]!);
+        }
+    for (const at of [
+      presentTrack(I.get("v")!.audioTrack, q(0)),
+      presentTrack({ edited: false, lead: q(0), mediaTime: q(0), end: q(3) }),
+      presentTrack(null),
+    ]) {
+      const a = ingestArgs({
+        inDir: "/in",
+        input: "v",
+        fileKind: "mp4",
+        sound: true,
+        countPicture: false,
+        capSec: 3,
+        soundAt: at,
+      });
+      graphs.push(a[a.indexOf("-af") + 1]!);
+    }
+    for (const g of graphs) expect([g, unpinned(g)]).toEqual([g, []]);
+    expect(graphs.join(";").match(/atrim=end_sample=/g)!.length).toBeGreaterThan(40);
+    // The guard sees the old form (a compressor straight into a sample cut).
+    expect(
+      unpinned("[bedin][bedsc]sidechaincompress=threshold=0.03,atrim=end_sample=192000[bed]"),
+    ).toHaveLength(1);
+  });
+
+  it("fades that exactly fill the length are taken (0.4 + 0.2 s of 0.6 s); a fade that rounds to 0 samples is left out", () => {
+    const I = ins(info("a", { kind: "image" }), info("m", { kind: "audio", durationSec: 9, audioSec: 9 }));
+    const full = planTimeline(
+      { clips: [{ fileId: "a", durationSec: 0.6 }], music: { fileId: "m", fadeInSec: 0.4, fadeOutSec: 0.2 } },
+      I,
+    );
+    expect(isPlanError(full)).toBe(false);
+    const g = audioArgs(full as Plan, { narration: false, music: "m.pcm" });
+    expect(g[g.indexOf("-filter_complex") + 1]).toContain("afade=t=in:ss=0:ns=19200");
+    expect(g[g.indexOf("-filter_complex") + 1]).toContain("afade=t=out:ss=19200:ns=9600");
+    expect(
+      planTimeline(
+        {
+          clips: [{ fileId: "a", durationSec: 0.6 }],
+          music: { fileId: "m", fadeInSec: 0.41, fadeOutSec: 0.2 },
+        },
+        I,
+      ),
+    ).toMatchObject({ code: "compose_invalid_timeline" });
+    const tiny = planTimeline(
+      {
+        clips: [{ fileId: "a", durationSec: 1 }],
+        music: { fileId: "m", fadeInSec: 0.00001, fadeOutSec: 0.000001 },
+      },
+      I,
+    ) as Plan;
+    const t = audioArgs(tiny, { narration: false, music: "m.pcm" });
+    expect(t[t.indexOf("-filter_complex") + 1]).not.toContain("afade");
+  });
+
+  it("the concat list gives each piece its planned length in whole microseconds — no drift over 40 pieces", () => {
+    const I = ins(info("a", { kind: "image" }));
+    const plan = planTimeline(
+      {
+        clips: Array.from({ length: 40 }, (_, i) => ({
+          fileId: "a",
+          durationSec: 0.5,
+          ...(i < 39 ? { transition: { type: "fade" as const, durationSec: 7 / 30 } } : {}),
+        })),
+      },
+      I,
+    ) as Plan;
+    const list = concatList(plan);
+    const ds = [...list.matchAll(/^duration (\d+\.\d{6})$/gm)].map((m) => Math.round(Number(m[1]) * 1e6));
+    // Each piece starts where its frames so far end, to the microsecond.
+    let frames = 0;
+    let at = 0;
+    const lengths: number[] = [];
+    for (const c of plan.clips) {
+      if (c.frames - c.head - c.tail > 0) lengths.push(c.frames - c.head - c.tail);
+      if (c.tail) lengths.push(c.tail);
+    }
+    expect(ds).toHaveLength(lengths.length);
+    for (const [k, n] of lengths.entries()) {
+      at += ds[k]!;
+      frames += n;
+      expect([k, at]).toEqual([k, Math.round((frames * 1e6) / 30)]);
+    }
+    expect(frames).toBe(plan.frames);
   });
 });
 
@@ -2006,7 +2128,8 @@ describe("review r1: the plan (pure)", () => {
     expect(isPlanError(p)).toBe(false);
     expect(p.frames).toBe(60);
     expect(concatList(p)).toBe(
-      "ffconcat version 1.0\nfile 'body-0.mp4'\nfile 'trans-0.mp4'\nfile 'trans-1.mp4'\nfile 'body-2.mp4'\n",
+      "ffconcat version 1.0\nfile 'body-0.mp4'\nduration 0.500000\nfile 'trans-0.mp4'\nduration 0.500000\n" +
+        "file 'trans-1.mp4'\nduration 0.500000\nfile 'body-2.mp4'\nduration 0.500000\n",
     );
     expect(clipArgs(p, 1, "/in")).not.toContain("body-1.mp4");
   });
@@ -3594,6 +3717,104 @@ describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", 
         expect([rate, from, out]).toEqual([rate, from, out.map((_, n) => at(n, from))]);
       }
     }
+  }, 600_000);
+
+  // ---- review r11, with the real ffmpeg
+  it("review r11: with a narration (0.5 s of silence), clip sound and music — ducked or not — last to the end of a 3, 3.8 and 4 s result", async () => {
+    const dir = tmp();
+    const half = path.join(dir, "silent-0.5.wav");
+    execFileSync(FFMPEG, [
+      ...[
+        "-hide_banner",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=r=48000:cl=stereo,atrim=duration=0.5",
+      ],
+      ...["-c:a", "pcm_s16le", half],
+    ]);
+    const t = await start({ composer: real });
+    for (const sec of [3, 3.8, 4]) {
+      const mov = path.join(dir, `tone-${sec}.mp4`);
+      execFileSync(FFMPEG, [
+        ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i", `color=c=black:s=64x64:r=30:d=${sec}`],
+        ...["-f", "lavfi", "-i", `sine=f=440:r=48000:d=${sec}`, "-c:v", "libx264", "-pix_fmt", "yuv420p"],
+        ...["-c:a", "aac", "-shortest", mov],
+      ]);
+      const wav = path.join(dir, `music-${sec}.wav`);
+      execFileSync(FFMPEG, [
+        ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i", `sine=f=330:r=48000:d=${sec + 1}`],
+        ...["-c:a", "pcm_s16le", wav],
+      ]);
+      const s = await t.scopeOf();
+      const v = await t.putFile(s, mov, "mp4");
+      const n = await t.putFile(s, half, "wav");
+      const out = await composeOne(t, s, { clips: [{ fileId: v }], narration: [{ fileId: n, startSec: 0 }] });
+      const pcm = pcmOf(out);
+      expect(["clip", sec, pcm.length / 48_000]).toEqual(["clip", sec, expect.closeTo(sec, 1)]);
+      expect(["clip", sec, loudness(pcm, sec - 0.1, sec - 0.01) > 1000]).toEqual(["clip", sec, true]);
+      for (const duck of [true, false]) {
+        const s2 = await t.scopeOf();
+        const img = await t.putFile(s2, inputs().png, "png");
+        const n2 = await t.putFile(s2, half, "wav");
+        const mus = await t.putFile(s2, wav, "wav");
+        const out2 = await composeOne(t, s2, {
+          clips: [{ fileId: img, durationSec: sec }],
+          narration: [{ fileId: n2, startSec: 0 }],
+          music: { fileId: mus, volume: 1, loop: false, duck },
+        });
+        const p2 = pcmOf(out2);
+        expect(["music", sec, duck, loudness(p2, sec - 0.1, sec - 0.01) > 1000]).toEqual([
+          "music",
+          sec,
+          duck,
+          true,
+        ]);
+      }
+    }
+  }, 600_000);
+
+  it("review r11: 40 images joined by 39 seven-frame fades (4-frame pieces between) — every frame of the file at exactly k/30", async () => {
+    const t = await start({ composer: real });
+    const s = await t.scopeOf();
+    const m = inputs();
+    const red = await t.putFile(s, m.png, "png");
+    const blue = await t.putFile(s, m.alphaBlue, "png");
+    const id = await t.queue(s, {
+      clips: Array.from({ length: 40 }, (_, i) => ({
+        fileId: i % 2 ? blue : red,
+        // 4-frame bodies between the fades (a 4-frame MP4 reports 0.133008 s).
+        durationSec: i === 0 || i === 39 ? 0.5 : 18 / 30,
+        ...(i < 39 ? { transition: { type: "fade", durationSec: 7 / 30 } } : {}),
+      })),
+    });
+    await t.drive();
+    const done = t.job(id);
+    expect(done.status, String(done.errorCode)).toBe("done");
+    const out = t.app.files!.pathOf(t.app.files!.get(done.fileId!)!);
+    const j = JSON.parse(
+      execFileSync(FFPROBE, [
+        ...[
+          "-v",
+          "error",
+          "-select_streams",
+          "v:0",
+          "-show_entries",
+          "stream=time_base:packet=pts",
+          "-of",
+          "json",
+          out,
+        ],
+      ]).toString(),
+    ) as { streams: { time_base: string }[]; packets: { pts: number }[] };
+    const [tn, td] = j.streams[0]!.time_base.split("/").map(Number) as [number, number];
+    const pts = j.packets.map((x) => x.pts).sort((a, b) => a - b);
+    expect(pts.length).toBe(2 * 15 + 38 * 18 - 39 * 7);
+    // Frame k at k/30: pts · tn / td = k / 30, in whole numbers.
+    const off = pts.map((p, k) => p * tn * 30 - k * td).filter((x) => x !== 0);
+    expect(off).toEqual([]);
   }, 600_000);
 
   it("readiness: a tiny composition checked in the same sandbox", async () => {

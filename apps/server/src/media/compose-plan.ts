@@ -511,7 +511,8 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
       fadeOutSec: t.music.fadeOutSec ?? 0,
       duck: t.music.duck ?? true,
     };
-    if (music.fadeInSec + music.fadeOutSec > total / FPS)
+    // Review r11: in the output's samples (0.4 s + 0.2 s fill 0.6 s exactly: 19 200 + 9 600 = 28 800).
+    if (Math.round(music.fadeInSec * RATE) + Math.round(music.fadeOutSec * RATE) > total * SPF)
       return err("compose_invalid_timeline", "music: fadeInSec + fadeOutSec are longer than the video");
   }
   const subs = t.subtitles ?? [];
@@ -845,12 +846,23 @@ export function transitionArgs(plan: Plan, i: number): string[] {
 
 /** The pieces of the picture in order (the concat demuxer's list, names in `work/`). */
 export function concatList(plan: Plan): string {
-  const names: string[] = [];
+  const names: { name: string; frames: number }[] = [];
   for (const [i, c] of plan.clips.entries()) {
-    if (c.frames - c.head - c.tail > 0) names.push(pieces(i).body);
-    if (c.tail) names.push(`trans-${i}.mp4`);
+    const own = c.frames - c.head - c.tail;
+    if (own > 0) names.push({ name: pieces(i).body, frames: own });
+    if (c.tail) names.push({ name: `trans-${i}.mp4`, frames: c.tail });
   }
-  return `ffconcat version 1.0\n${names.map((n) => `file '${n}'`).join("\n")}\n`;
+  // Review r11: each piece's length as planned (its frames / 30), not as its file reports it (a 4-frame MP4 says
+  // 0.133008 s — the next piece would start early): whole microseconds (the demuxer's unit) from the frame count so
+  // far, so that every piece starts at round(frames so far × 1 000 000 / 30) µs — no drift.
+  const us = (frames: number) => Math.round((frames * 1_000_000) / FPS);
+  let at = 0;
+  const lines = names.map((n) => {
+    const d = us(at + n.frames) - us(at);
+    at += n.frames;
+    return `file '${n.name}'\nduration ${(d / 1_000_000).toFixed(6)}`;
+  });
+  return `ffconcat version 1.0\n${lines.join("\n")}\n`;
 }
 
 /** The PCM of an input's sound, in `work/` (`ingestArgs`). */
@@ -886,10 +898,10 @@ export function ingestArgs(o: {
   const shiftA =
     aShift !== 0 || aStart > 0
       ? `asettb=1/${PICTURE_TB}${tickShift(aShift, "asetpts")}${
-          aStart > 0 ? `,aresample=${RATE},atrim=start_pts=${aStart}` : ""
+          aStart > 0 ? `,${counted(`atrim=start_pts=${aStart}`)}` : ""
         },`
       : "";
-  const endA = sa.end ? `,atrim=end_sample=${Math.max(1, toSamples(sa.end))}` : "";
+  const endA = `,${sa.end ? counted(`atrim=end_sample=${Math.max(1, toSamples(sa.end))}`, "s16") : PIN_48K("s16")}`;
   const vShift = toTicks(pa.shift);
   const shiftV = vShift !== 0 ? `settb=1/${PICTURE_TB}${tickShift(vShift)},` : "";
   // Review r8: a gap in the sound's timestamps is silence from 1 ms on (`min_hard_comp`; ffmpeg's own 0.1 s would
@@ -904,7 +916,7 @@ export function ingestArgs(o: {
           "-map",
           "0:a:0",
           "-af",
-          `${shiftA}aresample=${RATE}:async=1:min_hard_comp=0.001:first_pts=0${endA},aformat=sample_fmts=s16:channel_layouts=stereo`,
+          `${shiftA}aresample=${RATE}:async=1:min_hard_comp=0.001:first_pts=0${endA}`,
           "-t",
           cap,
           ...PCM,
@@ -935,6 +947,14 @@ const RAW = ["-f", "s16le", "-ar", String(RATE), "-ac", "2"];
  * ducking and the loudness normalisation). */
 const RAW_FLOAT = ["-f", "f32le", "-ar", String(RATE), "-ac", "2"];
 const DUCK = "sidechaincompress=threshold=0.03:ratio=8:attack=20:release=400";
+/**
+ * Review r11: every filter that counts samples (`atrim` by samples, `afade` by samples) has 48 kHz stereo in front of
+ * it, pinned — a filter before it may negotiate another rate (`loudnorm` asks for 192 kHz, and the compressors before
+ * it then run at that rate: a 4 s result's ducked sound was cut after 1 s). `counted(f)` puts the pin right before `f`.
+ */
+export const PIN_48K = (fmt: "fltp" | "s16" = "fltp") =>
+  `aresample=${RATE},aformat=sample_fmts=${fmt}:sample_rates=${RATE}:channel_layouts=stereo`;
+const counted = (f: string, fmt: "fltp" | "s16" = "fltp") => `${PIN_48K(fmt)},${f}`;
 
 /**
  * The sound (review R3): the clips' PCM (`bed.pcm`), the narration (`narration.pcm`, when there is any) and the music
@@ -954,7 +974,9 @@ export function audioArgs(plan: Plan, o: { narration: boolean; music: string | n
     const taps = 2 + (duckMusic ? 1 : 0);
     graph.push(`[${k}:a]asplit=${taps}[nar][scb]${duckMusic ? "[scm]" : ""}`);
     // Review r7: a compressor ends with the shorter of its two inputs — both are padded, its output cut at the target.
-    graph.push(`[0:a]apad[bedin];[scb]apad[bedsc];[bedin][bedsc]${DUCK},atrim=end_sample=${T}[bed]`);
+    graph.push(
+      `[0:a]apad[bedin];[scb]apad[bedsc];[bedin][bedsc]${DUCK},${counted(`atrim=end_sample=${T}`)}[bed]`,
+    );
     mix.push("[bed]", "[nar]");
     k++;
   } else {
@@ -970,20 +992,20 @@ export function audioArgs(plan: Plan, o: { narration: boolean; music: string | n
       "-i",
       o.music,
     );
+    // Review r10: in samples (the model's seconds converted once); review r11: a fade of 0 samples is none.
+    const fadeIn = Math.round(m.fadeInSec * RATE);
+    const fadeOut = Math.round(m.fadeOutSec * RATE);
     const fades = [
-      // Review r10: in samples (the model's seconds converted once).
-      ...(m.fadeInSec > 0 ? [`afade=t=in:ss=0:ns=${Math.round(m.fadeInSec * RATE)}`] : []),
-      ...(m.fadeOutSec > 0
-        ? [
-            `afade=t=out:ss=${Math.max(0, T - Math.round(m.fadeOutSec * RATE))}:ns=${Math.round(m.fadeOutSec * RATE)}`,
-          ]
-        : []),
+      ...(fadeIn > 0 ? [counted(`afade=t=in:ss=0:ns=${fadeIn}`)] : []),
+      ...(fadeOut > 0 ? [counted(`afade=t=out:ss=${Math.max(0, T - fadeOut)}:ns=${fadeOut}`)] : []),
     ];
     graph.push(
-      `[${k}:a]apad,atrim=end_sample=${T},volume=${num(m.volume)}${fades.map((f) => `,${f}`).join("")}${duckMusic ? "[m0]" : "[mus]"}`,
+      `[${k}:a]apad,${counted(`atrim=end_sample=${T}`)},volume=${num(m.volume)}${fades.map((f) => `,${f}`).join("")}${duckMusic ? "[m0]" : "[mus]"}`,
     );
     if (duckMusic)
-      graph.push(`[m0]apad[musin];[scm]apad[mussc];[musin][mussc]${DUCK},atrim=end_sample=${T}[mus]`);
+      graph.push(
+        `[m0]apad[musin];[scm]apad[mussc];[musin][mussc]${DUCK},${counted(`atrim=end_sample=${T}`)}[mus]`,
+      );
     mix.push("[mus]");
   }
   // Loudness normalisation needs 3 s to measure (`loudnorm` gives NaN on less, reviews r1 and r5): a result of 3 s or
@@ -993,7 +1015,7 @@ export function audioArgs(plan: Plan, o: { narration: boolean; music: string | n
     T >= 3 * RATE
       ? `loudnorm=I=-16:TP=-1.5:LRA=11,aresample=${RATE}`
       : "alimiter=limit=0.8414:level=0:latency=1";
-  const tail = `${level},aformat=sample_fmts=fltp:sample_rates=${RATE}:channel_layouts=stereo,apad,atrim=end_sample=${T},asetpts=N/SR/TB[out]`;
+  const tail = `${level},apad,${counted(`atrim=end_sample=${T}`)},asetpts=N/SR/TB[out]`;
   graph.push(
     mix.length === 1
       ? `${mix[0]}${tail}`
