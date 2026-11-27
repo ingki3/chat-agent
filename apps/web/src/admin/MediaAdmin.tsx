@@ -12,6 +12,7 @@ import { admin, ApiError, errorText } from "../api.js";
 import { usd } from "../usage-format.js";
 import {
   catalogView,
+  composeReadinessPollMs,
   anySavePaused,
   conflictNotice,
   draftBase,
@@ -448,6 +449,13 @@ function SettingsForm({
             길이와 예상 비용을 보여 줘요.
           </p>
         </section>
+        <ComposeSection
+          enabled={draft.composeEnabled}
+          perRun={draft.perRunLimits.compose}
+          readiness={m.compose}
+          onEnabled={(v) => set({ composeEnabled: v })}
+          onPerRun={(v) => set({ perRunLimits: { ...draft.perRunLimits, compose: v } })}
+        />
         <p className="muted small">
           청소년 계정도 미디어 생성이 보여요. 청소년 계정의 요청은 제공자가 지원하면 가장 엄격한 검열 옵션으로
           보내요. 모든 요청은 데이터 수집을 거부하고(<code>data_collection: deny</code>), 비밀값이 든
@@ -521,6 +529,57 @@ function SettingsForm({
   );
 }
 
+/**
+ * 멀티미디어 합성 (#238 stage 4): its own switch (no model, no key, no cost — the server's ffmpeg puts the
+ * conversation's files together), its per-run limit and whether ffmpeg/ffprobe and the sandbox are ready here.
+ */
+function ComposeSection(props: {
+  enabled: boolean;
+  perRun: number;
+  readiness: MediaAdminView["compose"];
+  onEnabled: (v: boolean) => void;
+  onPerRun: (v: number) => void;
+}) {
+  const ready = props.readiness?.ready ?? null;
+  return (
+    <section aria-label="멀티미디어 합성" data-testid="media-compose">
+      <h3>멀티미디어 합성</h3>
+      <label className="row">
+        <input
+          type="checkbox"
+          checked={props.enabled}
+          onChange={(e) => props.onEnabled(e.target.checked)}
+          data-testid="media-compose-enabled"
+        />
+        <span>대화의 이미지·영상·음성을 영상 하나로 합성하기 (compose_video)</span>
+      </label>
+      <p className="muted small">
+        외부로 보내는 것이 없어 비용이 들지 않아요. 이 서버의 ffmpeg로 최대 5분·40개 클립·1080p까지 만들고, 한
+        번에 하나씩(대기 3개, 한 사람 1개) 처리해요. 자막은 켜고 끌 수 있는 자막 트랙으로 넣어요.
+      </p>
+      <p className="small" data-testid="media-compose-ready">
+        {ready === true
+          ? "준비됨: ffmpeg·ffprobe와 격리 실행을 확인했어요."
+          : ready === false
+            ? "준비 안 됨: 이 서버에서 ffmpeg·ffprobe(H.264·AAC)나 격리 실행을 확인하지 못했어요. 켜 두어도 쓸 수 없어요."
+            : "준비 상태를 확인하는 중이에요."}
+      </p>
+      <label className="field">
+        <span>한 번 실행에서 합성 최대 횟수</span>
+        <input
+          type="number"
+          min={0}
+          max={MEDIA_LIMITS.perRunMax}
+          step={1}
+          value={Number.isNaN(props.perRun) ? "" : props.perRun}
+          onChange={(e) => props.onPerRun(e.target.value === "" ? NaN : Number(e.target.value))}
+          required
+        />
+      </label>
+    </section>
+  );
+}
+
 /** 관리자 → 미디어 생성 (#238 stage 1): the OpenRouter key, per-kind models and the cost limits. */
 export function MediaAdmin() {
   const qc = useQueryClient();
@@ -539,6 +598,9 @@ export function MediaAdmin() {
       const shown = qc.getQueryData<Shown>(MEDIA_KEY);
       return reads.isLatest(ticket) || !shown ? { status, ticket } : shown;
     },
+    // #238 stage 4 (review r1): while the composition's readiness is still being checked here, ask again now and then
+    // (it settles within seconds) — never once it is known.
+    refetchInterval: (query) => composeReadinessPollMs(query.state.data?.status.compose),
   });
   // After a write (or a refused catalog): any status read in flight is cancelled — watched or not — and the status
   // is invalidated and read again even with no one watching it (the next visit then reads it anyway).

@@ -43,6 +43,7 @@ import { moderationFor, STRICTNESS, withMediaPolicy } from "./policy.js";
 import { mediaRunKey } from "../usage/store.js";
 import type { MediaSettingsStore } from "./settings.js";
 import type { VideoJobs } from "./video-jobs.js";
+import type { ComposeJobs } from "./compose-jobs.js";
 import { imageSize, stripImage, textRuns } from "./strip.js";
 import { removeSpeechWorkdir, type Measured, type SpeechAudio } from "./speech-audio.js";
 import {
@@ -159,6 +160,8 @@ export type MediaGeneratorOptions = {
   split?: SpeechSplitLimits;
   /** #238 stage 3: `video_generate` makes a confirmation card there (`video-jobs.ts`); absent, it is not offered. */
   video?: () => VideoJobs | undefined;
+  /** #238 stage 4: `compose_video` queues a composition there (`compose-jobs.ts`); absent, it is not offered. */
+  compose?: () => ComposeJobs | undefined;
 };
 
 export const MEDIA_SLOTS = { total: 4, perUser: 2 } as const;
@@ -188,7 +191,7 @@ class MediaToolError extends Error {
   }
 }
 
-type Kind = "image" | "speech" | "video";
+type Kind = "image" | "speech" | "video" | "compose";
 type Descriptor = { type?: unknown; values?: unknown };
 type Params = Map<string, Set<string> | null>;
 
@@ -255,6 +258,8 @@ export class MediaGenerator {
 
   /** Whether the kind is offered now: switched on, a model chosen, a key in place (video: with its job store). */
   offered(kind: Kind): boolean {
+    // Stage 4 (review R9): no model and no key — the admin's switch and the local programs (its own gate).
+    if (kind === "compose") return !!this.o.compose?.()?.offered();
     if (kind === "video" && !this.o.video?.()) return false;
     const k = this.o.settings.get().kinds[kind];
     return k.enabled && !!k.model && !!this.o.keys.resolve();
@@ -276,6 +281,12 @@ export class MediaGenerator {
       const video = this.o.video?.();
       if (!video) return { ok: false, code: "media_disabled", hint: MEDIA_TOOL_HINTS.media_disabled! };
       return video.propose(scope, input, o);
+    }
+    // Stage 4: a composition queued on this server (nothing is paid by the call or the job).
+    if (kind === "compose") {
+      const compose = this.o.compose?.();
+      if (!compose) return { ok: false, code: "compose_disabled", hint: MEDIA_TOOL_HINTS.compose_disabled! };
+      return compose.queue(scope, input, o);
     }
     try {
       // The result goes to the model: every known secret out of it (file names, voices, notes).

@@ -301,8 +301,10 @@ describe("관리자 → 미디어 생성 (#238)", () => {
         video: { enabled: false, model: null },
       },
       dailyCostLimitUsd: 50,
-      perRunLimits: { image: 4, speech: 3, music: 1, video: 1 },
+      perRunLimits: { image: 4, speech: 3, music: 1, video: 1, compose: 1 },
       videoDefaultSec: 8,
+      // #238 stage 4: 멀티미디어 합성 is off until the admin turns it on (no model, no key, no cost).
+      composeEnabled: false,
     });
     expect(m.youthStrictModeration).toBe(true);
     expect(t.requests).toHaveLength(0);

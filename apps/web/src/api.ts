@@ -118,6 +118,8 @@ import {
   MediaCatalog,
   VIDEO_JOB_ERRORS,
   VideoJob,
+  COMPOSE_JOB_ERRORS,
+  ComposeJob,
   type MediaKind,
   type MediaSettings,
 } from "@agentlee/shared";
@@ -676,6 +678,13 @@ export const videoJobs = {
     VideoJob.parse(await call("POST", `/api/video-jobs/${enc(id)}/dismiss`, { version })),
 };
 
+/** 멀티미디어 합성 (#238 stage 4): the job of a `compose_video` call, and its subtitle track. */
+export const composeJobs = {
+  get: async (id: string) => ComposeJob.parse(await call("GET", `/api/compose-jobs/${enc(id)}`)),
+  eventsUrl: (id: string) => `/api/compose-jobs/${enc(id)}/events`,
+  subtitlesUrl: (id: string) => `/api/compose-jobs/${enc(id)}/subtitles.vtt`,
+};
+
 export const runs = {
   get: async (id: string) => Run.parse(await call("GET", `/api/runs/${enc(id)}`)),
   interrupt: async (id: string) => Run.parse(await call("POST", `/api/runs/${enc(id)}/interrupt`, {})),
@@ -767,6 +776,7 @@ const MESSAGES: Record<string, string> = {
   // 미디어 생성 (#238)
   ...MEDIA_ERRORS,
   ...VIDEO_JOB_ERRORS,
+  ...COMPOSE_JOB_ERRORS,
 };
 export const errorText = (e: unknown) =>
   e instanceof ApiError ? (MESSAGES[e.code] ?? `오류가 났어요 (${e.code})`) : "서버에 연결하지 못했어요.";

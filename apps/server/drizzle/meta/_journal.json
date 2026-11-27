@@ -281,6 +281,13 @@
       "when": 1795665782057,
       "tag": "0039_video_jobs",
       "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "6",
+      "when": 1795699618925,
+      "tag": "0040_compose_jobs",
+      "breakpoints": true
     }
   ]
 }

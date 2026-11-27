@@ -442,6 +442,8 @@ export class NotificationService {
           researchFailed: row.researchFailed,
           videoDone: row.videoDone,
           videoFailed: row.videoFailed,
+          composeDone: row.composeDone,
+          composeFailed: row.composeFailed,
           rev: row.rev,
         }
       : {
@@ -455,6 +457,8 @@ export class NotificationService {
           researchFailed: true,
           videoDone: true,
           videoFailed: true,
+          composeDone: true,
+          composeFailed: true,
           rev: 0,
         };
   }
@@ -469,7 +473,9 @@ export class NotificationService {
       | "research_done"
       | "research_failed"
       | "video_done"
-      | "video_failed",
+      | "video_failed"
+      | "compose_done"
+      | "compose_failed",
   ): boolean {
     const p = this.prefs(userId);
     if (kind === "memory_proposal") return p.memoryProposals !== false;
@@ -480,6 +486,9 @@ export class NotificationService {
     // 영상 생성 (#238 stage 3): "완성" and "실패", each its own switch.
     if (kind === "video_done") return p.videoDone !== false;
     if (kind === "video_failed") return p.videoFailed !== false;
+    // 멀티미디어 합성 (#238 stage 4): "완성" and "실패", each its own switch.
+    if (kind === "compose_done") return p.composeDone !== false;
+    if (kind === "compose_failed") return p.composeFailed !== false;
     return p.memoryFailed !== false;
   }
 
@@ -497,6 +506,8 @@ export class NotificationService {
       researchFailed: p.researchFailed ?? before.researchFailed ?? true,
       videoDone: p.videoDone ?? before.videoDone ?? true,
       videoFailed: p.videoFailed ?? before.videoFailed ?? true,
+      composeDone: p.composeDone ?? before.composeDone ?? true,
+      composeFailed: p.composeFailed ?? before.composeFailed ?? true,
       updatedAt: this.now(),
     };
     // The revision goes up with every write, in the same statement (#188 review 9).

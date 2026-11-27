@@ -109,6 +109,9 @@ import { MediaRecovery, MediaSettler } from "./media/settle.js";
 import { VideoJobs, type VideoJobsOptions } from "./media/video-jobs.js";
 import { fixtureVideoProbe, sandboxedVideoProbe, type VideoProbe } from "./media/video-probe.js";
 import { registerVideoRoutes } from "./media/video-routes.js";
+import { ComposeJobs, type ComposeJobsOptions } from "./media/compose-jobs.js";
+import { fixtureComposer, sandboxedComposer, type Composer } from "./media/compose-run.js";
+import { registerComposeRoutes } from "./media/compose-routes.js";
 import { sandboxedSpeechAudio, sweepSpeechScratch, type SpeechAudio } from "./media/speech-audio.js";
 import type { SpeechSplitLimits } from "./media/speech-split.js";
 import { youtubeState, type YoutubeState } from "./youtube/packages.js";
@@ -229,6 +232,8 @@ declare module "fastify" {
           recovery: MediaRecovery;
           /** 영상 생성 (#238 stage 3): the cards and the job engine. */
           video: VideoJobs;
+          /** 멀티미디어 합성 (#238 stage 4): the jobs and their engine. */
+          compose: ComposeJobs;
         }
       | undefined;
     /**
@@ -393,6 +398,16 @@ export type BuildOptions = {
      * `limits`: shorter waits.
      */
     video?: { start?: boolean; probe?: () => VideoProbe | undefined; limits?: VideoJobsOptions["limits"] };
+    /**
+     * 멀티미디어 합성 (#238 stage 4). `start`: run the job engine as the lock-holding start does (`dataLock`);
+     * `composer`: ffmpeg/ffprobe (default: the sandboxed ones beside AUDIO_FFMPEG; in tests none, unless given);
+     * `limits`: shorter waits.
+     */
+    compose?: {
+      start?: boolean;
+      composer?: () => Composer | undefined;
+      limits?: ComposeJobsOptions["limits"];
+    };
   };
   python?: {
     runner?: PythonRunner;
@@ -665,7 +680,10 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const mediaFetch = mediaFetchImpl ? { fetchImpl: mediaFetchImpl } : {};
     // video_generate (#238 stage 3): its cards and jobs (made below; the generator and the admin's writes ask for it).
     const videoRef: { jobs?: VideoJobs } = {};
+    const composeRef: { jobs?: ComposeJobs } = {};
     const mediaAdmin = new MediaAdminService({
+      // Stage 4: the composition's local readiness, shown next to its switch.
+      composeReadiness: () => composeRef.jobs?.readiness(),
       // A key or settings write expires the waiting video cards in its own transaction.
       changed: () => videoRef.jobs?.expireWaiting(),
       settings: settingsStore,
@@ -695,6 +713,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     // image_generate / speech_generate (#238 stage 2): offered while the kind is on (관리자 → 미디어 생성).
     const mediaTools = new MediaGenerator({
       video: () => videoRef.jobs,
+      compose: () => composeRef.jobs,
       db: opts.db!,
       files: () => app.files,
       keys: openRouterKeys,
@@ -757,6 +776,38 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     registerVideoRoutes(app, video, app.conversations!);
     if (opts.dataLock || opts.media?.video?.start) app.addHook("onReady", async () => video.start());
     app.addHook("preClose", async () => video.stop());
+    // 멀티미디어 합성 (#238 stage 4): `compose_video`'s jobs — run one at a time by the engine, which only the
+    // lock-holding server runs (a restart interrupts what another process left). Without the engine it is not offered.
+    const composer =
+      opts.media?.compose?.composer ??
+      (config.env === "test"
+        ? () => undefined
+        : config.fakeRuntime
+          ? // The e2e server: a scripted composer (no program runs; the known-good MP4 after a few steps).
+            (() => {
+              const c = fixtureComposer(config.dataDir);
+              return () => c;
+            })()
+          : () => sandboxedComposer({ dataDir: config.dataDir, ffmpegPath: config.audioFfmpeg }));
+    const compose = new ComposeJobs({
+      db: opts.db!,
+      files: () => app.files,
+      conversations: app.conversations!,
+      settings: mediaSettings,
+      users,
+      notifications: () => app.notifications,
+      composer,
+      filesPending: (conversationId) => mediaTools.filesPending(conversationId),
+      dataDir: config.dataDir,
+      secrets: config.skillSecrets,
+      log: app.log,
+      now: mediaNow,
+      ...(opts.media?.compose?.limits ? { limits: opts.media.compose.limits } : {}),
+    });
+    composeRef.jobs = compose;
+    registerComposeRoutes(app, compose, app.conversations!);
+    if (opts.dataLock || opts.media?.compose?.start) app.addHook("onReady", async () => compose.start());
+    app.addHook("preClose", async () => compose.stop());
     // Late cost settlement (#238 review r2): generations still waiting for their cost are looked up again with a
     // backoff, also after a restart. Not in tests (they drive `runOnce`).
     const mediaSettler = new MediaSettler({
@@ -777,6 +828,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       settler: mediaSettler,
       recovery: mediaRecovery,
       video,
+      compose,
     });
     registerMediaRoutes(app, { users, media: mediaAdmin });
     // Web search and fetch (#50): results are stored as sources of the run's conversation.

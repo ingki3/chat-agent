@@ -558,3 +558,121 @@ test("stage 3: the admin cannot choose a video model priced in tokens (no bound 
     ).status(),
   ).toBe(200);
 });
+
+/** A 16×16 PNG (one colour): the composition's input. */
+const TINY_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAACXBIWXMAAAABAAAAAQBPJcTWAAAAGUlEQVR4nGPUT9jHQApgIUn1qIZRDUNKAwBa4wGLIbQV5gAAAABJRU5ErkJggg==",
+  "base64",
+);
+
+/**
+ * 멀티미디어 합성 (#238 stage 4): the admin turns it on with its own switch (no key, no model), a member's
+ * `compose_video` call queues a job at once and its card follows it to the player with its subtitle track. The e2e
+ * server's composer is scripted (`compose-run.ts` `fixtureComposer`: a few progress steps, then the known-good MP4) —
+ * no ffmpeg runs.
+ */
+test("stage 4: the admin's switch, then a composition's card: progress, the player and its subtitle track", async ({
+  page,
+  browser,
+  baseURL,
+}, info) => {
+  test.skip(info.project.name !== "desktop", "server-wide settings: one project writes them");
+  const admin = await browser.newContext({ storageState: authFile(ADMIN), baseURL: baseURL! });
+  closeOther = () => admin.close();
+  const adminPage = await admin.newPage();
+  await adminPage.goto("/admin?tab=media");
+  const form = adminPage
+    .getByRole("region", { name: "미디어 생성" })
+    .getByRole("form", { name: "미디어 생성 설정" });
+  const section = form.getByTestId("media-compose");
+  await expect(section.getByTestId("media-compose-ready")).toContainText("준비됨", { timeout: 15_000 });
+  await expect(section.getByTestId("media-compose-enabled")).not.toBeChecked();
+  await expect(section.getByLabel("한 번 실행에서 합성 최대 횟수")).toHaveValue("1");
+  await section.getByTestId("media-compose-enabled").check();
+  await form.getByRole("button", { name: "확인하고 저장" }).click();
+  await expect(form.getByRole("status")).toContainText("저장했어요");
+  await adminPage.reload();
+  await expect(form.getByTestId("media-compose-enabled")).toBeChecked();
+
+  await signIn(page, baseURL!, await newMember(browser, baseURL!, "media-compose"));
+  const conv = await newConversation(page.request, baseURL!, `합성 ${crypto.randomUUID().slice(0, 8)}`);
+  // A picture sent with a message (a file of this conversation).
+  const up = await page.request.post(`/api/conversations/${conv.id}/files`, {
+    headers: {
+      ...csrf(baseURL!),
+      "content-type": "application/octet-stream",
+      "x-file-name": encodeURIComponent("장면.png"),
+      "x-upload-id": crypto.randomUUID(),
+    },
+    data: TINY_PNG,
+  });
+  expect(up.status(), await up.text()).toBe(201);
+  const file = (await up.json()) as { id: string };
+  const sent = await page.request.post(`/api/conversations/${conv.id}/messages`, {
+    data: { text: "이 사진으로 영상 만들어 줘", fileIds: [file.id] },
+    headers: csrf(baseURL!),
+  });
+  expect(sent.status()).toBe(201);
+  const { run } = (await sent.json()) as { run: { id: string } };
+  await expect
+    .poll(
+      async () =>
+        ((await (await page.request.get(`/api/runs/${run.id}`)).json()) as { endedAt: unknown }).endedAt,
+      { timeout: 15_000 },
+    )
+    .not.toBeNull();
+
+  await page.goto(`/c/${conv.id}`);
+  await sendMessage(page, `/compose ${file.id}`);
+  const reply = page.getByTestId("assistant").last();
+  await expect(reply).toHaveAttribute("data-status", "complete");
+  const card = reply.getByTestId("compose-card");
+  await expect(card).toBeVisible();
+  await expect(card.getByTestId("compose-card-duration")).toHaveText("2초");
+  await expect(card.getByTestId("compose-card-status")).toHaveText("완성됐어요", { timeout: 30_000 });
+  const player = card.getByTestId("compose-card-video");
+  await expect(player).toHaveAttribute("controls", "");
+  expect(await player.getAttribute("src")).toMatch(/^\/api\/files\/[^/]+\/content\?inline=1$/);
+  await expect
+    .poll(() => player.evaluate((el: HTMLVideoElement) => (el.error ? -1 : el.readyState)), {
+      timeout: 10_000,
+    })
+    .toBeGreaterThanOrEqual(1);
+  // The subtitle track: on by default, the timeline's text as WebVTT from the owner-only route.
+  const track = card.getByTestId("compose-card-track");
+  await expect(track).toHaveAttribute("kind", "subtitles");
+  await expect(track).toHaveAttribute("default", "");
+  // The browser itself loaded the track (same origin, the page's CSP lets it): its cue is there.
+  await expect
+    .poll(() => player.evaluate((el: HTMLVideoElement) => el.textTracks[0]?.cues?.length ?? -1), {
+      timeout: 10_000,
+    })
+    .toBe(1);
+  const vtt = await page.request.get((await track.getAttribute("src"))!);
+  expect(vtt.status()).toBe(200);
+  expect(vtt.headers()["content-type"]).toMatch(/^text\/vtt/);
+  expect(await vtt.text()).toContain("첫 장면이에요");
+  await expect(card.getByTestId("compose-card-download")).toContainText(/compose-.*\.mp4/);
+  // The same card after a reload (linked by the call's id).
+  await page.reload();
+  await expect(
+    page.getByTestId("assistant").last().getByTestId("compose-card").getByTestId("compose-card-status"),
+  ).toHaveText("완성됐어요");
+
+  // Back off for the other specs: the switch off.
+  const after = (await (await admin.request.get("/api/admin/media")).json()) as {
+    settingsRevision: string;
+    settings: Record<string, unknown>;
+  };
+  expect(
+    (
+      await admin.request.put("/api/admin/media/settings", {
+        headers: csrf(baseURL!),
+        data: {
+          settings: { ...after.settings, composeEnabled: false },
+          expectedRevision: after.settingsRevision,
+        },
+      })
+    ).status(),
+  ).toBe(200);
+});

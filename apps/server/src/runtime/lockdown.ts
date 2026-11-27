@@ -3,9 +3,9 @@
  * (isolation/sandbox.ts) is the second. The adapters (#15, #16) pass these settings unchanged.
  */
 import { AUDIO_TRANSCRIBE_TOOL } from "@agentlee/mcp-tools/audio";
-import { IMAGE_GENERATE_TOOL, SPEECH_GENERATE_TOOL } from "@agentlee/mcp-tools/media";
+import { COMPOSE_VIDEO_TOOL, IMAGE_GENERATE_TOOL, SPEECH_GENERATE_TOOL } from "@agentlee/mcp-tools/media";
 import { YOUTUBE_AUDIO_TOOL } from "@agentlee/mcp-tools/youtube";
-import { AUDIO_LIMITS, MEDIA_TOOL_LIMITS, YOUTUBE_LIMITS } from "@agentlee/shared";
+import { AUDIO_LIMITS, COMPOSE_LIMITS, MEDIA_TOOL_LIMITS, YOUTUBE_LIMITS } from "@agentlee/shared";
 
 /** The longest a `speech_generate` call may take (#248), from the limits the server itself enforces. */
 export function speechCallBudgetMs(): number {
@@ -34,6 +34,8 @@ const SLOW_TOOLS: readonly { name: string; callTimeoutMs: number }[] = [
     // the cost lookups.
     callTimeoutMs: speechCallBudgetMs(),
   },
+  // #238 stage 4: the call copies and probes its inputs before the job is queued (the composition runs after it).
+  { name: COMPOSE_VIDEO_TOOL.name, callTimeoutMs: COMPOSE_LIMITS.prepareTimeoutMs + 30_000 },
 ];
 
 export const AGENTLEE_MCP = "agentlee";

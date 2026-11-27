@@ -1,0 +1,1029 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { setImmediate as yieldNow } from "node:timers/promises";
+import { z } from "zod";
+import { COMPOSE_LIMITS, type ComposeJobCode, type ComposeTimeline, type FileKind } from "@agentlee/shared";
+import { runIsolated, type RunIsolatedOptions, type RunResult } from "../isolation/sandbox.js";
+import { removeTree } from "../python/service.js";
+import { storagePaths } from "../storage/paths.js";
+import {
+  audioArgs,
+  clipArgs,
+  concatList,
+  cueText,
+  FPS,
+  ingestArgs,
+  inputKindOf,
+  muxArgs,
+  pieces,
+  planTimeline,
+  probeArgs,
+  DEMUXER,
+  RATE,
+  sourcePcm,
+  SPF,
+  toAss,
+  transitionArgs,
+  verifyArgs,
+  workUnits,
+  isPlanError,
+  presentTrack,
+  pictureEnd,
+  pictureEndArgs,
+  q,
+  Q0,
+  qAdd,
+  qMax,
+  qMin,
+  qSec,
+  qSub,
+  type Q,
+  type TrackEdit,
+  type InputInfo,
+  type Plan,
+} from "./compose-plan.js";
+import { decodeVerdict, makeScratchDir, speechTools, sweepScratch } from "./speech-audio.js";
+import { KNOWN_GOOD_MP4, MP4_BRANDS } from "./video-probe.js";
+
+/**
+ * 멀티미디어 합성's programs (#238 stage 4-1): `audio_transcribe`'s ffmpeg (`AUDIO_FFMPEG`, default Homebrew's) and the
+ * ffprobe beside it, every run its own sandboxed process group (`runIsolated`, #42): no network, no child processes, a
+ * fixed environment, the job's remaining time, 2 GiB of memory, two threads; it reads only the job's `in/` and `work/`
+ * and writes only `work/` (the mux: `out/`). The arguments are `compose-plan.ts`'s. Without ffmpeg/ffprobe (not macOS)
+ * there is no `Composer`, and `compose_video` is not offered.
+ *
+ * Working folders: `<DATA_DIR>/compose-scratch/<job id>/{in,work,out}` — the job's copies of its inputs, the pieces, the
+ * result — removed when the job ends (and every one at the engine's start).
+ */
+/** A composition's end: the checked MP4 and the plan it was made from (lengths decoded), or why there is none. */
+export type ComposeOutcome =
+  { ok: true; file: string; bytes: number; plan: Plan } | { ok: false; code: ComposeJobCode };
+export type ProbeOutcome =
+  | { ok: true; info: Omit<InputInfo, "fileId" | "name"> }
+  | { ok: false; reason: "unreadable" | "kind" | "failed" | "animated" | "edited" };
+
+export type Composer = {
+  /** A fresh job folder with `in/`, `work/` and `out/` (its name is the job's id). */
+  workdir(): string;
+  /** One input copy (`in/<name>`) probed: its kind (as its file row says, read with that demuxer), streams, length. */
+  probe(file: string, fileKind: FileKind, signal?: AbortSignal): Promise<ProbeOutcome>;
+  /**
+   * The whole composition in the job folder; the checked MP4 in `out/` (review R5). The inputs' lengths are decoded
+   * first and the plan made from them (the re-plan after review r3: what the call worked out was an estimate).
+   */
+  compose(job: {
+    dir: string;
+    timeline: ComposeTimeline;
+    /** The inputs as the call found them (kinds, streams, names in `in/`; their lengths are estimates). */
+    inputs: readonly InputInfo[];
+    signal: AbortSignal;
+    deadlineAt: number;
+    onProgress: (fraction: number) => void;
+  }): Promise<ComposeOutcome>;
+  /** Whether a tiny composition works here, in the same sandbox, checked like a real one. */
+  ready(signal?: AbortSignal): Promise<boolean>;
+};
+
+export const COMPOSE_RUN_LIMITS = {
+  memoryBytes: 2 * 1024 * 1024 * 1024,
+  probeTimeoutMs: 60_000,
+  stderrBytes: 256 * 1024,
+} as const;
+
+const JOB_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** `compose-scratch/<uuid>/{in,work,out}` under the data folder (checked like `speech-scratch`). */
+export function makeComposeWorkdir(dataDir: string): string {
+  const dir = makeScratchDir(dataDir, storagePaths(dataDir).composeScratch);
+  for (const d of ["in", "work", "out"]) fs.mkdirSync(path.join(dir, d), { mode: 0o700 });
+  return dir;
+}
+export const removeComposeWorkdir = (dir: string): boolean => {
+  if (!JOB_NAME.test(path.basename(dir))) return false;
+  try {
+    return removeTree(dir);
+  } catch {
+    return false;
+  }
+};
+/** Every job folder not kept (the engine's start: none is in use; later sweeps keep the jobs under way). */
+export const sweepComposeScratch = (
+  dataDir: string,
+  keep: (name: string) => boolean = () => false,
+): boolean => sweepScratch(dataDir, storagePaths(dataDir).composeScratch, keep);
+
+const Probe = z.object({
+  format: z
+    .object({
+      format_name: z.string().max(200).optional(),
+      duration: z.coerce.number().optional(),
+    })
+    .optional(),
+  streams: z
+    .array(
+      z.object({
+        codec_type: z.string().max(40).optional(),
+        codec_name: z.string().max(40).optional(),
+        width: z.number().int().optional(),
+        height: z.number().int().optional(),
+        // Review r10: a stream's times as whole numbers of its time base (never ffprobe's decimal seconds).
+        time_base: z
+          .string()
+          .regex(/^\d{1,12}\/\d{1,12}$/)
+          .optional(),
+        start_pts: z.number().int().optional(),
+        duration_ts: z.number().int().optional(),
+        disposition: z.object({ attached_pic: z.number().int() }).partial().optional(),
+      }),
+    )
+    .max(64)
+    .optional(),
+});
+
+/**
+ * One track's presentation as its edit list gives it (re-plan 2): `lead` — an explicit leading empty edit (seconds),
+ * `end` — where its one media edit ends on the movie's timeline (lead + that edit's duration); both null-free only
+ * with an edit list (`edited`). Without one the track's media timeline is its presentation (`lead` 0, `end` null).
+ */
+export type TrackTimeline = {
+  edited: boolean;
+  /** Review r10: the same, exact (from the boxes' integer fields) — what every graph uses (`presentTrack`). */
+  exact: TrackEdit;
+  lead: number;
+  /** Review r7: where in the track's media its one media edit starts (seconds, the track's own `mdhd` timescale). */
+  mediaTime: number;
+  /** Where the presentation ends on the movie's timeline; null when not known (none, or a fragmented file's 0). */
+  end: number | null;
+};
+/** The first picture and sound tracks' timelines, or why the file is not one this server takes (`compose_input_edited`). */
+export type Mp4Timeline =
+  | { ok: true; video: TrackTimeline | null; audio: TrackTimeline | null }
+  | { ok: false; reason: "unsupported" | "unparsable" };
+
+/** The box of an MP4/MOV: its type and where its contents start and end (its own header — 8 or 16 bytes — skipped). */
+type Box = { type: string; start: number; end: number };
+
+/**
+ * The boxes in `b[from, to)` (re-plan 2, item D): a 32-bit size, or 1 and a 64-bit size after the type (a 16-byte
+ * header), or 0 for "to the end of the parent"; a size shorter than its header or past the parent's end makes the whole
+ * file unparsable (null).
+ */
+function children(b: Buffer, from: number, to: number): Box[] | null {
+  const out: Box[] = [];
+  let at = from;
+  while (at < to) {
+    if (at + 8 > to) return null;
+    let len = b.readUInt32BE(at);
+    let hdr = 8;
+    if (len === 1) {
+      if (at + 16 > to) return null;
+      const big = b.readBigUInt64BE(at + 8);
+      if (big > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+      len = Number(big);
+      hdr = 16;
+    } else if (len === 0) len = to - at;
+    if (len < hdr || at + len > to) return null;
+    out.push({ type: b.toString("latin1", at + 4, at + 8), start: at + hdr, end: at + len });
+    at += len;
+  }
+  return out;
+}
+
+/**
+ * An MP4/MOV's presentation timeline, read from its own boxes (re-plans r5–2): `moov/mvhd` (the movie's timescale) and,
+ * for the first `vide` and the first `soun` track (`trak/mdia/hdlr`), its edit list (`trak/edts/elst`). Taken (re-plan 2,
+ * item A): no edit list, or at most one leading empty edit (media time −1) followed by exactly one media edit played at
+ * rate 1 — anything else (an empty edit inside, several media edits, another rate) is `unsupported`, a box that does not
+ * add up `unparsable`. Box headers only; the `moov` box is read whole when it is at most 32 MB (a bigger one is
+ * `unparsable`). Exported for tests.
+ */
+export function mp4Timeline(file: string): Mp4Timeline {
+  const bad = { ok: false as const, reason: "unparsable" as const };
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const size = fs.fstatSync(fd).size;
+    const head = Buffer.alloc(16);
+    let off = 0;
+    let moov: { buf: Buffer; hdr: number } | undefined;
+    for (let n = 0; off < size && n < 1000; n++) {
+      if (off + 8 > size) return bad;
+      fs.readSync(fd, head, 0, 16, off);
+      let len = head.readUInt32BE(0);
+      let hdr = 8;
+      if (len === 1) {
+        if (off + 16 > size) return bad;
+        len = Number(head.readBigUInt64BE(8));
+        hdr = 16;
+      } else if (len === 0) len = size - off;
+      if (len < hdr || off + len > size) return bad;
+      if (head.toString("latin1", 4, 8) === "moov") {
+        if (len > 32 * 1024 * 1024) return bad;
+        const buf = Buffer.alloc(len);
+        fs.readSync(fd, buf, 0, len, off);
+        moov = { buf, hdr };
+        break;
+      }
+      off += len;
+    }
+    if (!moov) return bad;
+    const b = moov.buf;
+    const top = children(b, moov.hdr, b.length);
+    if (!top) return bad;
+    let scale = 0;
+    // Review r7: a fragmented file (`mvex`): its first `moov` may give a media edit of length 0 — "not known yet".
+    const fragmented = top.some((x) => x.type === "mvex");
+    const found: { video: TrackTimeline | null; audio: TrackTimeline | null } = { video: null, audio: null };
+    for (const box of top) {
+      if (box.type === "mvhd") {
+        if (box.start + 24 > box.end) return bad;
+        scale = b.readUInt32BE(box.start + (b[box.start] === 1 ? 20 : 12));
+      }
+    }
+    if (!scale) return bad;
+    for (const box of top) {
+      if (box.type !== "trak") continue;
+      const kids = children(b, box.start, box.end);
+      if (!kids) return bad;
+      let handler = "";
+      let mediaScale = 0;
+      let elst: Box | undefined;
+      for (const k of kids) {
+        if (k.type === "mdia") {
+          const m = children(b, k.start, k.end);
+          if (!m) return bad;
+          for (const h of m) {
+            if (h.type === "hdlr") {
+              if (h.start + 12 > h.end) return bad;
+              handler = b.toString("latin1", h.start + 8, h.start + 12);
+            }
+            if (h.type === "mdhd") {
+              if (h.start + 24 > h.end) return bad;
+              mediaScale = b.readUInt32BE(h.start + (b[h.start] === 1 ? 20 : 12));
+            }
+          }
+        }
+        if (k.type === "edts") {
+          const e = children(b, k.start, k.end);
+          if (!e) return bad;
+          elst = e.find((x) => x.type === "elst");
+        }
+      }
+      const kind = handler === "vide" ? "video" : handler === "soun" ? "audio" : null;
+      if (!kind || found[kind]) continue;
+      if (!elst) {
+        found[kind] = {
+          edited: false,
+          lead: 0,
+          mediaTime: 0,
+          end: null,
+          exact: { edited: false, lead: Q0, mediaTime: Q0, end: null },
+        };
+        continue;
+      }
+      if (!mediaScale) return bad;
+      if (elst.start + 8 > elst.end) return bad;
+      const v = b[elst.start]!;
+      if (v > 1) return bad;
+      const count = b.readUInt32BE(elst.start + 4);
+      const each = v === 1 ? 20 : 12;
+      if (elst.start + 8 + count * each > elst.end) return bad;
+      const entries = Array.from({ length: count }, (_, k) => {
+        const at = elst!.start + 8 + k * each;
+        return {
+          duration: v === 1 ? Number(b.readBigUInt64BE(at)) : b.readUInt32BE(at),
+          media: v === 1 ? Number(b.readBigInt64BE(at + 8)) : b.readInt32BE(at + 4),
+          rate: b.readInt16BE(at + (v === 1 ? 16 : 8)),
+          fraction: b.readInt16BE(at + (v === 1 ? 18 : 10)),
+        };
+      });
+      // At most one leading empty edit, then exactly one media edit at rate 1.
+      const lead = entries[0]?.media === -1 ? entries[0] : undefined;
+      const media = entries.slice(lead ? 1 : 0);
+      if (media.length !== 1 || media[0]!.media < 0 || media[0]!.rate !== 1 || media[0]!.fraction !== 0)
+        return { ok: false, reason: "unsupported" };
+      const leadSec = (lead?.duration ?? 0) / scale;
+      // A media edit of length 0: in a fragmented file "to its end" (the decoded end decides); else nothing to show.
+      if (media[0]!.duration === 0 && !fragmented) return { ok: false, reason: "unsupported" };
+      const leadQ = q(lead?.duration ?? 0, scale);
+      const endQ = media[0]!.duration === 0 ? null : q((lead?.duration ?? 0) + media[0]!.duration, scale);
+      found[kind] = {
+        edited: true,
+        lead: leadSec,
+        mediaTime: media[0]!.media / mediaScale,
+        end: endQ ? qSec(endQ) : null,
+        exact: { edited: true, lead: leadQ, mediaTime: q(media[0]!.media, mediaScale), end: endQ },
+      };
+    }
+    return { ok: true, ...found };
+  } catch {
+    return bad;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+/** Whether a WebP is animated (its `VP8X` header's animation flag, or an `ANIM` chunk) — review r5. */
+export function isAnimatedWebp(file: string): boolean {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const b = Buffer.alloc(64);
+    const got = fs.readSync(fd, b, 0, 64, 0);
+    if (got < 21 || b.toString("latin1", 0, 4) !== "RIFF" || b.toString("latin1", 8, 12) !== "WEBP")
+      return false;
+    return (
+      (b.toString("latin1", 12, 16) === "VP8X" && (b[20]! & 0x02) !== 0) || b.includes("ANIM", 12, "latin1")
+    );
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+/**
+ * ffprobe's report of an input judged (exported for tests); `timeline`: an MP4/MOV's presentation timeline
+ * (`mp4Timeline`) — its lead and its end decide the picture's and the sound's presentation (re-plan 2).
+ */
+export function judgeInput(
+  stdout: string,
+  fileKind: FileKind,
+  timeline: Mp4Timeline = { ok: true, video: null, audio: null },
+): ProbeOutcome {
+  if (!timeline.ok) return { ok: false, reason: "edited" };
+  const kind = inputKindOf(fileKind);
+  if (!kind) return { ok: false, reason: "kind" };
+  let r: z.infer<typeof Probe>;
+  try {
+    const p = Probe.safeParse(JSON.parse(stdout));
+    if (!p.success) return { ok: false, reason: "unreadable" };
+    r = p.data;
+  } catch {
+    return { ok: false, reason: "unreadable" };
+  }
+  const streams = r.streams ?? [];
+  const video = streams.filter((s) => s.codec_type === "video" && s.disposition?.attached_pic !== 1);
+  const audio = streams.filter((s) => s.codec_type === "audio");
+  const v = video[0];
+  const side = (n: number | undefined) => n !== undefined && n > 0 && n <= COMPOSE_LIMITS.maxInputSide;
+  const duration =
+    Number.isFinite(r.format?.duration) && r.format!.duration! > 0 ? r.format!.duration! : null;
+  // Review r10: a stream's start and length exact — `start_pts`, `duration_ts` in its `time_base`.
+  const tb = (x: typeof v) => {
+    const m = x?.time_base ? /^(\d+)\/(\d+)$/.exec(x.time_base) : null;
+    return m && Number(m[2]) > 0 ? { n: Number(m[1]), d: Number(m[2]) } : null;
+  };
+  const exactAt = (x: typeof v, ts: number | undefined) => {
+    const t = tb(x);
+    return t && ts !== undefined && Number.isSafeInteger(ts * t.n) ? q(ts * t.n, t.d) : null;
+  };
+  const startOf = (x: typeof v) => exactAt(x, x?.start_pts);
+  const lengthOf = (x: typeof v) => (x?.duration_ts && x.duration_ts > 0 ? exactAt(x, x.duration_ts) : null);
+  // Review r1: the first sound's end from the file's start — its own start and length (a video's sound may be shorter
+  // than its picture, or start later); the file's length when the stream does not say (an estimate only: the job
+  // decodes the real one).
+  const a = audio[0];
+  const starts = streams.map(startOf).filter((x): x is Q => !!x);
+  const fileStart = starts.length ? starts.reduce(qMin) : Q0;
+  const aLength = lengthOf(a);
+  const audioSec = !a
+    ? null
+    : aLength
+      ? Math.max(0, qSec(qSub(startOf(a) ?? fileStart, fileStart))) + qSec(aLength)
+      : duration;
+  const mov = DEMUXER[fileKind] === "mov";
+  const tv = timeline.video;
+  const ta = timeline.audio;
+  // Review r8: each track as the file describes it — its edit list (re-plan 2: presented on [lead, end) of the movie's
+  // timeline, its media from its edit's media time; the file is read with `-ignore_editlist` and mapped by
+  // `presentTrack`), or, without one, its samples at their own times — a sound track to its own end (review r4: an
+  // AAC's last frame decodes past it).
+  const streamEnd = (x: typeof v) => {
+    const s0 = startOf(x);
+    const l = lengthOf(x);
+    return s0 && l ? qAdd(s0, l) : null;
+  };
+  const none = { edited: false, lead: Q0, mediaTime: Q0, end: null };
+  const videoTrack: TrackEdit | null = mov && v ? (tv?.edited ? tv.exact : none) : null;
+  const audioTrack: TrackEdit | null =
+    mov && a ? (ta?.edited ? ta.exact : { ...none, end: streamEnd(a) }) : null;
+  // An MP4/MOV's presentation 0 on its `-copyts` timeline (review r5, restored in r8; exact — review r10): the earliest
+  // first sample of its tracks — a track with an edit list starts at the movie's 0 (its leading empty edit stays, as
+  // nothing), one without at its first sample (a B-frame picture's reorder delay without an edit list is no gap; sound
+  // before that first picture is kept).
+  const first = (x: typeof v, edited: boolean | undefined) => (edited ? Q0 : (startOf(x) ?? Q0));
+  const firsts = [...(v ? [first(v, tv?.edited)] : []), ...(a ? [first(a, ta?.edited)] : [])];
+  const origin = mov && firsts.length ? qMax(Q0, firsts.reduce(qMin)) : Q0;
+
+  if (kind === "image") {
+    if (!v || !side(v.width) || !side(v.height)) return { ok: false, reason: "unreadable" };
+    return {
+      ok: true,
+      info: {
+        fileKind,
+        kind,
+        durationSec: null,
+        hasVideo: true,
+        hasAudio: false,
+        width: v.width!,
+        height: v.height!,
+      },
+    };
+  }
+  if (kind === "video") {
+    // A cover picture only (an audio file in an MP4) is not a video — but its sound may still be narration.
+    if (v && (!side(v.width) || !side(v.height))) return { ok: false, reason: "unreadable" };
+    if (!v && !audio.length) return { ok: false, reason: "unreadable" };
+    if (duration === null) return { ok: false, reason: "unreadable" };
+    return {
+      ok: true,
+      info: {
+        fileKind,
+        kind,
+        durationSec: duration,
+        hasVideo: !!v,
+        hasAudio: audio.length > 0,
+        audioSec,
+        videoTrack,
+        audioTrack,
+        origin,
+        width: v?.width ?? null,
+        height: v?.height ?? null,
+      },
+    };
+  }
+  if (!audio.length || duration === null) return { ok: false, reason: "unreadable" };
+  return {
+    ok: true,
+    info: {
+      fileKind,
+      kind,
+      durationSec: duration,
+      audioSec,
+      audioTrack,
+      origin,
+      hasVideo: false,
+      hasAudio: true,
+      width: null,
+      height: null,
+    },
+  };
+}
+
+const Verify = z.object({
+  format: z
+    .object({
+      format_name: z.string().max(200).optional(),
+      tags: z
+        .object({ major_brand: z.string().max(16).optional() })
+        .partial()
+        .optional(),
+    })
+    .optional(),
+  streams: z
+    .array(
+      z.object({
+        codec_type: z.string().max(40).optional(),
+        codec_name: z.string().max(40).optional(),
+        nb_read_packets: z.coerce.number().int().optional(),
+        duration: z.coerce.number().optional(),
+        width: z.number().int().optional(),
+        height: z.number().int().optional(),
+        disposition: z.object({ attached_pic: z.number().int() }).partial().optional(),
+      }),
+    )
+    .max(16)
+    .optional(),
+});
+
+/**
+ * The result judged (review R5, exported for tests): an MP4 (`isom`-family brand) with exactly one H.264 picture of the
+ * plan's size and frame count (±1 frame: one packet per frame), one AAC sound within 0.1 s of the plan's samples, and
+ * a `mov_text` subtitle track exactly when the plan has subtitles.
+ */
+export function judgeResult(stdout: string, plan: Plan, subtitles: boolean): boolean {
+  let r: z.infer<typeof Verify>;
+  try {
+    const p = Verify.safeParse(JSON.parse(stdout));
+    if (!p.success) return false;
+    r = p.data;
+  } catch {
+    return false;
+  }
+  const names = (r.format?.format_name ?? "").split(",");
+  const brand = (r.format?.tags?.major_brand ?? "").toLowerCase().padEnd(4, " ");
+  if (!names.includes("mp4") || !MP4_BRANDS.has(brand)) return false;
+  const s = r.streams ?? [];
+  const video = s.filter((x) => x.codec_type === "video" && x.disposition?.attached_pic !== 1);
+  const audio = s.filter((x) => x.codec_type === "audio");
+  const subs = s.filter((x) => x.codec_type === "subtitle");
+  if (video.length !== 1 || audio.length !== 1 || subs.length !== (subtitles ? 1 : 0)) return false;
+  const v = video[0]!;
+  const a = audio[0]!;
+  if (v.codec_name !== "h264" || v.width !== plan.width || v.height !== plan.height) return false;
+  if (v.nb_read_packets === undefined || Math.abs(v.nb_read_packets - plan.frames) > 1) return false;
+  if (a.codec_name !== "aac" || a.duration === undefined) return false;
+  // Review r4: picture and sound end together — the sound within one frame of the picture's frames.
+  if (Math.abs(a.duration - plan.samples / (SPF * 30)) > 1 / 30 + 1e-3) return false;
+  if (subtitles && subs[0]!.codec_name !== "mov_text") return false;
+  return true;
+}
+
+/** A regular file with one name (not a link): its size, or undefined. */
+function plainSize(file: string): number | undefined {
+  const st = fs.lstatSync(file, { throwIfNoEntry: false });
+  return st?.isFile() && st.nlink === 1 ? st.size : undefined;
+}
+
+/**
+ * One track of a mix: placed at `start` (samples of the result) for `length` samples, faded in and out over its
+ * overlaps; its samples are read from `offset` in `file` — `take` of them at most (the rest, and whatever the file does
+ * not have, is silence) — times `gain`.
+ */
+export type Track = {
+  file: string;
+  start: number;
+  length: number;
+  fadeIn: number;
+  fadeOut: number;
+  offset?: number;
+  take?: number;
+  gain?: number;
+};
+
+/**
+ * PCM tracks (48 kHz stereo s16) summed into one of `total` samples (48 kHz stereo float — review r5), second by second (exported for tests): each at its
+ * start, cut to its length, faded in and out linearly over its overlaps (two crossfading clips add up to one), never
+ * clipped. The clips' sound (`bed.pcm`: their transitions are their crossfades) and the narration (`narration.pcm`).
+ */
+export async function mixPcm(out: string, total: number, tracks: readonly Track[]): Promise<void> {
+  const CHUNK = 48_000;
+  const fd = fs.openSync(out, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+  const fds = new Map<string, number>();
+  try {
+    const acc = new Float64Array(CHUNK * 2);
+    const outBuf = Buffer.alloc(CHUNK * 8);
+    const inBuf = Buffer.alloc(CHUNK * 4);
+    for (let c0 = 0; c0 < total; c0 += CHUNK) {
+      const n = Math.min(CHUNK, total - c0);
+      acc.fill(0, 0, n * 2);
+      for (const t of tracks) {
+        const from = Math.max(c0, t.start);
+        // Only the samples it has: past `take` (and past the file's end) the track is silence.
+        const to = Math.min(c0 + n, t.start + Math.min(t.length, t.take ?? t.length));
+        if (to <= from) continue;
+        const gain = t.gain ?? 1;
+        let tfd = fds.get(t.file);
+        if (tfd === undefined)
+          fds.set(t.file, (tfd = fs.openSync(t.file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)));
+        const count = to - from;
+        const got = fs.readSync(tfd, inBuf, 0, count * 4, ((t.offset ?? 0) + from - t.start) * 4);
+        const have = Math.floor(got / 4);
+        for (let k = 0; k < have; k++) {
+          const p = from - t.start + k;
+          let w = gain;
+          if (t.fadeIn > 0 && p < t.fadeIn) w = (gain * p) / t.fadeIn;
+          if (t.fadeOut > 0 && p >= t.length - t.fadeOut)
+            w = Math.min(w, (gain * (t.length - p)) / t.fadeOut);
+          const o = (from - c0 + k) * 2;
+          acc[o] = acc[o]! + inBuf.readInt16LE(k * 4) * w;
+          acc[o + 1] = acc[o + 1]! + inBuf.readInt16LE(k * 4 + 2) * w;
+        }
+      }
+      // Float, not clipped (review r5): a gain above 1 reaches the ducking and the loudness normalisation intact.
+      for (let k = 0; k < n * 2; k++) outBuf.writeFloatLE(acc[k]! / 32768, k * 4);
+      let off = 0;
+      while (off < n * 8) off += fs.writeSync(fd, outBuf, off, n * 8 - off);
+      await yieldNow();
+    }
+  } finally {
+    fs.closeSync(fd);
+    for (const f of fds.values()) fs.closeSync(f);
+  }
+}
+
+/** A tiny PNG (16×16, one colour): the readiness check's input. */
+const READY_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAACXBIWXMAAAABAAAAAQBPJcTWAAAAGUlEQVR4nGPUT9jHQApgIUn1qIZRDUNKAwBa4wGLIbQV5gAAAABJRU5ErkJggg==",
+  "base64",
+);
+
+/** The progress value of an ffmpeg `-progress` line (`out_time_us=`): seconds done, or undefined. */
+export const progressSeconds = (line: string): number | undefined => {
+  const m = /^out_time_(?:us|ms)=(\d+)$/.exec(line.trim());
+  return m ? Number(m[1]) / 1_000_000 : undefined;
+};
+
+/** The `Composer` the app uses: the sandboxed ffmpeg and ffprobe (undefined without them). */
+export function sandboxedComposer(o: {
+  dataDir: string;
+  ffmpegPath?: string | undefined;
+  platform?: NodeJS.Platform;
+  run?: typeof runIsolated;
+  /** Tests: every run's peak memory. */
+  onPeakRss?: (bytes: number) => void;
+}): Composer | undefined {
+  const tools = speechTools(o.ffmpegPath, o.dataDir, o.platform);
+  if (!tools) return undefined;
+  const run = o.run ?? runIsolated;
+  const exec = async (
+    command: string,
+    args: string[],
+    p: {
+      cwd: string;
+      read: string[];
+      write: string[];
+      timeoutMs: number;
+      signal?: AbortSignal | undefined;
+      onLine?: (l: string) => void;
+      maxOutputBytes?: number;
+    },
+  ): Promise<RunResult | undefined> => {
+    const opts: RunIsolatedOptions = {
+      command,
+      args,
+      cwd: p.cwd,
+      env: { HOME: p.cwd, LANG: "en_US.UTF-8" },
+      read: p.read,
+      write: p.write,
+      trusted: tools.ffmpeg.trusted,
+      network: "none",
+      noFlagChanges: true,
+      timeoutMs: Math.max(1000, p.timeoutMs),
+      maxRssBytes: COMPOSE_RUN_LIMITS.memoryBytes,
+      maxOutputBytes: p.maxOutputBytes ?? COMPOSE_RUN_LIMITS.stderrBytes,
+      ...(p.signal ? { signal: p.signal } : {}),
+      ...(p.onLine ? { onStdoutLine: p.onLine } : {}),
+      ...(o.onPeakRss ? { onPeakRss: o.onPeakRss } : {}),
+    };
+    try {
+      return await run(opts);
+    } catch {
+      // No sandbox, a hard link in an allowed folder, a spawn failure: nothing ran.
+      return undefined;
+    }
+  };
+
+  const probe: Composer["probe"] = async (file, fileKind, signal) => {
+    if (!inputKindOf(fileKind)) return { ok: false, reason: "kind" };
+    if (plainSize(file) === undefined) return { ok: false, reason: "failed" };
+    // Review r5: ffmpeg cannot decode an animated WebP — refused with its own code (no other decoder is run).
+    if (fileKind === "webp" && isAnimatedWebp(file)) return { ok: false, reason: "animated" };
+    const dir = path.dirname(file);
+    const r = await exec(tools.ffprobe, probeArgs(file, fileKind), {
+      cwd: dir,
+      read: [dir],
+      write: [],
+      timeoutMs: COMPOSE_RUN_LIMITS.probeTimeoutMs,
+      signal,
+      maxOutputBytes: 64 * 1024,
+    });
+    const v = decodeVerdict(r);
+    if (v === "failed") return { ok: false, reason: "failed" };
+    if (v !== "ok") return { ok: false, reason: "unreadable" };
+    return judgeInput(r!.stdout, fileKind, DEMUXER[fileKind] === "mov" ? mp4Timeline(file) : undefined);
+  };
+
+  const compose: Composer["compose"] = async (job) => {
+    const inDir = path.join(job.dir, "in");
+    const work = path.join(job.dir, "work");
+    const outDir = path.join(job.dir, "out");
+    const t = job.timeline;
+    let done = 0;
+    let totalUnits = 1;
+    const report = (f: number) => job.onProgress(Math.max(0, Math.min(1, f)));
+    /** One ffmpeg run of `weight` units over `seconds` of output (its progress lines move the bar). */
+    const step = async (
+      args: string[],
+      weight: number,
+      seconds: number,
+      where: { read: string[]; write: string[] },
+      onLine?: (l: string) => void,
+    ): Promise<ComposeJobCode | null> => {
+      if (job.signal.aborted) return "compose_failed";
+      const left = job.deadlineAt - Date.now();
+      if (left <= 0) return "compose_timeout";
+      const r = await exec(tools.ffmpeg.exe, args, {
+        cwd: work,
+        read: where.read,
+        write: where.write,
+        timeoutMs: left,
+        signal: job.signal,
+        onLine: (l) => {
+          onLine?.(l);
+          const s = progressSeconds(l);
+          if (s !== undefined && seconds > 0) report((done + weight * Math.min(1, s / seconds)) / totalUnits);
+        },
+      });
+      done += weight;
+      report(done / totalUnits);
+      if (r?.killed === "timeout" || Date.now() >= job.deadlineAt) return "compose_timeout";
+      return decodeVerdict(r) === "ok" ? null : "compose_failed";
+    };
+    const local = { read: [inDir, work], write: [work] };
+    // 1. Ingest (the re-plan after review r3): every input with sound or used as a clip decoded once from its start —
+    //    the sound to PCM (its sample count is its length), the picture counted at 30 fps. Nothing is read from
+    //    metadata for a length.
+    const byId = new Map(job.inputs.map((i) => [i.fileId, i]));
+    const caps = new Map<string, { cap: number; count: boolean }>();
+    const use = (fileId: string, cap: number, count: boolean) => {
+      const was = caps.get(fileId);
+      caps.set(fileId, { cap: Math.max(was?.cap ?? 0, cap), count: (was?.count ?? false) || count });
+    };
+    const longest = COMPOSE_LIMITS.maxSeconds + 1;
+    for (const c of t.clips) {
+      const info = byId.get(c.fileId);
+      if (!info || info.kind !== "video") continue;
+      // What the clip takes from its source: up to the trim's end, or its length from the start (else all of it).
+      // Review r4: with a trim and a length, only up to the earlier of the two.
+      const end = c.trim
+        ? Math.min(c.trim.endSec, c.trim.startSec + (c.durationSec ?? Infinity))
+        : (c.durationSec ?? longest);
+      use(c.fileId, Math.min(end, COMPOSE_LIMITS.maxSourceSeconds) + 1, true);
+    }
+    for (const n of t.narration ?? []) use(n.fileId, longest, false);
+    if (t.music) use(t.music.fileId, longest, false);
+    const truth = new Map<string, InputInfo>();
+    for (const info of job.inputs) truth.set(info.fileId, info);
+    for (const [fileId, u] of caps) {
+      const info = byId.get(fileId)!;
+      if (info.kind === "image") continue;
+      let pictureFrames: number | undefined;
+      const code = await step(
+        ingestArgs({
+          inDir,
+          input: info.name,
+          fileKind: info.fileKind,
+          sound: info.hasAudio,
+          countPicture: u.count && info.hasVideo,
+          capSec: u.cap,
+          soundAt: presentTrack(info.audioTrack, info.origin ?? Q0),
+          pictureAt: presentTrack(info.videoTrack, info.origin ?? Q0),
+        }),
+        0,
+        0,
+        local,
+        (l) => {
+          const m = /^frame=(\d+)$/.exec(l.trim());
+          if (m) pictureFrames = Number(m[1]);
+        },
+      );
+      if (code) return { ok: false, code };
+      let audioSec: number | null = null;
+      if (info.hasAudio) {
+        const size = plainSize(path.join(work, sourcePcm(info.name)));
+        if (size === undefined || size % 4) return { ok: false, code: "compose_failed" };
+        audioSec = size / 4 / RATE;
+      }
+      if (u.count && info.hasVideo && !pictureFrames) return { ok: false, code: "compose_failed" };
+      // Re-plan 2: a picture with an edit list lasts to its media edit's end — not to its last frame's own duration.
+      // Review r13: without one (or a fragmented file's, not known), to its last frame's end — that frame's pts plus
+      // its duration, exact, on the input's timeline — not a count of 30 fps frames.
+      const shown = presentTrack(info.videoTrack, info.origin ?? Q0);
+      let lastEnd: Q | null = null;
+      if (u.count && info.hasVideo && !shown.end) {
+        const left = job.deadlineAt - Date.now();
+        if (left <= 0) return { ok: false, code: "compose_timeout" };
+        const fold = pictureEnd();
+        const r = await exec(tools.ffprobe, pictureEndArgs(path.join(inDir, info.name)), {
+          cwd: inDir,
+          read: [inDir],
+          write: [],
+          timeoutMs: left,
+          signal: job.signal,
+          onLine: fold.line,
+        });
+        if (r?.killed === "timeout" || Date.now() >= job.deadlineAt)
+          return { ok: false, code: "compose_timeout" };
+        // Review r14: fail closed — no exact end (the scan failed, or said nothing usable) is no length to guess.
+        const e = decodeVerdict(r) === "ok" ? fold.end() : null;
+        if (!e) return { ok: false, code: "compose_failed" };
+        lastEnd = qAdd(e, shown.shift);
+      }
+      const pictureSec = !(u.count && info.hasVideo) ? null : Math.max(0, qSec(shown.end ?? lastEnd!));
+      truth.set(fileId, {
+        ...info,
+        durationSec: Math.max(pictureSec ?? 0, audioSec ?? 0) || (info.durationSec ?? 0),
+        audioSec,
+      });
+    }
+    // 2. The plan from the decoded lengths (a narration that is really longer holds the last picture; the 5-minute cap
+    //    on the real total).
+    const plan = planTimeline(t, truth);
+    if (isPlanError(plan))
+      return {
+        ok: false,
+        code: plan.code === "compose_too_long" ? "compose_too_long" : "compose_timeline_mismatch",
+      };
+    const units = workUnits(plan);
+    totalUnits =
+      done +
+      units.clips.reduce((a, b) => a + b, 0) +
+      units.transitions.reduce((a, b) => a + b, 0) +
+      units.audio +
+      units.mux;
+    // 3. Every clip's picture pieces.
+    for (const [i, c] of plan.clips.entries()) {
+      const code = await step(clipArgs(plan, i, inDir), units.clips[i]!, c.frames / FPS, local);
+      if (code) return { ok: false, code };
+      const p = pieces(i);
+      if (c.frames - c.head - c.tail > 0 && plainSize(path.join(work, p.body)) === undefined)
+        return { ok: false, code: "compose_failed" };
+      if (
+        (c.head && plainSize(path.join(work, p.head)) === undefined) ||
+        (c.tail && plainSize(path.join(work, p.tail)) === undefined)
+      )
+        return { ok: false, code: "compose_failed" };
+    }
+    // 4. Every transition (then its lossless pieces are no longer needed).
+    for (const [i, c] of plan.clips.entries()) {
+      if (!c.tail) continue;
+      const code = await step(transitionArgs(plan, i), units.transitions[i]!, c.tail / FPS, local);
+      if (code) return { ok: false, code };
+      if (plainSize(path.join(work, `trans-${i}.mp4`)) === undefined)
+        return { ok: false, code: "compose_failed" };
+      fs.rmSync(path.join(work, pieces(i).tail), { force: true });
+      fs.rmSync(path.join(work, pieces(i + 1).head), { force: true });
+    }
+    fs.writeFileSync(path.join(work, "list.ffconcat"), concatList(plan), { flag: "wx", mode: 0o600 });
+    // 5. The sound: each clip's slice of its input's PCM (from the trim's start, sample-exact; silence where it has
+    //    none), crossfaded where its picture is; the narration placed at its samples; the music — then one graph.
+    try {
+      await mixPcm(
+        path.join(work, "bed.pcm"),
+        plan.samples,
+        plan.clips.flatMap((c) =>
+          c.kind === "video" && c.hasAudio
+            ? [
+                {
+                  file: path.join(work, sourcePcm(c.input)),
+                  start: c.at * SPF,
+                  length: c.frames * SPF,
+                  fadeIn: c.head * SPF,
+                  fadeOut: c.tail * SPF,
+                  offset: Math.round(c.startSec * RATE),
+                  // Review r13: to the chosen part's end, unrounded (as the picture is cut) — silence for the rest of
+                  // its frames.
+                  take: Math.round(Math.min(c.pickSec ?? c.useSec, c.useSec) * RATE),
+                  gain: c.volume,
+                },
+              ]
+            : [],
+        ),
+      );
+      const narration: Track[] = plan.narration
+        .filter((n) => n.maxSamples > 0)
+        .map((n) => ({
+          file: path.join(work, sourcePcm(n.input)),
+          start: n.startSample,
+          length: n.maxSamples,
+          fadeIn: 0,
+          fadeOut: 0,
+        }));
+      if (narration.length) await mixPcm(path.join(work, "narration.pcm"), plan.samples, narration);
+      if (plan.music && !plainSize(path.join(work, sourcePcm(plan.music.input))))
+        return { ok: false, code: "compose_failed" };
+      const code = await step(
+        audioArgs(plan, {
+          narration: narration.length > 0,
+          music: plan.music ? sourcePcm(plan.music.input) : null,
+        }),
+        units.audio,
+        plan.samples / RATE,
+        { read: [work], write: [work] },
+      );
+      if (code) return { ok: false, code };
+    } catch {
+      return { ok: false, code: "compose_failed" };
+    }
+    // 6. The file (the subtitles cut to the real length — `timedCues`).
+    const subs = (t.subtitles ?? []).length ? toAss(t.subtitles ?? [], plan.frames / FPS) : null;
+    const hasSubs = !!subs && subs.includes("\nDialogue:");
+    // Review r4: every cue asked for is in the track (none lost to rounding) — else the result is not what was asked.
+    const asked = (t.subtitles ?? []).filter((x) => cueText(x.text)).length;
+    if (asked !== (subs?.split("\nDialogue:").length ?? 1) - 1)
+      return { ok: false, code: "compose_verify_failed" };
+    if (hasSubs) fs.writeFileSync(path.join(work, "subs.ass"), subs!, { flag: "wx", mode: 0o600 });
+    const result = path.join(outDir, "result.mp4");
+    const code = await step(
+      muxArgs({ subtitles: hasSubs, out: result, maxBytes: COMPOSE_LIMITS.maxBytes }),
+      units.mux,
+      plan.frames / FPS,
+      { read: [work], write: [outDir] },
+    );
+    const bytes = plainSize(result);
+    if (bytes !== undefined && bytes > COMPOSE_LIMITS.maxBytes)
+      return { ok: false, code: "compose_too_large" };
+    if (code) return { ok: false, code };
+    if (bytes === undefined) return { ok: false, code: "compose_failed" };
+    // 7. The check (review R5): never only ffmpeg's exit status.
+    const left = job.deadlineAt - Date.now();
+    if (left <= 0) return { ok: false, code: "compose_timeout" };
+    const v = await exec(tools.ffprobe, verifyArgs(result), {
+      cwd: outDir,
+      read: [outDir],
+      write: [],
+      timeoutMs: Math.min(left, COMPOSE_RUN_LIMITS.probeTimeoutMs),
+      signal: job.signal,
+      maxOutputBytes: 64 * 1024,
+    });
+    if (decodeVerdict(v) !== "ok" || !judgeResult(v!.stdout, plan, hasSubs))
+      return { ok: false, code: "compose_verify_failed" };
+    return { ok: true, file: result, bytes, plan };
+  };
+
+  const composer: Composer = {
+    workdir: () => makeComposeWorkdir(o.dataDir),
+    probe,
+    compose,
+    ready: (signal) => readyOf(composer, signal),
+  };
+  return composer;
+}
+
+/** `ready` of a composer: a 0.5 s 720×720 picture with a subtitle made and checked in a fresh job folder (removed). */
+async function readyOf(c: Composer, signal?: AbortSignal): Promise<boolean> {
+  let dir: string | undefined;
+  try {
+    dir = c.workdir();
+    const file = path.join(dir, "in", "in-0.png");
+    fs.writeFileSync(file, READY_PNG, { flag: "wx", mode: 0o600 });
+    const p = await c.probe(file, "png", signal);
+    if (!p.ok) return false;
+    const r = await c.compose({
+      dir,
+      timeline: {
+        output: { resolution: "720p", aspectRatio: "1:1" },
+        clips: [{ fileId: "ready", durationSec: 0.5 }],
+        subtitles: [{ startSec: 0, endSec: 0.4, text: "ok" }],
+      },
+      inputs: [{ ...p.info, fileId: "ready", name: "in-0.png" }],
+      signal: signal ?? new AbortController().signal,
+      deadlineAt: Date.now() + 120_000,
+      onProgress: () => {},
+    });
+    return r.ok;
+  } catch {
+    return false;
+  } finally {
+    if (dir) removeComposeWorkdir(dir);
+  }
+}
+
+/**
+ * The FAKE_RUNTIME (e2e) and test composer — no program runs: inputs are taken by their kind (a video 2 s long with
+ * sound, audio 2 s — the same "decoded" at the run), and the "composition" is the known-good MP4 after a few progress
+ * steps (`stepMs` apart).
+ */
+export function fixtureComposer(
+  dataDir: string,
+  o: { stepMs?: number; outcome?: () => ComposeOutcome | undefined } = {},
+): Composer {
+  const composer: Composer = {
+    workdir: () => makeComposeWorkdir(dataDir),
+    async probe(file, fileKind) {
+      const kind = inputKindOf(fileKind);
+      if (!kind) return { ok: false, reason: "kind" };
+      if (plainSize(file) === undefined) return { ok: false, reason: "failed" };
+      return {
+        ok: true,
+        info: {
+          fileKind,
+          kind,
+          durationSec: kind === "image" ? null : 2,
+          hasVideo: kind !== "audio",
+          hasAudio: kind !== "image",
+          width: kind === "audio" ? null : 64,
+          height: kind === "audio" ? null : 36,
+        },
+      };
+    },
+    async compose(job) {
+      for (const f of [0.25, 0.5, 0.75]) {
+        if (job.signal.aborted) return { ok: false, code: "compose_failed" };
+        job.onProgress(f);
+        await new Promise((r) => setTimeout(r, o.stepMs ?? 200));
+      }
+      const forced = o.outcome?.();
+      if (forced && !forced.ok) return forced;
+      // The lengths it was given stand for decoded ones.
+      const plan = planTimeline(job.timeline, new Map(job.inputs.map((i) => [i.fileId, i])));
+      if (isPlanError(plan))
+        return {
+          ok: false,
+          code: plan.code === "compose_too_long" ? "compose_too_long" : "compose_timeline_mismatch",
+        };
+      const file = path.join(job.dir, "out", "result.mp4");
+      fs.writeFileSync(file, KNOWN_GOOD_MP4, { flag: "wx", mode: 0o600 });
+      return { ok: true, file, bytes: KNOWN_GOOD_MP4.length, plan };
+    },
+    ready: async () => true,
+  };
+  return composer;
+}
+
+/** A job id is a fresh UUID made with its folder (`workdir`). */
+export const isJobName = (s: string) => JOB_NAME.test(s);
+export const randomJobName = () => crypto.randomUUID();

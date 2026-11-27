@@ -406,6 +406,9 @@ export const notificationPrefs = sqliteTable("notification_prefs", {
   /** 영상 생성 (#238 stage 3): "완성" and "실패" notifications — the user may turn each off. */
   videoDone: integer("video_done", { mode: "boolean" }).notNull().default(true),
   videoFailed: integer("video_failed", { mode: "boolean" }).notNull().default(true),
+  /** 멀티미디어 합성 (#238 stage 4): "완성" and "실패" notifications — the user may turn each off. */
+  composeDone: integer("compose_done", { mode: "boolean" }).notNull().default(true),
+  composeFailed: integer("compose_failed", { mode: "boolean" }).notNull().default(true),
   /** Revision (#188 review 9): +1 on every write; every response carries it. */
   rev: integer("rev").notNull().default(0),
   updatedAt: integer("updated_at").notNull(),
@@ -1899,5 +1902,57 @@ export const videoJobs = sqliteTable(
     index("video_jobs_conversation_idx").on(t.conversationId, t.createdAt),
     index("video_jobs_status_idx").on(t.status),
     index("video_jobs_next_idx").on(t.status, t.nextAt),
+  ],
+);
+
+/**
+ * 멀티미디어 합성 jobs (#238 stage 4-1, docs/decisions/media-generation.md §15): one per `compose_video` call. The id
+ * is also its working folder's name (`compose-scratch/<id>`). `timeline_json` is the validated timeline — the one
+ * column with the user's texts (subtitles); `plan_json` what the server worked out from it and the probed inputs
+ * (frame and sample counts, input kinds, server-made file names — no user text). `preparing` (inputs being copied
+ * and probed by the call) → `queued` → `running` → `done` (with `file_id`, in the file row's own transaction) or
+ * `failed` (`error_code`). A restart fails every job not ended (`compose_interrupted`).
+ */
+export const composeJobs = sqliteTable(
+  "compose_jobs",
+  {
+    id: text("id").primaryKey(),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    ownerId: text("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** The reply of the run that called `compose_video` (the card is under its tool line; the file is linked to it). */
+    messageId: text("message_id").notNull(),
+    runId: text("run_id").notNull(),
+    status: text("status", { enum: ["preparing", "queued", "running", "done", "failed"] }).notNull(),
+    timelineJson: text("timeline_json").notNull(),
+    planJson: text("plan_json"),
+    /** The result's length in milliseconds (frames / 30), its frame size, its clip count, whether it has subtitles. */
+    durationMs: integer("duration_ms").notNull(),
+    width: integer("width").notNull(),
+    height: integer("height").notNull(),
+    clips: integer("clips").notNull(),
+    subtitles: integer("subtitles", { mode: "boolean" }).notNull(),
+    /** 0–100 while running. */
+    progress: integer("progress"),
+    fileId: text("file_id").references(() => files.id, { onDelete: "set null" }),
+    errorCode: text("error_code"),
+    /** +1 on every write the card shows. */
+    version: integer("version").notNull().default(0),
+    /** The process that made or ran it (a restart fails every job of another process that has not ended). */
+    boot: text("boot").notNull(),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+    startedAt: integer("started_at"),
+    endedAt: integer("ended_at"),
+    notifiedAt: integer("notified_at"),
+    notifyNextAt: integer("notify_next_at"),
+    notifyTries: integer("notify_tries").notNull().default(0),
+  },
+  (t) => [
+    index("compose_jobs_conversation_idx").on(t.conversationId, t.createdAt),
+    index("compose_jobs_status_idx").on(t.status, t.createdAt),
   ],
 );

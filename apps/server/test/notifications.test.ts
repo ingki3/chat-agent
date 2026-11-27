@@ -726,7 +726,7 @@ describe("quiet hours (FR-13.4)", () => {
       quietEnd: "06:00",
       timeZone: "Nowhere/City",
     });
-    // 기억 정리 (#146, #188), 깊이 조사 (#211) and 영상 생성 (#238) notifications: on unless turned off, kept when a page leaves them out.
+    // 기억 정리 (#146, #188), 깊이 조사 (#211), 영상 생성 and 영상 합성 (#238) notifications: on unless turned off, kept when a page leaves them out.
     expect(ok.json()).toEqual({
       quietStart: "22:30",
       quietEnd: "06:00",
@@ -738,6 +738,8 @@ describe("quiet hours (FR-13.4)", () => {
       researchFailed: true,
       videoDone: true,
       videoFailed: true,
+      composeDone: true,
+      composeFailed: true,
       rev: 1,
     });
     expect((await api(mom, "GET", "/api/notifications/prefs")).json()).toEqual(ok.json());

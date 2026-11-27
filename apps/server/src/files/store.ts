@@ -125,7 +125,22 @@ export function cleanName(raw: string): string {
  */
 const VIDEO_HELD = `(SELECT count(*) FROM video_jobs WHERE conversation_id = ? AND file_id IS NULL AND id <> ?
   AND status IN ('submitting', 'pending', 'in_progress', 'downloading'))`;
-const PLACES = `(SELECT count(*) FROM files WHERE conversation_id = ?) + ${VIDEO_HELD}`;
+/**
+ * #238 stage 4 (review R8): a composition not ended (`preparing`, `queued`, `running`) holds one place the same way —
+ * counted by every check of a new file (uploads, generated files, a fork's copies); the job storing its own result
+ * leaves itself out (the same job id as above: ids are UUIDs, never shared between the two tables).
+ */
+const COMPOSE_HELD = `(SELECT count(*) FROM compose_jobs WHERE conversation_id = ? AND file_id IS NULL AND id <> ?
+  AND status IN ('preparing', 'queued', 'running'))`;
+const PLACES = `(SELECT count(*) FROM files WHERE conversation_id = ?) + ${VIDEO_HELD} + ${COMPOSE_HELD}`;
+/** The values `PLACES` binds, in order: the conversation, and the job storing its own file ('' for everyone else). */
+const placesArgs = (conversationId: string, exceptJob = "") => [
+  conversationId,
+  conversationId,
+  exceptJob,
+  conversationId,
+  exceptJob,
+];
 
 export type FileStoreOptions = {
   now?: () => number;
@@ -226,17 +241,23 @@ export class FileStore {
    */
   placesTaken(conversationId: string, exceptJob = ""): number {
     return (
-      this.db.$client.prepare(`SELECT ${PLACES} AS n`).get(conversationId, conversationId, exceptJob) as {
+      this.db.$client.prepare(`SELECT ${PLACES} AS n`).get(...placesArgs(conversationId, exceptJob)) as {
         n: number;
       }
     ).n;
   }
 
-  /** Whether this file is a video job's checked result (#238 stage 3: the only MP4s served inline). */
+  /**
+   * Whether this file is a video job's checked result (#238 stage 3) or a composition's (stage 4, checked the same way
+   * before it was stored): the only MP4s served inline.
+   */
   isVerifiedVideo(fileId: string): boolean {
     return !!this.db.$client
-      .prepare("SELECT 1 FROM video_jobs WHERE file_id = ? AND status = 'done'")
-      .get(fileId);
+      .prepare(
+        `SELECT 1 FROM video_jobs WHERE file_id = ? AND status = 'done'
+         UNION ALL SELECT 1 FROM compose_jobs WHERE file_id = ? AND status = 'done' LIMIT 1`,
+      )
+      .get(fileId, fileId);
   }
 
   /** Absolute path of a file's bytes (where it should be — reads and writes go through `storeDir`). */
@@ -368,9 +389,7 @@ export class FileStore {
               row.bytes,
               row.sha256,
               row.createdAt,
-              row.conversationId,
-              row.conversationId,
-              "",
+              ...placesArgs(row.conversationId),
               FILE_LIMITS.perConversation,
             ).changes === 1;
       } finally {
@@ -402,7 +421,8 @@ export class FileStore {
     tmp: string;
     guard?: () => boolean;
     /**
-     * #238 stage 3: a video job's result — the place its job holds is its own (`jobId` is left out of the held count),
+     * #238 stage 3: a video job's result (stage 4: also a composition's) — the place its job holds is its own (`jobId`
+     * is left out of the held count),
      * and `commit` runs in the **same transaction** as the insert (the job's `file_id` and `done`): false (or a throw)
      * rolls the row back and removes the file (`FileAddCancelledError`).
      */
@@ -461,9 +481,7 @@ export class FileStore {
                 row.bytes,
                 row.sha256,
                 row.createdAt,
-                row.conversationId,
-                row.conversationId,
-                input.video?.jobId ?? "",
+                ...placesArgs(row.conversationId, input.video?.jobId ?? ""),
                 FILE_LIMITS.perConversation,
               ).changes === 1;
           if (!inserted || !input.video) return inserted;
@@ -568,9 +586,7 @@ export class FileStore {
             row.bytes,
             row.sha256,
             row.createdAt,
-            row.conversationId,
-            row.conversationId,
-            "",
+            ...placesArgs(row.conversationId),
             FILE_LIMITS.perConversation,
           ).changes === 1;
       if (!added) throw new FileLimitError();

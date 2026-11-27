@@ -281,6 +281,23 @@ function videoJob(f: Family) {
   return id;
 }
 
+/**
+ * A composition (#238 stage 4) of `owner`'s conversation shared with `shared` — ended (failed), with a subtitle, so
+ * its stream closes at once and its track reads. The job is the owner's only, like a video card.
+ */
+function composeJob(f: Family) {
+  const fx = conversation(f);
+  return f.app.media!.compose.recordEnded({
+    conversationId: fx.id,
+    ownerId: f.users.owner.id,
+    messageId: fx.params.assistantMessageId,
+    timeline: {
+      clips: [{ fileId: "matrix-file", durationSec: 2 }],
+      subtitles: [{ startSec: 0, endSec: 1, text: "자막" }],
+    },
+  });
+}
+
 /** A live share (#29) of `owner`'s schedule-result conversation (#56) with `shared` — "새 결과 알림 받기" (#52). */
 function scheduleShare(f: Family) {
   const store = f.app.conversations!;
@@ -383,6 +400,10 @@ export const APP_MATRIX: MatrixRow[] = [
     body: { version: 1 },
     errors: { owner: "video_job_changed", shared: "forbidden", admin: "forbidden", stranger: "forbidden" },
   },
+  // 멀티미디어 합성 (#238 stage 4): the job and its subtitle track are the conversation owner's only.
+  { route: "GET /api/compose-jobs/:id", expect: OWNER_ONLY, fixture: composeJob },
+  { route: "GET /api/compose-jobs/:id/events", expect: OWNER_ONLY, fixture: composeJob },
+  { route: "GET /api/compose-jobs/:id/subtitles.vtt", expect: OWNER_ONLY, fixture: composeJob },
   { route: "GET /api/conversations/:id", expect: READ, fixture: conversation },
   {
     route: "PATCH /api/conversations/:id",

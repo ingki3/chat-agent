@@ -63,6 +63,8 @@ export type MediaAdminOptions = {
    * under the old key or settings expire with it (`VideoJobs.expireWaiting`).
    */
   changed?: () => void;
+  /** #238 stage 4: the composition's local readiness (ffmpeg, ffprobe, the sandbox) — undefined without the engine. */
+  composeReadiness?: () => { ready: boolean | null; checkedAt: number | null } | undefined;
 };
 
 const CATALOG_TTL_MS = 10 * 60_000;
@@ -154,6 +156,7 @@ export class MediaAdminService {
       settings: this.o.store.get(),
       settingsRevision: this.o.store.revision(),
       youthStrictModeration: YOUTH_STRICT_MODERATION,
+      compose: this.o.composeReadiness?.() ?? { ready: null, checkedAt: null },
     };
   }
 

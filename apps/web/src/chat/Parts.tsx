@@ -18,6 +18,8 @@ import { MemoryCard } from "../instructions/MemoryCard.js";
 import { memoryProposalIds } from "../instructions/memory-card.js";
 import { VideoCard } from "./VideoCard.js";
 import { videoJobIds } from "./video-card.js";
+import { ComposeCard } from "./ComposeCard.js";
+import { composeJobIds } from "./compose-card.js";
 
 type ToolCall = Extract<PublicPart, { type: "tool_call" }>;
 type ToolResult = Extract<PublicPart, { type: "tool_result" }>;
@@ -381,6 +383,13 @@ export function Parts({ parts, streaming = false }: { parts: readonly PublicPart
               ...s.calls.flatMap((c) => (s.results.has(c.id) ? [s.results.get(c.id)!] : [])),
             ]).map((id) => (
               <VideoCard key={id} jobId={id} />
+            ))}
+            {/* `compose_video` (#238 stage 4, review R10): its job's card — linked by the call's id to its result. */}
+            {composeJobIds([
+              ...s.calls,
+              ...s.calls.flatMap((c) => (s.results.has(c.id) ? [s.results.get(c.id)!] : [])),
+            ]).map((id) => (
+              <ComposeCard key={id} jobId={id} />
             ))}
           </Fragment>
         ) : (

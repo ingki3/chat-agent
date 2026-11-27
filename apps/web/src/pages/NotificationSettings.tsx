@@ -206,6 +206,7 @@ export function NotificationSettings() {
       <MemoryNotifications />
       <ResearchNotifications />
       <VideoNotifications />
+      <ComposeNotifications />
     </section>
   );
 }
@@ -317,7 +318,9 @@ type Toggle =
   | "researchDone"
   | "researchFailed"
   | "videoDone"
-  | "videoFailed";
+  | "videoFailed"
+  | "composeDone"
+  | "composeFailed";
 
 /** 기억 정리 notifications (#146, #188, spec §8): 제안 대기, 자동 반영, 실패 — each can be turned off. */
 function MemoryNotifications() {
@@ -361,6 +364,21 @@ function VideoNotifications() {
         ["videoFailed", "승인한 영상을 만들지 못했을 때"],
       ]}
       note="알림에는 정해진 문구와 이유만 적혀요. 요청 내용과 영상은 눌러서 대화에서 봐요."
+    />
+  );
+}
+
+/** 멀티미디어 합성 notifications (#238 stage 4): 완성, 실패 — each can be turned off. */
+function ComposeNotifications() {
+  return (
+    <KindToggles
+      testId="compose-notifications"
+      title="영상 합성 알림"
+      items={[
+        ["composeDone", "합성한 영상이 완성됐을 때"],
+        ["composeFailed", "영상을 합성하지 못했을 때"],
+      ]}
+      note="알림에는 정해진 문구와 이유만 적혀요. 영상과 자막은 눌러서 대화에서 봐요."
     />
   );
 }
