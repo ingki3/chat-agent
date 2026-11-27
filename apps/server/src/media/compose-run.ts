@@ -29,6 +29,8 @@ import {
   workUnits,
   isPlanError,
   presentTrack,
+  pictureEnd,
+  pictureEndArgs,
   q,
   Q0,
   qAdd,
@@ -775,14 +777,36 @@ export function sandboxedComposer(o: {
         if (size === undefined || size % 4) return { ok: false, code: "compose_failed" };
         audioSec = size / 4 / RATE;
       }
+      if (u.count && info.hasVideo && !pictureFrames) return { ok: false, code: "compose_failed" };
       // Re-plan 2: a picture with an edit list lasts to its media edit's end — not to its last frame's own duration.
-      const pictureEnd = presentTrack(info.videoTrack, info.origin ?? Q0).end;
+      // Review r13: without one (or a fragmented file's, not known), to its last frame's end — that frame's pts plus
+      // its duration, exact, on the input's timeline — not a count of 30 fps frames.
+      const shown = presentTrack(info.videoTrack, info.origin ?? Q0);
+      let lastEnd: Q | null = null;
+      if (u.count && info.hasVideo && !shown.end && DEMUXER[info.fileKind] === "mov") {
+        const left = job.deadlineAt - Date.now();
+        if (left <= 0) return { ok: false, code: "compose_timeout" };
+        const fold = pictureEnd();
+        const r = await exec(tools.ffprobe, pictureEndArgs(path.join(inDir, info.name)), {
+          cwd: inDir,
+          read: [inDir],
+          write: [],
+          timeoutMs: left,
+          signal: job.signal,
+          onLine: fold.line,
+        });
+        if (r?.killed === "timeout" || Date.now() >= job.deadlineAt)
+          return { ok: false, code: "compose_timeout" };
+        const e = decodeVerdict(r) === "ok" ? fold.end() : null;
+        lastEnd = e ? qAdd(e, shown.shift) : null;
+      }
       const pictureSec = !(u.count && info.hasVideo)
         ? null
-        : pictureEnd
-          ? Math.max(0, qSec(pictureEnd))
-          : (pictureFrames ?? 0) / FPS;
-      if (u.count && info.hasVideo && !pictureFrames) return { ok: false, code: "compose_failed" };
+        : shown.end
+          ? Math.max(0, qSec(shown.end))
+          : lastEnd
+            ? Math.max(0, qSec(lastEnd))
+            : (pictureFrames ?? 0) / FPS;
       truth.set(fileId, {
         ...info,
         durationSec: Math.max(pictureSec ?? 0, audioSec ?? 0) || (info.durationSec ?? 0),
@@ -844,7 +868,9 @@ export function sandboxedComposer(o: {
                   fadeIn: c.head * SPF,
                   fadeOut: c.tail * SPF,
                   offset: Math.round(c.startSec * RATE),
-                  take: Math.round(c.useSec * RATE),
+                  // Review r13: to the chosen part's end, unrounded (as the picture is cut) — silence for the rest of
+                  // its frames.
+                  take: Math.round(Math.min(c.pickSec ?? c.useSec, c.useSec) * RATE),
                   gain: c.volume,
                 },
               ]

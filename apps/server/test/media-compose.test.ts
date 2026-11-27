@@ -38,6 +38,7 @@ import {
   toAss,
   toVtt,
   ingestArgs,
+  pictureEnd,
   presentTrack,
   q,
   qSec,
@@ -1795,9 +1796,17 @@ describe("review r8: one presentation per track (pure)", () => {
         ]);
         expect([c.name, startSec, head.includes(trim)]).toEqual([c.name, startSec, true]);
         // The leading empty edit's end as the canvas's frame number (review r10).
+        // Review r13: a chosen part that ends by then shows none of the picture.
         const leadIn = toTicks(p.start) - secTicks(startSec);
-        expect([c.name, startSec, graph.includes(":enable='gte(n,")]).toEqual([c.name, startSec, leadIn > 0]);
-        if (leadIn > 0) expect(graph).toContain(`:enable='gte(n,${Math.ceil(leadIn / 100_000)})'`);
+        const cutTicks = Number(/,trim=end_pts=(\d+)/.exec(head)![1]);
+        const off = toTicks(p.start) > 0 && cutTicks <= toTicks(p.start);
+        expect([c.name, startSec, graph.includes(":enable='0'")]).toEqual([c.name, startSec, off]);
+        expect([c.name, startSec, graph.includes(":enable='gte(n,")]).toEqual([
+          c.name,
+          startSec,
+          !off && leadIn > 0,
+        ]);
+        if (!off && leadIn > 0) expect(graph).toContain(`:enable='gte(n,${Math.ceil(leadIn / 100_000)})'`);
         expect(graph).not.toContain("trim=end=");
         expect(graph).not.toMatch(/setpts=PTS[-+][0-9.]*\.[0-9]/);
       }
@@ -2075,6 +2084,44 @@ describe("review r12: the narration's end in whole samples; pieces without B-fra
   it("every H.264 piece is encoded without B-frames (one decoding delay for all)", () => {
     const i = H264.indexOf("-bf");
     expect(H264[i + 1]).toBe("0");
+  });
+});
+
+describe("review r13: the picture's real end, an empty chosen part (pure)", () => {
+  it("the last frame's end is the latest pts + duration in its time base (B-frames: not the last line)", () => {
+    const f = pictureEnd();
+    for (const l of [
+      "packet|pts=256|duration=128",
+      "packet|pts=15616|duration=128",
+      "packet|pts=15360|duration=128",
+      "packet|pts=N/A|duration=128",
+      "stream|time_base=1/15360",
+    ])
+      f.line(l);
+    expect(f.end()).toEqual(q(15744, 15360));
+    expect(pictureEnd().end()).toBeNull();
+  });
+
+  it("a chosen part that ends by the picture's first showing keeps the overlay off; one after it switches it on", () => {
+    const track = { edited: true, lead: q(1), mediaTime: q(2, 5), end: q(21, 10) };
+    for (const [endSec, on] of [
+      [0.999, "enable='0'"],
+      [1, "enable='0'"],
+      [1.01, "enable='gte(n,30)'"],
+    ] as const) {
+      const plan = planTimeline(
+        {
+          clips: [{ fileId: "v", trim: { startSec: 0, endSec } }],
+          narration: [{ fileId: "n", startSec: 0 }],
+        },
+        ins(
+          info("v", { kind: "video", durationSec: 2.1, videoTrack: track, origin: q(0) }),
+          info("n", { kind: "audio", durationSec: 2, audioSec: 2 }),
+        ),
+      ) as Plan;
+      const a = clipArgs(plan, 0, "/in");
+      expect([endSec, a[a.indexOf("-filter_complex") + 1]!.includes(on)]).toEqual([endSec, true]);
+    }
   });
 });
 
@@ -3933,6 +3980,92 @@ describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", 
       ],
     });
     expect(meta(b)).toEqual({ duration: "1.033333", avg_frame_rate: "30/1", nb_frames: "31" });
+  });
+
+  // ---- review r13, with the real ffmpeg
+  it("review r13: choosing only a leading empty edit (to 0.999 s, 1 s) and holding it shows none of the picture; to 1.01 s holds its first frame", async () => {
+    const dir = tmp();
+    const src = path.join(dir, "src-lead.mov");
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-itsoffset", "1", "-f", "lavfi", "-i"],
+      "nullsrc=s=64x64:r=1:d=3,format=rgb24,geq=r='if(lt(T\\,1)\\,255\\,0)':g=0:b='if(gte(T\\,1)\\,255\\,0)'",
+      ...["-c:v", "libx264", "-bf", "0", "-pix_fmt", "yuv420p", "-video_track_timescale", "16384", src],
+    ]);
+    // Nothing until 1 s, then its media from 0.4 s: the red frame (media 0) is already on screen at the edit's start.
+    const mov = path.join(dir, "lead.mov");
+    rewriteElst(src, mov, (e) => e.map((x) => (x.media === -1 ? x : { ...x, media: 6554, duration: 1100 })));
+    expect(mp4Timeline(mov)).toMatchObject({ ok: true, video: { edited: true, lead: 1 } });
+    const nar = path.join(dir, "silent-2.wav");
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo,atrim=duration=2"],
+      ...["-c:a", "pcm_s16le", nar],
+    ]);
+    const t = await start({ composer: real });
+    for (const [endSec, want] of [
+      [0.999, Array(60).fill("black")],
+      [1, Array(60).fill("black")],
+      [1.01, [...Array(30).fill("black"), ...Array(30).fill("red")]],
+    ] as const) {
+      const s = await t.scopeOf();
+      const f = await t.putFile(s, mov, "mp4");
+      const n = await t.putFile(s, nar, "wav");
+      const out = await composeOne(t, s, {
+        clips: [{ fileId: f, trim: { startSec: 0, endSec } }],
+        narration: [{ fileId: n, startSec: 0 }],
+      });
+      expect([endSec, colours(out)]).toEqual([endSec, want]);
+    }
+  });
+
+  it("review r13: a 120 fps file of 121 frames (its last 1.000–1.008 s) keeps that frame — held, and as a trim's start", async () => {
+    const dir = tmp();
+    const nar = path.join(dir, "silent-2.wav");
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo,atrim=duration=2"],
+      ...["-c:a", "pcm_s16le", nar],
+    ]);
+    const t = await start({ composer: real });
+    for (const flags of [
+      ["-use_editlist", "0"],
+      ["-movflags", "empty_moov+frag_keyframe"],
+    ]) {
+      const file = path.join(dir, `tail120-${flags[0]}.mp4`);
+      execFileSync(FFMPEG, [
+        ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i"],
+        "nullsrc=s=64x64:r=120:d=1.00833,format=rgb24,geq=r='if(gte(N\\,120)\\,0\\,255)':g=0:b='if(gte(N\\,120)\\,255\\,0)'",
+        ...["-frames:v", "121", "-c:v", "libx264", "-bf", "2", "-pix_fmt", "yuv420p", ...flags, file],
+      ]);
+      const s = await t.scopeOf();
+      const f = await t.putFile(s, file, "mp4");
+      const n = await t.putFile(s, nar, "wav");
+      const out = await composeOne(t, s, { clips: [{ fileId: f }], narration: [{ fileId: n, startSec: 0 }] });
+      expect([flags, colours(out)]).toEqual([flags, [...Array(30).fill("red"), ...Array(30).fill("blue")]]);
+      const s2 = await t.scopeOf();
+      const f2 = await t.putFile(s2, file, "mp4");
+      const one = await composeOne(t, s2, {
+        clips: [{ fileId: f2, trim: { startSec: 1, endSec: 1 + 1 / 30 } }],
+      });
+      expect([flags, colours(one)]).toEqual([flags, ["blue"]]);
+    }
+  });
+
+  it("review r13: a clip of 1.020 s by its length cuts the source's sound there, as a trim to 1.020 s does", async () => {
+    const dir = tmp();
+    const mov = path.join(dir, "late-sound.mov");
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=30:d=2"],
+      ...["-f", "lavfi", "-i", "aevalsrc=if(gte(t\\,1.02)\\,sin(2*PI*550*t)*0.5\\,0):s=48000:d=2"],
+      ...["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le", mov],
+    ]);
+    const t = await start({ composer: real });
+    for (const clip of [{ durationSec: 1.02 }, { trim: { startSec: 0, endSec: 1.02 } }]) {
+      const s = await t.scopeOf();
+      const f = await t.putFile(s, mov, "mp4");
+      const out = await composeOne(t, s, { clips: [{ fileId: f, ...clip }] });
+      const pcm = pcmOf(out);
+      expect([clip, loudness(pcm, 0.5, 1.0) < 50]).toEqual([clip, true]);
+      expect([clip, loudness(pcm, 1.022, 1.031) < 50]).toEqual([clip, true]);
+    }
   });
 
   it("readiness: a tiny composition checked in the same sandbox", async () => {

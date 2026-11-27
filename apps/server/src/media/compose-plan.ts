@@ -796,6 +796,12 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
     const trimTicks = secTicks(c.startSec);
     const leadTicks = toTicks(at.start) - trimTicks;
     const firstShown = leadTicks > 0 ? Math.ceil(leadTicks / TICKS_PER_FRAME) : 0;
+    // Review r12: the selected part ends on the input's timeline too (the trim's start plus what is chosen).
+    const pick = trimTicks + secTicks(c.pickSec ?? c.useSec);
+    const cut = Math.max(1, at.end ? Math.min(toTicks(at.end), pick) : pick);
+    // Review r13: a part that ends before the picture is first shown (only a leading empty edit chosen) shows none of
+    // it — not even held for the frames after.
+    const none = cut <= toTicks(at.start) && toTicks(at.start) > 0;
     // The canvas is the output's size (no frame of the source is kept for its size — review r5: a reference branch
     // buffered every frame before the start); the picture is fitted to it first, its alpha kept for the overlay.
     picture =
@@ -807,19 +813,14 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
       // Review r12: the selected part ends on the input's timeline too (the trim's start plus what is used) — the last
       // frame it allows is the one held for the rest of the clip (frames held for a narration): the source's end
       // frozen, then sampled at 30 fps, never the last 30 fps sample repeated.
-      `,trim=end_pts=${Math.max(
-        1,
-        at.end
-          ? Math.min(toTicks(at.end), trimTicks + secTicks(c.pickSec ?? c.useSec))
-          : trimTicks + secTicks(c.pickSec ?? c.useSec),
-      )}` +
+      `,trim=end_pts=${cut}` +
       `${tickShift(-trimTicks)},` +
       `${square},${fit(W, H)},setsar=1,format=yuva420p[src];` +
       `color=c=black:s=${W}x${H}:r=${FPS},format=yuv420p[canvas];` +
       // Before a leading empty edit ends nothing is shown (review r7: the frame showing at the edit's start comes in at
       // its lead, not before).
       `[canvas][src]overlay=eof_action=repeat:repeatlast=1${
-        firstShown > 0 ? `:enable='gte(n,${firstShown})'` : ""
+        none ? `:enable='0'` : firstShown > 0 ? `:enable='gte(n,${firstShown})'` : ""
       },format=yuv420p,${exact}`;
   }
   const outs: { label: string; from: number; to: number; args: string[] }[] = [];
@@ -1106,6 +1107,53 @@ export function muxArgs(o: { subtitles: boolean; out: string; maxBytes: number }
     "mp4",
     o.out,
   ];
+}
+
+/**
+ * Review r13: ffprobe of an MP4/MOV's first picture's packets on the timeline the ingest reads (`-ignore_editlist`),
+ * one compact line each (`packet|pts=…|duration=…`, then `stream|time_base=…`) — streamed, never kept whole.
+ */
+export function pictureEndArgs(file: string): string[] {
+  return [
+    "-v",
+    "error",
+    "-hide_banner",
+    "-protocol_whitelist",
+    "file,pipe",
+    "-ignore_editlist",
+    "1",
+    "-f",
+    "mov",
+    "-select_streams",
+    "v:0",
+    "-show_entries",
+    "packet=pts,duration:stream=time_base",
+    "-of",
+    "compact",
+    file,
+  ];
+}
+/**
+ * Review r13: folds those lines into where the picture's last frame ends — the latest pts + duration, exact in its
+ * time base (on the decoded timeline, before `presentTrack`'s shift) — not a 30 fps frame count (a 120 fps file's
+ * last frame, 1.000–1.008 s, is no 30 fps frame of its own).
+ */
+export function pictureEnd(): { line: (l: string) => void; end: () => Q | null } {
+  let best: number | null = null;
+  let tb: { n: number; d: number } | null = null;
+  return {
+    line: (l) => {
+      const p = /^packet\|pts=(-?\d+)\|duration=(\d+|N\/A)$/.exec(l.trim());
+      if (p) {
+        const e = Number(p[1]) + (p[2] === "N/A" ? 0 : Number(p[2]));
+        if (Number.isSafeInteger(e) && (best === null || e > best)) best = e;
+        return;
+      }
+      const t = /^stream\|time_base=(\d+)\/(\d+)$/.exec(l.trim());
+      if (t && Number(t[2]) > 0) tb = { n: Number(t[1]), d: Number(t[2]) };
+    },
+    end: () => (best !== null && tb && Number.isSafeInteger(best * tb.n) ? q(best * tb.n, tb.d) : null),
+  };
 }
 
 /** ffprobe of one input copy: its container, streams, sizes and length (JSON). */
