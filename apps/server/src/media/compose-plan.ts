@@ -186,6 +186,11 @@ export type PlanClip = {
   /** Video: where in the source it starts, and how many seconds of it are used (the rest holds its last frame). */
   startSec: number;
   useSec: number;
+  /**
+   * Review r12: the part of the source chosen (the trim, or its stated length when shorter), unrounded — the picture
+   * is cut there on the input's timeline and its last frame then held (`useSec` is that rounded to whole frames).
+   */
+  pickSec?: number;
   fit: "letterbox" | "crop";
   kenBurns: "in" | "out" | "left" | "right" | null;
   volume: number;
@@ -425,6 +430,7 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
       frames: n,
       startSec: start,
       useSec: Math.min(source, n / FPS),
+      pickSec: Math.min(source, dur),
       fit: c.fit ?? "letterbox",
       kenBurns: null,
       volume: c.volume ?? 1,
@@ -472,6 +478,8 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
     if (!info.hasAudio || info.kind === "image")
       return err("compose_input_kind", `narration[${i}].fileId: audio (mp3/m4a/wav) or a video with sound`);
     const startSample = Math.round(n.startSec * RATE);
+    // Review r12: its end in whole samples — where it is placed plus its decoded length — then whole frames.
+    const soundSamples = Math.round((info.audioSec ?? info.durationSec ?? 0) * RATE);
     narration.push({
       input: info.name,
       fileKind: info.fileKind,
@@ -479,8 +487,7 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
       maxSamples: COMPOSE_LIMITS.maxSeconds * RATE - startSample,
     });
     // Review r1: the sound's own end (a video's sound can be shorter than its picture).
-    const sound = info.audioSec ?? info.durationSec ?? 0;
-    needed = Math.max(needed, Math.ceil((n.startSec + sound) * FPS - 1e-6));
+    needed = Math.max(needed, Math.ceil((startSample + soundSamples) / SPF));
   }
   const max = COMPOSE_LIMITS.maxSeconds * FPS;
   if (needed > max || total > max)
@@ -692,7 +699,11 @@ const input = (o: { demuxer: string; file: string }) => [
   "-i",
   o.file,
 ];
-/** The one H.264 setting of every picture piece (the concat copies them: they must be alike — review R4). */
+/**
+ * The one H.264 setting of every picture piece (the concat copies them: they must be alike — review R4). Review r12:
+ * no B-frames — every piece then has the same decoding delay (none): a 1-frame piece (no B-frame possible) before a
+ * B-frame piece made their decoding times overlap, and the MP4 said 0.966667 s at 930/29 fps for 31 frames.
+ */
 export const H264 = [
   "-c:v",
   "libx264",
@@ -706,6 +717,8 @@ export const H264 = [
   "high",
   "-level:v",
   "4.1",
+  "-bf",
+  "0",
   "-g",
   "60",
   "-sc_threshold",
@@ -777,7 +790,6 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
     // and held to the clip's length. The graph's trim ends the run (nothing after it is decoded).
     // The canvas starts at the trim's start (review r5): its first slot shows the source frame on screen at that very
     // moment (a frame that began before it), and every later slot samples the source at start + k/30.
-    const own = Math.max(1, Math.round(c.useSec * FPS));
     const at = c.picture ?? presentTrack(null);
     // Review r10: the trim's start converted once; the first output frame the picture shows (a leading empty edit's
     // end after it) as a frame number of the canvas — no time compared in seconds.
@@ -792,7 +804,15 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
       // a trim after that end shows the last frame allowed, held, never one the edit leaves out) — then the trim.
       // Review r9: all of it in whole ticks of `PICTURE_TB`.
       `[0:v]settb=1/${PICTURE_TB}${tickShift(toTicks(at.shift))}` +
-      `${at.end ? `,trim=end_pts=${Math.max(1, toTicks(at.end))}` : ""}` +
+      // Review r12: the selected part ends on the input's timeline too (the trim's start plus what is used) — the last
+      // frame it allows is the one held for the rest of the clip (frames held for a narration): the source's end
+      // frozen, then sampled at 30 fps, never the last 30 fps sample repeated.
+      `,trim=end_pts=${Math.max(
+        1,
+        at.end
+          ? Math.min(toTicks(at.end), trimTicks + secTicks(c.pickSec ?? c.useSec))
+          : trimTicks + secTicks(c.pickSec ?? c.useSec),
+      )}` +
       `${tickShift(-trimTicks)},` +
       `${square},${fit(W, H)},setsar=1,format=yuva420p[src];` +
       `color=c=black:s=${W}x${H}:r=${FPS},format=yuv420p[canvas];` +
@@ -800,8 +820,7 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
       // its lead, not before).
       `[canvas][src]overlay=eof_action=repeat:repeatlast=1${
         firstShown > 0 ? `:enable='gte(n,${firstShown})'` : ""
-      },trim=end_frame=${own},setpts=N,` +
-      `format=yuv420p,tpad=stop_mode=clone:stop=-1,${exact}`;
+      },format=yuv420p,${exact}`;
   }
   const outs: { label: string; from: number; to: number; args: string[] }[] = [];
   if (c.head) outs.push({ label: "hv", from: 0, to: c.head, args: [...LOSSLESS, p.head] });

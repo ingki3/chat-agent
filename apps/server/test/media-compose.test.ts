@@ -27,6 +27,7 @@ import {
   checkInputs,
   checkTimeline,
   clipArgs,
+  H264,
   audioArgs,
   transitionArgs,
   timedCues,
@@ -1556,8 +1557,9 @@ describe("review r2: the plan (pure)", () => {
     expect(a).not.toContain("-noaccurate_seek");
     const g = a[a.indexOf("-filter_complex") + 1]!;
     // The canvas starts at the trim's start (review r5): the source shifted by it, then 30 frames.
-    expect(g).toContain("[0:v]settb=1/3000000,setpts=PTS-6000000,");
-    expect(g).toContain("overlay=eof_action=repeat:repeatlast=1,trim=end_frame=30,");
+    // Review r12: the selected part (2–3 s) cut on the input's timeline before the trim's shift.
+    expect(g).toContain("[0:v]settb=1/3000000,trim=end_pts=9000000,setpts=PTS-6000000,");
+    expect(g).toContain("overlay=eof_action=repeat:repeatlast=1,format=yuv420p,trim=end_frame=30,");
     // The picture only: its sound is a slice of the input's decoded PCM.
     expect(g).not.toContain("[0:a");
     expect(a).not.toContain("pcm_s16le");
@@ -1775,7 +1777,9 @@ describe("review r8: one presentation per track (pure)", () => {
         // Review r9/r10: whole ticks of 1/3 000 000 s, each converted once from its exact value.
         const sh = toTicks(p.shift);
         const map = sh !== 0 ? `,setpts=PTS${sh < 0 ? "-" : "+"}${Math.abs(sh)}` : "";
-        const cut = p.end ? `,trim=end_pts=${toTicks(p.end)}` : "";
+        // Review r12: cut where the edit ends or the selected part does, whichever is first.
+        const chosen = secTicks(startSec) + secTicks(plan.clips[0]!.pickSec!);
+        const cut = `,trim=end_pts=${p.end ? Math.min(toTicks(p.end), chosen) : chosen}`;
         const trim = startSec ? `,setpts=PTS-${secTicks(startSec)},` : "";
         // Its end does not move with the trim; the trim's shift comes after it.
         expect([c.name, startSec, head.startsWith(`[0:v]settb=1/3000000${map}`)]).toEqual([
@@ -1783,12 +1787,12 @@ describe("review r8: one presentation per track (pure)", () => {
           startSec,
           true,
         ]);
-        if (cut)
-          expect([c.name, startSec, head.indexOf(cut) < head.indexOf(trim || "scale")]).toEqual([
-            c.name,
-            startSec,
-            true,
-          ]);
+        expect([c.name, startSec, head.includes(cut)]).toEqual([c.name, startSec, true]);
+        expect([c.name, startSec, head.indexOf(cut) < head.indexOf(trim || "scale")]).toEqual([
+          c.name,
+          startSec,
+          true,
+        ]);
         expect([c.name, startSec, head.includes(trim)]).toEqual([c.name, startSec, true]);
         // The leading empty edit's end as the canvas's frame number (review r10).
         const leadIn = toTicks(p.start) - secTicks(startSec);
@@ -2037,6 +2041,40 @@ describe("review r11: samples counted at 48 kHz, pieces of their planned length,
       expect([k, at]).toEqual([k, Math.round((frames * 1e6) / 30)]);
     }
     expect(frames).toBe(plan.frames);
+  });
+});
+
+describe("review r12: the narration's end in whole samples; pieces without B-frames (pure)", () => {
+  it("a narration placed at the same sample ends at the same frame, however its start is written", () => {
+    const I = ins(info("a", { kind: "image" }), info("n", { kind: "audio", durationSec: 1, audioSec: 1 }));
+    for (const startSec of [0.06667, 2 / 30]) {
+      const p = planTimeline(
+        { clips: [{ fileId: "a", durationSec: 0.5 }], narration: [{ fileId: "n", startSec }] },
+        I,
+      ) as Plan;
+      // 3 200 + 48 000 = 51 200 samples = 32 frames exactly.
+      expect([startSec, p.frames]).toEqual([startSec, 32]);
+    }
+    // 16 000 samples at 299.66667 s (sample 14 384 000) end at exactly 300 s — not too long.
+    const J = ins(
+      info("a", { kind: "image" }),
+      info("n", { kind: "audio", durationSec: 1 / 3, audioSec: 16_000 / 48_000 }),
+    );
+    for (const startSec of [299.66667, 299 + 2 / 3]) {
+      const p = planTimeline(
+        {
+          clips: Array.from({ length: 10 }, () => ({ fileId: "a", durationSec: 29 })),
+          narration: [{ fileId: "n", startSec }],
+        },
+        J,
+      );
+      expect([startSec, isPlanError(p) ? p.code : (p as Plan).frames]).toEqual([startSec, 9000]);
+    }
+  });
+
+  it("every H.264 piece is encoded without B-frames (one decoding delay for all)", () => {
+    const i = H264.indexOf("-bf");
+    expect(H264[i + 1]).toBe("0");
   });
 });
 
@@ -3816,6 +3854,86 @@ describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", 
     const off = pts.map((p, k) => p * tn * 30 - k * td).filter((x) => x !== 0);
     expect(off).toEqual([]);
   }, 600_000);
+
+  // ---- review r12, with the real ffmpeg
+  it("review r12: a clip held for a narration holds the source's last frame (60 and 120 fps exact 1 s, 30 fps trimmed to 1.010 s)", async () => {
+    const dir = tmp();
+    const nar = path.join(dir, "silent-2.wav");
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo,atrim=duration=2"],
+      ...["-c:a", "pcm_s16le", nar],
+    ]);
+    const t = await start({ composer: real });
+    for (const [rate, d, trim, want] of [
+      // The last frame blue: red ×(rate − 1), blue ×1 in exactly 1 s.
+      [60, 1, null, [30, 30]],
+      [120, 1, null, [30, 30]],
+      // Blue from 1.000 s; the part up to 1.010 s includes its first blue frame.
+      [30, 2, { startSec: 0, endSec: 1.01 }, [30, 30]],
+      [30, 1, null, [29, 31]],
+    ] as const) {
+      const file = path.join(dir, `last-${rate}-${d}.mp4`);
+      const blueFrom = d === 1 ? `gte(N\\,${rate - 1})` : `gte(T\\,1)`;
+      execFileSync(FFMPEG, [
+        ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i"],
+        `nullsrc=s=64x64:r=${rate}:d=${d},format=rgb24,geq=r='if(${blueFrom}\\,0\\,255)':g=0:b='if(${blueFrom}\\,255\\,0)'`,
+        ...["-c:v", "libx264", "-pix_fmt", "yuv420p", file],
+      ]);
+      const s = await t.scopeOf();
+      const f = await t.putFile(s, file, "mp4");
+      const n = await t.putFile(s, nar, "wav");
+      const out = colours(
+        await composeOne(t, s, {
+          clips: [{ fileId: f, ...(trim ? { trim } : {}) }],
+          narration: [{ fileId: n, startSec: 0 }],
+        }),
+      );
+      expect([rate, d, out]).toEqual([
+        rate,
+        d,
+        [...Array(want[0]).fill("red"), ...Array(want[1]).fill("blue")],
+      ]);
+    }
+  });
+
+  it("review r12: a 1-frame cut then a 30-frame one, and photos whose first body is 1 frame — the MP4 says 30 fps and its true length", async () => {
+    const t = await start({ composer: real });
+    const m = inputs();
+    const meta = (file: string) =>
+      JSON.parse(
+        execFileSync(FFPROBE, [
+          ...[
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=duration,avg_frame_rate,nb_frames",
+          ],
+          ...["-of", "json", file],
+        ]).toString(),
+      ).streams[0] as { duration: string; avg_frame_rate: string; nb_frames: string };
+    const s1 = await t.scopeOf();
+    const v = await t.putFile(s1, m.video, "mp4");
+    const a = await composeOne(t, s1, {
+      clips: [
+        { fileId: v, trim: { startSec: 0, endSec: 1 / 30 } },
+        { fileId: v, trim: { startSec: 0, endSec: 1 } },
+      ],
+    });
+    expect(meta(a)).toEqual({ duration: "1.033333", avg_frame_rate: "30/1", nb_frames: "31" });
+    const s2 = await t.scopeOf();
+    const img = await t.putFile(s2, m.png, "png");
+    const blue = await t.putFile(s2, m.alphaBlue, "png");
+    // 16 frames, 15 of them fading into the next: a 1-frame first body.
+    const b = await composeOne(t, s2, {
+      clips: [
+        { fileId: img, durationSec: 16 / 30, transition: { type: "fade", durationSec: 0.5 } },
+        { fileId: blue, durationSec: 1 },
+      ],
+    });
+    expect(meta(b)).toEqual({ duration: "1.033333", avg_frame_rate: "30/1", nb_frames: "31" });
+  });
 
   it("readiness: a tiny composition checked in the same sandbox", async () => {
     const dataDir = path.join(tmp(), "data");
