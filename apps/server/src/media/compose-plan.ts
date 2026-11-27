@@ -73,13 +73,13 @@ export type InputInfo = {
   /** Where its sound ends, from the file's start (estimated, then decoded); null without sound. */
   audioSec?: number | null;
   /**
-   * Review r5 (restored in r8): an MP4/MOV's presentation 0 on its `-copyts` timeline (seconds) — the earliest first
+   * Review r5 (restored in r8): an MP4/MOV's presentation 0 on its `-copyts` timeline (exact — review r10) — the earliest first
    * sample of its picture and sound tracks, a track with an edit list counting from the movie's 0 — so a codec's
    * reorder delay without an edit list (a B-frame MP4 whose only track's first picture is at 0.0667 s) is not taken for
    * a gap, and sound that starts before the first picture is kept. 0 when there is nothing to take away; never negative
    * (a preroll before 0 is cut).
    */
-  originSec?: number;
+  origin?: Q;
   /**
    * Review r8: an MP4/MOV's first picture and sound tracks as the file describes them (`mp4Timeline`; without an edit
    * list, its samples' own end where ffprobe says one). Every graph reads them through `presentTrack` only.
@@ -93,17 +93,71 @@ export type InputInfo = {
 };
 
 /**
- * Review r8: one MP4/MOV track as its file describes it. With an edit list (re-plan 2: at most a leading empty edit,
- * then one media edit at rate 1): nothing until `lead` (movie seconds), then its media from `mediaTime` (its own
- * seconds) to `end` on the movie's timeline (null: a fragmented file's, not known up front). Without one: its samples
- * at their own times, to `end` when known (ffprobe's start + duration of a sound track — review r4) — else to its last
- * sample's end.
+ * Review r10: an exact time — a fraction of whole numbers (seconds = n / d, d > 0), made only from integer sources: an
+ * edit list's and its headers' fields (`elst`, `mdhd`, `mvhd`), ffprobe's `start_pts`/`duration_ts` with its
+ * `time_base`. It is turned into a graph's unit (ticks of `PICTURE_TB`, samples, frames) once, where it is used.
  */
-export type TrackEdit = { edited: boolean; lead: number; mediaTime: number; end: number | null };
+export type Q = { n: number; d: number };
+const big = (x: number) => BigInt(Math.round(x));
+const gcd = (a: bigint, b: bigint): bigint => {
+  let x = a < 0n ? -a : a;
+  let y = b < 0n ? -b : b;
+  while (y) [x, y] = [y, x % y];
+  return x || 1n;
+};
+const fromBig = (n: bigint, d: bigint): Q => {
+  if (d < 0n) [n, d] = [-n, -d];
+  const g = gcd(n, d);
+  return { n: Number(n / g), d: Number(d / g) };
+};
+/** n / d seconds (d > 0). */
+export const q = (n: number, d = 1): Q => fromBig(big(n), big(d));
+export const Q0: Q = { n: 0, d: 1 };
+export const qAdd = (a: Q, b: Q): Q =>
+  fromBig(big(a.n) * big(b.d) + big(b.n) * big(a.d), big(a.d) * big(b.d));
+export const qSub = (a: Q, b: Q): Q => qAdd(a, { n: -b.n, d: b.d });
+export const qCmp = (a: Q, b: Q): number => {
+  const x = big(a.n) * big(b.d) - big(b.n) * big(a.d);
+  return x < 0n ? -1 : x > 0n ? 1 : 0;
+};
+export const qMin = (a: Q, b: Q): Q => (qCmp(a, b) <= 0 ? a : b);
+export const qMax = (a: Q, b: Q): Q => (qCmp(a, b) >= 0 ? a : b);
+/** Seconds as a number — for lengths and checks only, never a graph's time. */
+export const qSec = (a: Q): number => a.n / a.d;
+/** `a` in whole units of 1/`per` s, rounded once (half up). */
+const units = (a: Q, per: number): number => {
+  const num = big(a.n) * big(per) * 2n + big(a.d);
+  const den = big(a.d) * 2n;
+  const f = num / den;
+  return Number(num % den !== 0n && num < 0n ? f - 1n : f);
+};
 
 /**
- * Review r8: how one track is presented on its input's timeline (seconds from `InputInfo.originSec`) — the only source
- * of every ingest and clip graph's mapping, for picture and sound alike:
+ * Review r9: the pictures' timebase — 1/3 000 000 s holds every 30 fps slot (k/30 = 100 000·k) and the frames of the
+ * usual track timescales (1/15360 at 30 fps, 1/90000, 1/600, 1/1000, 1/30000…) as whole ticks. Review r10: the sound's
+ * shifts and cuts use it too. Each time is a whole number of these ticks, converted once from its exact value.
+ */
+export const PICTURE_TB = 3_000_000;
+const TICKS_PER_FRAME = PICTURE_TB / FPS;
+/** An exact time in ticks of `PICTURE_TB`. */
+export const toTicks = (a: Q): number => units(a, PICTURE_TB);
+/** A time the model gave in seconds (a trim's start), in ticks — its one conversion. */
+export const secTicks = (sec: number): number => Math.round(sec * PICTURE_TB);
+/** An exact time in 48 kHz samples. */
+export const toSamples = (a: Q): number => units(a, RATE);
+
+/**
+ * Review r8: one MP4/MOV track as its file describes it (review r10: exact). With an edit list (re-plan 2: at most a
+ * leading empty edit, then one media edit at rate 1): nothing until `lead` (movie time), then its media from
+ * `mediaTime` (its own time) to `end` on the movie's timeline (null: a fragmented file's, not known up front). Without
+ * one (`lead`, `mediaTime` 0): its samples at their own times, to `end` when known (a sound track's `start_pts +
+ * duration_ts` — review r4) — else to its last sample's end.
+ */
+export type TrackEdit = { edited: boolean; lead: Q; mediaTime: Q; end: Q | null };
+
+/**
+ * Review r8: how one track is presented on its input's timeline (from `InputInfo.origin`) — the only source of every
+ * ingest and clip graph's mapping, for picture and sound alike (review r10: exact; each graph converts it once):
  *
  * - `shift`: added to a sample's time as decoded (`-copyts -ignore_editlist`) to give its time on that timeline;
  * - `start`: nothing of the track before it — silence, black (a leading empty edit's end) — cut whatever the shift (a
@@ -111,16 +165,16 @@ export type TrackEdit = { edited: boolean; lead: number; mediaTime: number; end:
  *   at it);
  * - `end`: nothing after it, cut on that timeline before any trim of the clip (null: its last sample's end).
  */
-export type TrackPresentation = { shift: number; start: number; end: number | null };
+export type TrackPresentation = { shift: Q; start: Q; end: Q | null };
 
-export function presentTrack(track: TrackEdit | null | undefined, originSec = 0): TrackPresentation {
-  const o = originSec;
-  if (!track) return { shift: 0 - o, start: 0, end: null };
-  if (!track.edited) return { shift: 0 - o, start: 0, end: track.end != null ? track.end - o : null };
+export function presentTrack(track: TrackEdit | null | undefined, origin: Q = Q0): TrackPresentation {
+  const back = qSub(Q0, origin);
+  if (!track) return { shift: back, start: Q0, end: null };
+  if (!track.edited) return { shift: back, start: Q0, end: track.end ? qSub(track.end, origin) : null };
   return {
-    shift: track.lead - track.mediaTime - o,
-    start: Math.max(0, track.lead - o),
-    end: track.end != null ? track.end - o : null,
+    shift: qSub(qSub(track.lead, track.mediaTime), origin),
+    start: qMax(Q0, qSub(track.lead, origin)),
+    end: track.end ? qSub(track.end, origin) : null,
   };
 }
 
@@ -375,7 +429,7 @@ export function planTimeline(t: ComposeTimeline, inputs: ReadonlyMap<string, Inp
       kenBurns: null,
       volume: c.volume ?? 1,
       hasAudio: info.hasAudio,
-      picture: presentTrack(info.videoTrack, info.originSec ?? 0),
+      picture: presentTrack(info.videoTrack, info.origin ?? Q0),
       head: 0,
       tail: 0,
       transition: null,
@@ -604,20 +658,8 @@ export function toVtt(subs: readonly Cue[], totalSec?: number): string {
 // ---------------------------------------------------------------- ffmpeg argument lists
 
 const num = (n: number) => String(Math.round(n * 1e6) / 1e6);
-/** "+0.4" / "-2": an offset added to a timestamp expression. */
-const signed = (n: number) => (n < 0 ? `-${num(-n)}` : `+${num(n)}`);
-/**
- * Review r9: the pictures' timebase — 1/3 000 000 s holds every 30 fps slot (k/30 = 100 000·k) and the frames of the
- * usual track timescales (1/15360 at 30 fps, 1/90000, 1/600, 1/1000, 1/30000…) as whole ticks. Each shift and cut is a
- * whole number of these ticks (one rounding each): rounded to microseconds instead, a frame at k/30 moved by 1/30
- * could land 1 µs after its slot, and the canvas would show the frame before it.
- */
-const PICTURE_TB = 3_000_000;
-const ticks = (sec: number) => Math.round(sec * PICTURE_TB);
-const tickShift = (sec: number) => {
-  const n = ticks(sec);
-  return n === 0 ? "" : `,setpts=PTS${n < 0 ? "-" : "+"}${Math.abs(n)}`;
-};
+/** A shift of whole ticks (`setpts`/`asetpts` in `PICTURE_TB`), nothing when 0. */
+const tickShift = (n: number, f = "setpts") => (n === 0 ? "" : `,${f}=PTS${n < 0 ? "-" : "+"}${Math.abs(n)}`);
 /** Every run: no stdin, quiet, local files and the progress pipe only, the filter threads bounded. */
 export const FF_COMMON = [
   "-nostdin",
@@ -736,7 +778,11 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
     // moment (a frame that began before it), and every later slot samples the source at start + k/30.
     const own = Math.max(1, Math.round(c.useSec * FPS));
     const at = c.picture ?? presentTrack(null);
-    const leadIn = at.start - c.startSec;
+    // Review r10: the trim's start converted once; the first output frame the picture shows (a leading empty edit's
+    // end after it) as a frame number of the canvas — no time compared in seconds.
+    const trimTicks = secTicks(c.startSec);
+    const leadTicks = toTicks(at.start) - trimTicks;
+    const firstShown = leadTicks > 0 ? Math.ceil(leadTicks / TICKS_PER_FRAME) : 0;
     // The canvas is the output's size (no frame of the source is kept for its size — review r5: a reference branch
     // buffered every frame before the start); the picture is fitted to it first, its alpha kept for the overlay.
     picture =
@@ -744,15 +790,15 @@ export function clipArgs(plan: Plan, i: number, inDir: string): string[] {
       // (`presentTrack`): mapped to its input's timeline and cut at its end there — before the clip's trim (review r8:
       // a trim after that end shows the last frame allowed, held, never one the edit leaves out) — then the trim.
       // Review r9: all of it in whole ticks of `PICTURE_TB`.
-      `[0:v]settb=1/${PICTURE_TB}${tickShift(at.shift)}` +
-      `${at.end != null ? `,trim=end_pts=${Math.max(1, ticks(at.end))}` : ""}` +
-      `${tickShift(-c.startSec)},` +
+      `[0:v]settb=1/${PICTURE_TB}${tickShift(toTicks(at.shift))}` +
+      `${at.end ? `,trim=end_pts=${Math.max(1, toTicks(at.end))}` : ""}` +
+      `${tickShift(-trimTicks)},` +
       `${square},${fit(W, H)},setsar=1,format=yuva420p[src];` +
       `color=c=black:s=${W}x${H}:r=${FPS},format=yuv420p[canvas];` +
       // Before a leading empty edit ends nothing is shown (review r7: the frame showing at the edit's start comes in at
       // its lead, not before).
       `[canvas][src]overlay=eof_action=repeat:repeatlast=1${
-        leadIn > 0 ? `:enable='gte(t,${num(leadIn)})'` : ""
+        firstShown > 0 ? `:enable='gte(n,${firstShown})'` : ""
       },trim=end_frame=${own},setpts=N,` +
       `format=yuv420p,tpad=stop_mode=clone:stop=-1,${exact}`;
   }
@@ -833,11 +879,19 @@ export function ingestArgs(o: {
   // The sound mapped to its timeline; before its start nothing (review r8: cut whatever the shift — a lead equal to its
   // edit's media time shifts by 0, yet the media before it is still left out), then silence from 0 to the first sample
   // kept (`first_pts=0`), and nothing past its end (an AAC's padding, an edit's end).
+  // Review r10: its shift in whole ticks of `PICTURE_TB`; its start and end in 48 kHz samples (`atrim`'s `start_pts` is
+  // in samples — the sound is resampled first, its timestamps kept, and the gaps filled by the second `aresample`).
+  const aShift = toTicks(sa.shift);
+  const aStart = toSamples(sa.start);
   const shiftA =
-    (sa.shift !== 0 ? `asettb=AVTB,asetpts=PTS${signed(sa.shift)}/TB,` : "") +
-    (sa.start > 0 ? `atrim=start=${num(sa.start)},` : "");
-  const endA = sa.end != null ? `,atrim=end=${num(Math.max(1e-6, sa.end))}` : "";
-  const shiftV = ticks(pa.shift) !== 0 ? `settb=1/${PICTURE_TB}${tickShift(pa.shift)},` : "";
+    aShift !== 0 || aStart > 0
+      ? `asettb=1/${PICTURE_TB}${tickShift(aShift, "asetpts")}${
+          aStart > 0 ? `,aresample=${RATE},atrim=start_pts=${aStart}` : ""
+        },`
+      : "";
+  const endA = sa.end ? `,atrim=end_sample=${Math.max(1, toSamples(sa.end))}` : "";
+  const vShift = toTicks(pa.shift);
+  const shiftV = vShift !== 0 ? `settb=1/${PICTURE_TB}${tickShift(vShift)},` : "";
   // Review r8: a gap in the sound's timestamps is silence from 1 ms on (`min_hard_comp`; ffmpeg's own 0.1 s would
   // close a shorter one — an MP4 whose first AAC sample is stretched to fill 0.0667 s then plays 45 ms early).
   const cap = num(Math.max(1, o.capSec));
@@ -917,9 +971,12 @@ export function audioArgs(plan: Plan, o: { narration: boolean; music: string | n
       o.music,
     );
     const fades = [
-      ...(m.fadeInSec > 0 ? [`afade=t=in:st=0:d=${num(m.fadeInSec)}`] : []),
+      // Review r10: in samples (the model's seconds converted once).
+      ...(m.fadeInSec > 0 ? [`afade=t=in:ss=0:ns=${Math.round(m.fadeInSec * RATE)}`] : []),
       ...(m.fadeOutSec > 0
-        ? [`afade=t=out:st=${num(Math.max(0, T / RATE - m.fadeOutSec))}:d=${num(m.fadeOutSec)}`]
+        ? [
+            `afade=t=out:ss=${Math.max(0, T - Math.round(m.fadeOutSec * RATE))}:ns=${Math.round(m.fadeOutSec * RATE)}`,
+          ]
         : []),
     ];
     graph.push(
@@ -1021,7 +1078,7 @@ export function probeArgs(file: string, fileKind: FileKind): string[] {
     "-f",
     DEMUXER[fileKind]!,
     "-show_entries",
-    "format=format_name,duration,start_time:stream=codec_type,codec_name,width,height,duration,start_time:stream_disposition=attached_pic",
+    "format=format_name,duration:stream=codec_type,codec_name,width,height,time_base,start_pts,duration_ts:stream_disposition=attached_pic",
     "-of",
     "json",
     file,

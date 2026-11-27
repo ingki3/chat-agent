@@ -29,6 +29,15 @@ import {
   workUnits,
   isPlanError,
   presentTrack,
+  q,
+  Q0,
+  qAdd,
+  qMax,
+  qMin,
+  qSec,
+  qSub,
+  type Q,
+  type TrackEdit,
   type InputInfo,
   type Plan,
 } from "./compose-plan.js";
@@ -107,7 +116,6 @@ const Probe = z.object({
     .object({
       format_name: z.string().max(200).optional(),
       duration: z.coerce.number().optional(),
-      start_time: z.coerce.number().optional(),
     })
     .optional(),
   streams: z
@@ -117,8 +125,13 @@ const Probe = z.object({
         codec_name: z.string().max(40).optional(),
         width: z.number().int().optional(),
         height: z.number().int().optional(),
-        duration: z.coerce.number().optional(),
-        start_time: z.coerce.number().optional(),
+        // Review r10: a stream's times as whole numbers of its time base (never ffprobe's decimal seconds).
+        time_base: z
+          .string()
+          .regex(/^\d{1,12}\/\d{1,12}$/)
+          .optional(),
+        start_pts: z.number().int().optional(),
+        duration_ts: z.number().int().optional(),
         disposition: z.object({ attached_pic: z.number().int() }).partial().optional(),
       }),
     )
@@ -133,6 +146,8 @@ const Probe = z.object({
  */
 export type TrackTimeline = {
   edited: boolean;
+  /** Review r10: the same, exact (from the boxes' integer fields) — what every graph uses (`presentTrack`). */
+  exact: TrackEdit;
   lead: number;
   /** Review r7: where in the track's media its one media edit starts (seconds, the track's own `mdhd` timescale). */
   mediaTime: number;
@@ -256,7 +271,13 @@ export function mp4Timeline(file: string): Mp4Timeline {
       const kind = handler === "vide" ? "video" : handler === "soun" ? "audio" : null;
       if (!kind || found[kind]) continue;
       if (!elst) {
-        found[kind] = { edited: false, lead: 0, mediaTime: 0, end: null };
+        found[kind] = {
+          edited: false,
+          lead: 0,
+          mediaTime: 0,
+          end: null,
+          exact: { edited: false, lead: Q0, mediaTime: Q0, end: null },
+        };
         continue;
       }
       if (!mediaScale) return bad;
@@ -283,11 +304,14 @@ export function mp4Timeline(file: string): Mp4Timeline {
       const leadSec = (lead?.duration ?? 0) / scale;
       // A media edit of length 0: in a fragmented file "to its end" (the decoded end decides); else nothing to show.
       if (media[0]!.duration === 0 && !fragmented) return { ok: false, reason: "unsupported" };
+      const leadQ = q(lead?.duration ?? 0, scale);
+      const endQ = media[0]!.duration === 0 ? null : q((lead?.duration ?? 0) + media[0]!.duration, scale);
       found[kind] = {
         edited: true,
         lead: leadSec,
         mediaTime: media[0]!.media / mediaScale,
-        end: media[0]!.duration === 0 ? null : leadSec + media[0]!.duration / scale,
+        end: endQ ? qSec(endQ) : null,
+        exact: { edited: true, lead: leadQ, mediaTime: q(media[0]!.media, mediaScale), end: endQ },
       };
     }
     return { ok: true, ...found };
@@ -344,17 +368,29 @@ export function judgeInput(
   const side = (n: number | undefined) => n !== undefined && n > 0 && n <= COMPOSE_LIMITS.maxInputSide;
   const duration =
     Number.isFinite(r.format?.duration) && r.format!.duration! > 0 ? r.format!.duration! : null;
+  // Review r10: a stream's start and length exact — `start_pts`, `duration_ts` in its `time_base`.
+  const tb = (x: typeof v) => {
+    const m = x?.time_base ? /^(\d+)\/(\d+)$/.exec(x.time_base) : null;
+    return m && Number(m[2]) > 0 ? { n: Number(m[1]), d: Number(m[2]) } : null;
+  };
+  const exactAt = (x: typeof v, ts: number | undefined) => {
+    const t = tb(x);
+    return t && ts !== undefined && Number.isSafeInteger(ts * t.n) ? q(ts * t.n, t.d) : null;
+  };
+  const startOf = (x: typeof v) => exactAt(x, x?.start_pts);
+  const lengthOf = (x: typeof v) => (x?.duration_ts && x.duration_ts > 0 ? exactAt(x, x.duration_ts) : null);
   // Review r1: the first sound's end from the file's start — its own start and length (a video's sound may be shorter
-  // than its picture, or start later); the file's length when the stream does not say.
+  // than its picture, or start later); the file's length when the stream does not say (an estimate only: the job
+  // decodes the real one).
   const a = audio[0];
-  const origin = Number.isFinite(r.format?.start_time) ? r.format!.start_time! : 0;
+  const starts = streams.map(startOf).filter((x): x is Q => !!x);
+  const fileStart = starts.length ? starts.reduce(qMin) : Q0;
+  const aLength = lengthOf(a);
   const audioSec = !a
     ? null
-    : Number.isFinite(a.duration) && a.duration! > 0
-      ? Math.max(0, (Number.isFinite(a.start_time) ? a.start_time! : origin) - origin) + a.duration!
+    : aLength
+      ? Math.max(0, qSec(qSub(startOf(a) ?? fileStart, fileStart))) + qSec(aLength)
       : duration;
-  // Review r4: an MP4/MOV's sound track ends where its presentation timeline says (its edit list — exact): an AAC's
-  // last frame decodes past it (padding). Read on the same timeline the ingest uses (`-copyts`).
   const mov = DEMUXER[fileKind] === "mov";
   const tv = timeline.video;
   const ta = timeline.audio;
@@ -362,22 +398,22 @@ export function judgeInput(
   // timeline, its media from its edit's media time; the file is read with `-ignore_editlist` and mapped by
   // `presentTrack`), or, without one, its samples at their own times — a sound track to its own end (review r4: an
   // AAC's last frame decodes past it).
-  const streamEnd = (x: typeof v) =>
-    x && Number.isFinite(x.duration) && x.duration! > 0
-      ? (Number.isFinite(x.start_time) ? x.start_time! : 0) + x.duration!
-      : null;
-  const videoTrack =
-    mov && v ? (tv?.edited ? tv : { edited: false, lead: 0, mediaTime: 0, end: null }) : null;
-  const audioTrack =
-    mov && a ? (ta?.edited ? ta : { edited: false, lead: 0, mediaTime: 0, end: streamEnd(a) }) : null;
-  // An MP4/MOV's presentation 0 on its `-copyts` timeline (review r5, restored in r8): the earliest first sample of its
-  // tracks — a track with an edit list starts at the movie's 0 (its leading empty edit stays, as nothing), one without
-  // at its first sample (a B-frame picture's reorder delay without an edit list is no gap; sound before that first
-  // picture is kept).
-  const first = (x: typeof v, edited: boolean | undefined) =>
-    edited ? 0 : x && Number.isFinite(x.start_time) ? x.start_time! : 0;
+  const streamEnd = (x: typeof v) => {
+    const s0 = startOf(x);
+    const l = lengthOf(x);
+    return s0 && l ? qAdd(s0, l) : null;
+  };
+  const none = { edited: false, lead: Q0, mediaTime: Q0, end: null };
+  const videoTrack: TrackEdit | null = mov && v ? (tv?.edited ? tv.exact : none) : null;
+  const audioTrack: TrackEdit | null =
+    mov && a ? (ta?.edited ? ta.exact : { ...none, end: streamEnd(a) }) : null;
+  // An MP4/MOV's presentation 0 on its `-copyts` timeline (review r5, restored in r8; exact — review r10): the earliest
+  // first sample of its tracks — a track with an edit list starts at the movie's 0 (its leading empty edit stays, as
+  // nothing), one without at its first sample (a B-frame picture's reorder delay without an edit list is no gap; sound
+  // before that first picture is kept).
+  const first = (x: typeof v, edited: boolean | undefined) => (edited ? Q0 : (startOf(x) ?? Q0));
   const firsts = [...(v ? [first(v, tv?.edited)] : []), ...(a ? [first(a, ta?.edited)] : [])];
-  const originSec = mov && firsts.length ? Math.max(0, Math.min(...firsts)) : 0;
+  const origin = mov && firsts.length ? qMax(Q0, firsts.reduce(qMin)) : Q0;
 
   if (kind === "image") {
     if (!v || !side(v.width) || !side(v.height)) return { ok: false, reason: "unreadable" };
@@ -410,7 +446,7 @@ export function judgeInput(
         audioSec,
         videoTrack,
         audioTrack,
-        originSec,
+        origin,
         width: v?.width ?? null,
         height: v?.height ?? null,
       },
@@ -425,7 +461,7 @@ export function judgeInput(
       durationSec: duration,
       audioSec,
       audioTrack,
-      originSec,
+      origin,
       hasVideo: false,
       hasAudio: true,
       width: null,
@@ -721,8 +757,8 @@ export function sandboxedComposer(o: {
           sound: info.hasAudio,
           countPicture: u.count && info.hasVideo,
           capSec: u.cap,
-          soundAt: presentTrack(info.audioTrack, info.originSec ?? 0),
-          pictureAt: presentTrack(info.videoTrack, info.originSec ?? 0),
+          soundAt: presentTrack(info.audioTrack, info.origin ?? Q0),
+          pictureAt: presentTrack(info.videoTrack, info.origin ?? Q0),
         }),
         0,
         0,
@@ -740,11 +776,11 @@ export function sandboxedComposer(o: {
         audioSec = size / 4 / RATE;
       }
       // Re-plan 2: a picture with an edit list lasts to its media edit's end — not to its last frame's own duration.
-      const pictureEnd = presentTrack(info.videoTrack, info.originSec ?? 0).end;
+      const pictureEnd = presentTrack(info.videoTrack, info.origin ?? Q0).end;
       const pictureSec = !(u.count && info.hasVideo)
         ? null
-        : pictureEnd != null
-          ? Math.max(0, pictureEnd)
+        : pictureEnd
+          ? Math.max(0, qSec(pictureEnd))
           : (pictureFrames ?? 0) / FPS;
       if (u.count && info.hasVideo && !pictureFrames) return { ok: false, code: "compose_failed" };
       truth.set(fileId, {
