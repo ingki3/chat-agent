@@ -2102,6 +2102,25 @@ describe("review r13: the picture's real end, an empty chosen part (pure)", () =
     expect(pictureEnd().end()).toBeNull();
   });
 
+  it("review r14: the lines are read field by field — a trailing delimiter, side data, other keys", () => {
+    const f = pictureEnd();
+    for (const l of [
+      "packet|pts=256|duration=128|",
+      "packet|duration=128|pts=15616",
+      "packet|pts=|duration=128",
+      "side_data|side_data_type=Display Matrix|rotation=-90",
+      "stream|time_base=1/15360|",
+      "stream|side_data_type=Display Matrix|",
+      "",
+    ])
+      f.line(l);
+    expect(f.end()).toEqual(q(15744, 15360));
+    // No time base: no end (the job then fails, never guesses).
+    const g = pictureEnd();
+    g.line("packet|pts=10|duration=1");
+    expect(g.end()).toBeNull();
+  });
+
   it("a chosen part that ends by the picture's first showing keeps the overlay off; one after it switches it on", () => {
     const track = { edited: true, lead: q(1), mediaTime: q(2, 5), end: q(21, 10) };
     for (const [endSec, on] of [
@@ -4066,6 +4085,106 @@ describe.skipIf(!HAVE_FFMPEG)("the real composition (local ffmpeg, sandboxed)", 
       expect([clip, loudness(pcm, 0.5, 1.0) < 50]).toEqual([clip, true]);
       expect([clip, loudness(pcm, 1.022, 1.031) < 50]).toEqual([clip, true]);
     }
+  });
+
+  // ---- review r14, with the real ffmpeg
+  it("review r14: a rotated 120 fps file of 121 frames (no edit list, fragmented) keeps its last frame — held, and as a trim's start", async () => {
+    const dir = tmp();
+    const nar = path.join(dir, "silent-2.wav");
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo,atrim=duration=2"],
+      ...["-c:a", "pcm_s16le", nar],
+    ]);
+    const plain = path.join(dir, "tail120.mp4");
+    execFileSync(FFMPEG, [
+      ...["-hide_banner", "-v", "error", "-f", "lavfi", "-i"],
+      "nullsrc=s=64x64:r=120:d=1.00833,format=rgb24,geq=r='if(gte(N\\,120)\\,0\\,255)':g=0:b='if(gte(N\\,120)\\,255\\,0)'",
+      ...[
+        "-frames:v",
+        "121",
+        "-c:v",
+        "libx264",
+        "-bf",
+        "2",
+        "-pix_fmt",
+        "yuv420p",
+        "-use_editlist",
+        "0",
+        plain,
+      ],
+    ]);
+    const t = await start({ composer: real });
+    for (const flags of [
+      ["-use_editlist", "0"],
+      ["-movflags", "empty_moov+frag_keyframe"],
+    ]) {
+      // Rotation side data: ffprobe's compact line for the stream then ends with a delimiter.
+      const file = path.join(dir, `rot-${flags[0]}.mp4`);
+      execFileSync(FFMPEG, [
+        ...[
+          "-hide_banner",
+          "-v",
+          "error",
+          "-display_rotation",
+          "90",
+          "-i",
+          plain,
+          "-c",
+          "copy",
+          ...flags,
+          file,
+        ],
+      ]);
+      const s = await t.scopeOf();
+      const f = await t.putFile(s, file, "mp4");
+      const n = await t.putFile(s, nar, "wav");
+      const out = await composeOne(t, s, { clips: [{ fileId: f }], narration: [{ fileId: n, startSec: 0 }] });
+      expect([flags, colours(out)]).toEqual([flags, [...Array(30).fill("red"), ...Array(30).fill("blue")]]);
+      const s2 = await t.scopeOf();
+      const f2 = await t.putFile(s2, file, "mp4");
+      const one = await composeOne(t, s2, {
+        clips: [{ fileId: f2, trim: { startSec: 1, endSec: 1 + 1 / 30 } }],
+      });
+      expect([flags, colours(one)]).toEqual([flags, ["blue"]]);
+    }
+  });
+
+  it("review r14: when the picture's packet scan fails or says nothing usable, the job fails (compose_failed) — never a guessed length; the slot is free", async () => {
+    let mode: "fail" | "empty" | "real" = "fail";
+    const t = await start({
+      composer: (d) =>
+        sandboxedComposer({
+          dataDir: d,
+          ffmpegPath: FFMPEG,
+          run: (o) =>
+            mode !== "real" && o.args.includes("packet=pts,duration:stream=time_base")
+              ? Promise.resolve({
+                  code: mode === "fail" ? 1 : 0,
+                  signal: null,
+                  stdout: "",
+                  stderr: mode === "fail" ? "scan failed" : "",
+                  killed: null,
+                })
+              : runIsolated(o),
+        }),
+    });
+    for (const m of ["fail", "empty"] as const) {
+      mode = m;
+      const s = await t.scopeOf();
+      const f = await t.putFile(s, inputs().noel, "mp4");
+      const id = await t.queue(s, { clips: [{ fileId: f }] });
+      await t.drive();
+      expect([m, t.job(id)]).toMatchObject([m, { status: "failed", errorCode: "compose_failed" }]);
+      // No result kept: only the input's place.
+      expect([m, t.app.files!.placesTaken(s.conversationId)]).toEqual([m, 1]);
+    }
+    // The slot was freed: the next job runs to the end.
+    mode = "real";
+    const s3 = await t.scopeOf();
+    const f3 = await t.putFile(s3, inputs().noel, "mp4");
+    const id3 = await t.queue(s3, { clips: [{ fileId: f3 }] });
+    await t.drive();
+    expect(t.job(id3).status).toBe("done");
   });
 
   it("readiness: a tiny composition checked in the same sandbox", async () => {

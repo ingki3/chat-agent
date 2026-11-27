@@ -783,7 +783,7 @@ export function sandboxedComposer(o: {
       // its duration, exact, on the input's timeline — not a count of 30 fps frames.
       const shown = presentTrack(info.videoTrack, info.origin ?? Q0);
       let lastEnd: Q | null = null;
-      if (u.count && info.hasVideo && !shown.end && DEMUXER[info.fileKind] === "mov") {
+      if (u.count && info.hasVideo && !shown.end) {
         const left = job.deadlineAt - Date.now();
         if (left <= 0) return { ok: false, code: "compose_timeout" };
         const fold = pictureEnd();
@@ -797,16 +797,12 @@ export function sandboxedComposer(o: {
         });
         if (r?.killed === "timeout" || Date.now() >= job.deadlineAt)
           return { ok: false, code: "compose_timeout" };
+        // Review r14: fail closed — no exact end (the scan failed, or said nothing usable) is no length to guess.
         const e = decodeVerdict(r) === "ok" ? fold.end() : null;
-        lastEnd = e ? qAdd(e, shown.shift) : null;
+        if (!e) return { ok: false, code: "compose_failed" };
+        lastEnd = qAdd(e, shown.shift);
       }
-      const pictureSec = !(u.count && info.hasVideo)
-        ? null
-        : shown.end
-          ? Math.max(0, qSec(shown.end))
-          : lastEnd
-            ? Math.max(0, qSec(lastEnd))
-            : (pictureFrames ?? 0) / FPS;
+      const pictureSec = !(u.count && info.hasVideo) ? null : Math.max(0, qSec(shown.end ?? lastEnd!));
       truth.set(fileId, {
         ...info,
         durationSec: Math.max(pictureSec ?? 0, audioSec ?? 0) || (info.durationSec ?? 0),

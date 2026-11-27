@@ -1142,15 +1142,25 @@ export function pictureEnd(): { line: (l: string) => void; end: () => Q | null }
   let best: number | null = null;
   let tb: { n: number; d: number } | null = null;
   return {
+    // Review r14: field by field — a section name, then `key=value` fields; empty fields (a trailing `|`, as with
+    // rotation side data), other keys and other sections (side data) are ignored.
     line: (l) => {
-      const p = /^packet\|pts=(-?\d+)\|duration=(\d+|N\/A)$/.exec(l.trim());
-      if (p) {
-        const e = Number(p[1]) + (p[2] === "N/A" ? 0 : Number(p[2]));
-        if (Number.isSafeInteger(e) && (best === null || e > best)) best = e;
-        return;
+      const [section, ...rest] = l.trim().split("|");
+      const f = new Map<string, string>();
+      for (const kv of rest) {
+        const at = kv.indexOf("=");
+        if (at > 0) f.set(kv.slice(0, at), kv.slice(at + 1));
       }
-      const t = /^stream\|time_base=(\d+)\/(\d+)$/.exec(l.trim());
-      if (t && Number(t[2]) > 0) tb = { n: Number(t[1]), d: Number(t[2]) };
+      if (section === "packet") {
+        const pts = f.get("pts");
+        const dur = f.get("duration");
+        if (!pts || !/^-?\d+$/.test(pts)) return;
+        const e = Number(pts) + (dur && /^\d+$/.test(dur) ? Number(dur) : 0);
+        if (Number.isSafeInteger(e) && (best === null || e > best)) best = e;
+      } else if (section === "stream") {
+        const m = /^(\d+)\/(\d+)$/.exec(f.get("time_base") ?? "");
+        if (m && Number(m[2]) > 0) tb = { n: Number(m[1]), d: Number(m[2]) };
+      }
     },
     end: () => (best !== null && tb && Number.isSafeInteger(best * tb.n) ? q(best * tb.n, tb.d) : null),
   };
